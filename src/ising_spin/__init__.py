@@ -1,35 +1,28 @@
 """
-Ising Spin Language Model — Zero Floating-Point Text Generation
+Ising Spin Language Model — V12 Coherent Generation
 
-A proof-of-concept demonstrating that grammatically and semantically
-structured text can be generated using only integer arithmetic, with
-no floating-point operations in the generation loop.
+Integer-only text generation using Ising spin models with exact token recall.
 
-Architecture (v3 — Enhanced Typed Ising-Potts):
-    - Each position has a TYPE (POS tag, ~13 states) and VALUE (word, ~8K states)
-    - Type layer: Potts model over POS tag sequences (spaCy-accurate)
-    - Value layer: Ising-like model with PMI couplings (NMF-factorized)
-    - Coupling structure: Ising-Potts gating (Haydarov et al., arXiv:2502.12014)
-    - PMI couplings: log-floor integer approximation via bit_length()
-    - Grammar: integer quadratic penalties (Marcolli-style implicational couplings)
-    - Dependency couplings: J_tree from parse trees for long-range agreement
-    - Integer NMF: J ≈ W×H, scaling memory from O(V²) to O(V×K)
-    - Semantics: type compatibility matrix gating Hebbian coupling
-    - Generation: staged annealing (types → types+words → words)
-    - ALL generation-path computation is integer arithmetic only
+Architecture (V12 — Coherent Autoregressive + Exact Recall):
+    - Autoregressive generation: P(w_t | w_1,...,w_{t-1}) at each position
+    - Exact n-gram recall: GFST-HMB-inspired exact token storage and retrieval
+    - Kneser-Ney backoff: continuation counts for graceful fallback
+    - Interpolation: adaptive recall/PMI/unigram weighting
+    - Type-compatible recall: grammar constraints override recall suggestions
+    - Function-word anti-loop: max 2 consecutive closed-class words
+    - Copy-fade: smooth transitions between copied and generated segments
+    - Copy loop detection: prevent infinite phrase repetition
+    - ALL generation-path computation is INTEGER ARITHMETIC ONLY
 
-New in v3:
-    - SpaCy POS tagger replaces rule-based assignment (accurate type couplings)
-    - Dependency tree couplings (J_tree) for subject-verb agreement
-    - Integer matrix factorization (J ≈ W×H) for vocabulary scaling beyond 3K
-    - Larger corpus training (100K samples default) to densify PMI matrix
+Pipeline:
+    V8 training infrastructure → V12 coherent generation
+    (PMI, types, emissions, deps, NMF → autoregressive + exact recall)
 
 References:
     - Reinhart & De las Coves (arXiv:2208.08301): Grammar of the Ising Model
     - Marcolli et al. (arXiv:1508.00504): Spin Glass Models of Syntax
     - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
-    - Levy & Goldberg (2014): Word2Vec ≈ SVD of PMI matrix
-    - Lee & Seung (2001): Algorithms for Non-negative Matrix Factorization
+    - GFST-HMB (github.com/pkhairkh/gfst-hmb-public): Exact token recall
 """
 
-__version__ = "5.0.0"
+__version__ = "12.0.0"
