@@ -764,7 +764,7 @@ class NGramIndex:
         context_words: List[int],
         candidate_words: np.ndarray,
         recall_scale: int = 100,
-        context_weight_factor: int = 4,
+        context_weight_factor: int = 2,
         longest_only: bool = True,
     ) -> np.ndarray:
         """
@@ -1270,8 +1270,9 @@ class KnowledgeLayer:
                     # Full match: subject AND predicate in context
                     word_bonuses[obj_idx] += self.knowledge_scale
                 else:
-                    # Weaker signal: only subject in context
-                    word_bonuses[obj_idx] += self.knowledge_scale // 3
+                    # Subject-only: strong signal (autoregressive context
+                    # rarely has both subject and predicate)
+                    word_bonuses[obj_idx] += self.knowledge_scale
         
         # Map bonuses to candidate_words array
         for i, w in enumerate(candidate_words):
@@ -2246,8 +2247,8 @@ class IsingLM:
         # MCMC refinement (post-generation spin-flip)
         self.mcmc_refine_steps = mcmc_refine_steps
 
-        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=500)
-        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=500)
+        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=5000)
+        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=5000)
 
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
@@ -2384,7 +2385,7 @@ class IsingLM:
             context_words=context_words,
             candidate_words=candidate_words,
             recall_scale=self.recall_scale,
-            context_weight_factor=4,
+            context_weight_factor=2,
             longest_only=True,
         )
         energies -= recall_bonuses
@@ -2795,7 +2796,7 @@ class IsingLM:
 
             # Create a new sampler with the current beta
             annealed_word_sampler = IntegerBoltzmannSampler(
-                beta=beta_t, max_delta=500
+                beta=beta_t, max_delta=5000
             )
 
             # === STEP 1: Choose POS type (BOLTZMANN, not override) ===

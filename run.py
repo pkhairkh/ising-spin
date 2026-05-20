@@ -159,20 +159,24 @@ def main():
         pmi_min_count=2,
         pmi_cap=10,
 
-        # Energy scales — v5.0: Knowledge dominates through Hamiltonian
-        # Key: spin3_scale produces deep energy wells that beat recall
+        # Energy scales — v5.0: Knowledge MUST dominate when J3 fires
+        # Recall 5-gram match: count*800*4^4 = ~1M. J3 must beat that.
+        # With spin3_scale=50000, J3 triple (count=3) = 150,000. ConceptNet (2x) = 100,000.
+        # At beta=0.15, exp(-0.15*100000) vs exp(-0.15*128000): knowledge word ~450x more likely.
         recall_scale=800,            # n-gram recall (moderate)
         pmi_weight=5,                # PMI coupling strength
         field_weight=1,              # Unigram field
-        knowledge_scale=2000,        # Layer 2: knowledge external field
-        spin3_scale=3000,            # Layer 3: 3-spin (dominates when it fires)
-        category_scale=600,          # Layer 4: category couplings
-        logic_rule_scale=800,        # Layer 5: soft logic
+        knowledge_scale=15000,       # Layer 2: knowledge external field (STRONG)
+        spin3_scale=50000,           # Layer 3: 3-spin (DOMINATES when it fires)
+        category_scale=800,          # Layer 4: category couplings
+        logic_rule_scale=2000,       # Layer 5: soft logic
         logic_hard_scale=50000,      # Layer 5: hard contradictions
 
-        # Sampling parameters
-        beta_type=0.01,
-        beta_word=0.15,
+        # Sampling parameters — v5.0: low beta for soft Boltzmann distribution
+        # With energy ranges of ~100K, beta=0.0005 gives soft distribution
+        # where top candidate gets ~20-40% probability (not 99.99%)
+        beta_type=0.001,
+        beta_word=0.0005,
         copy_enabled=True,
         copy_min_context=2,
         copy_min_confidence=0.25,
