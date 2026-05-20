@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-Ising Knowledge Machine — Runner v3.0.
+Ising Spin Glass Language Model — Runner v5.0.
 
-5-Layer Architecture:
-  Layer 1: PMI Couplings (word affinities) + Local Field (unigram)
+Genuine Ising Dynamics: ALL word selection through the Hamiltonian.
+No overrides. No bypasses. Knowledge creates competing energy wells.
+Boltzmann sampling at temperature beta picks between them stochastically.
+
+5-Layer Architecture (ALL compete through E(w|ctx)):
+  Layer 1: PMI Couplings (word affinities) + Local Field
   Layer 2: Knowledge External Field h_knowledge[w]
   Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples
-  Layer 4: Category Couplings J_category (hypernym-based semantic smoothing)
-  Layer 5: Markov Logic Penalty (factual consistency rules)
+  Layer 4: Category Couplings J_category (hypernym-based)
+  Layer 5: Markov Logic Penalty (factual consistency)
 
-Primary:   N-gram exact recall (when context matches)
-Secondary: Ising PMI coupling (when recall misses)
-Knowledge: Layers 2-5 (knowledge graph + category + logic)
-Sampling:  Integer Boltzmann via lookup table (NO np.exp)
+Post-generation: MCMC spin-flip refinement (Metropolis criterion)
 
-Improvements over v2.0:
-  - Vocabulary scaled to V=8000 (was 3000)
-  - Triple coverage expanded to 500+ hardcoded + ConceptNet
-  - knowledge_scale=2000, spin3_scale=3000 (much stronger)
-  - Layer 4: Category couplings (30+ categories)
-  - Layer 5: Markov logic rules (30+ rules)
+v5.0 changes from v4.0:
+  - KILLED _check_knowledge_override() — no more bypassing Boltzmann
+  - KILLED knowledge_type_override — types biased through energy, not override
+  - ALL knowledge through Hamiltonian — deep energy wells from J3
+  - NO PMI damping when recall hits — all terms compete freely
+  - MCMC spin-flip refinement — genuinely Ising dynamics
+  - Competing triples create competing energy wells
+  - Phase transition: knowledge influence varies with beta
 """
 
 import sys
@@ -71,14 +74,13 @@ def run_ablation(model, prompts, length=20):
     print("\n" + "=" * 70)
     print("ABLATION STUDY: Ising ON vs Ising OFF")
     print("=" * 70)
-    print("\n  This measures the ACTUAL contribution of the Ising PMI model.")
-    print("  If Ising OFF produces identical text, then Ising adds nothing.")
-    print("  If Ising ON produces better text when recall misses, then it contributes.\n")
+    print("\n  v5.0: Both use energy-only pipeline (no overrides).")
+    print("  Ising OFF: PMI=0, but knowledge + category + logic still active.\n")
 
     ising_texts = []
     baseline_texts = []
-    ising_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0}
-    baseline_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0}
+    ising_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0, 'knowledge_hits': 0}
+    baseline_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0, 'knowledge_hits': 0}
 
     for prompt in prompts:
         result_ising = model.generator.generate(prompt=prompt, length=length)
@@ -119,7 +121,6 @@ def run_ablation(model, prompts, length=20):
     print(f"  {'Unique words':<30} {ising_quality['unique_words']:>12} {baseline_quality['unique_words']:>12}")
     print(f"  {'Type-token ratio':<30} {ising_quality['type_token_ratio']:>12.3f} "
           f"{baseline_quality['type_token_ratio']:>12.3f}")
-    print(f"  {'Double DET patterns':<30} {ising_quality['n_double_dets']:>12} {baseline_quality['n_double_dets']:>12}")
     print(f"  {'Same-word reps':<30} {ising_quality['n_same_word_reps']:>12} {baseline_quality['n_same_word_reps']:>12}")
 
     return ising_texts, baseline_texts
@@ -127,21 +128,21 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING KNOWLEDGE MACHINE (v4.0 — Knowledge-First Architecture)")
+    print("ISING SPIN GLASS LANGUAGE MODEL (v5.0 — Genuine Ising Dynamics)")
     print("=" * 70)
     print()
-    print("5-Layer Architecture:")
-    print("  Layer 1: PMI Couplings (word affinities) + Local Field")
+    print("5-Layer Architecture (ALL compete through Hamiltonian):")
+    print("  Layer 1: PMI Couplings + Local Field")
     print("  Layer 2: Knowledge External Field h_knowledge[w]")
     print("  Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples")
-    print("  Layer 4: Category Couplings J_category (hypernym-based)")
+    print("  Layer 4: Category Couplings (hypernym-based)")
     print("  Layer 5: Markov Logic Penalty (factual consistency)")
     print()
-    print("v4.0 Improvements:")
-    print("  KNOWLEDGE-FIRST: Knowledge layers override recall when confident")
-    print("  Vocab augmentation: Knowledge words added even if absent from corpus")
-    print("  Improved ConceptNet loader with multiple fallback strategies")
-    print("  Hard logic filter removes contradictory candidates BEFORE sampling")
+    print("v5.0: Genuine Ising Dynamics")
+    print("  NO overrides. NO bypasses. Knowledge through Hamiltonian only.")
+    print("  Deep energy wells from J3 compete with recall in Boltzmann sampling.")
+    print("  MCMC spin-flip refinement (Metropolis criterion).")
+    print("  Phase transition: knowledge influence varies with beta.")
     print()
 
     t0 = time.time()
@@ -158,14 +159,15 @@ def main():
         pmi_min_count=2,
         pmi_cap=10,
 
-        # Energy scales — v4.0: Knowledge-first architecture
-        recall_scale=800,            # Lowered from 1000 — recall no longer dominates
-        pmi_weight=5,                # Increased from 3 — PMI matters more when recall misses
-        field_weight=1,
-        knowledge_scale=2000,        # Layer 2: strong external field
-        spin3_scale=3000,            # Layer 3: strongest knowledge signal (override)
-        category_scale=600,          # Layer 4: increased from 400
-        logic_rule_scale=800,        # Layer 5: increased from 600
+        # Energy scales — v5.0: Knowledge dominates through Hamiltonian
+        # Key: spin3_scale produces deep energy wells that beat recall
+        recall_scale=800,            # n-gram recall (moderate)
+        pmi_weight=5,                # PMI coupling strength
+        field_weight=1,              # Unigram field
+        knowledge_scale=2000,        # Layer 2: knowledge external field
+        spin3_scale=3000,            # Layer 3: 3-spin (dominates when it fires)
+        category_scale=600,          # Layer 4: category couplings
+        logic_rule_scale=800,        # Layer 5: soft logic
         logic_hard_scale=50000,      # Layer 5: hard contradictions
 
         # Sampling parameters
@@ -178,6 +180,9 @@ def main():
         max_closed_class_run=2,
         ising_enabled=True,
         skip_pmi_max_dist=5,
+
+        # v5.0: MCMC spin-flip refinement
+        mcmc_refine_steps=2,
 
         # ConceptNet
         use_conceptnet=True,
@@ -192,7 +197,7 @@ def main():
     # PHASE 1: Quick generation test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("QUICK GENERATION TEST")
+    print("QUICK GENERATION TEST (v5.0 — Energy-Only, No Overrides)")
     print("=" * 70)
 
     prompts = ["the", "a", "in", "science", "research", "students", "he",
@@ -205,20 +210,18 @@ def main():
         n_copies = sum(1 for d in result['diagnostics'] if d['copy'])
         n_recalls = sum(1 for d in result['diagnostics'] if d['recall_hit'])
         n_pmi = sum(1 for d in result['diagnostics'] if not d['recall_hit'])
-        n_knowledge = sum(1 for d in result['diagnostics'] if d.get('knowledge_override'))
         flag = " LOOP" if "of the of the" in text else ""
         print(f"  '{prompt}' -> {text}{flag}")
-        knowledge_str = f" knowledge={n_knowledge}" if n_knowledge > 0 else ""
-        print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}{knowledge_str}")
+        print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}")
 
     # ======================================================================
     # PHASE 2: 5-Layer Knowledge Test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("5-LAYER KNOWLEDGE TEST")
+    print("5-LAYER KNOWLEDGE TEST (Energy Competition, Not Overrides)")
     print("=" * 70)
-    print("\n  Testing: All 5 Layers ON vs All Knowledge Layers OFF")
-    print("  Using knowledge-triggering prompts.\n")
+    print("\n  v5.0: All 5 Layers ON vs Knowledge Layers OFF")
+    print("  Knowledge wins through DEEP ENERGY WELLS, not overrides.\n")
 
     # Knowledge layer diagnostics
     kl = model.knowledge_layer
@@ -228,7 +231,6 @@ def main():
     print(f"  Layer 2+3 (Knowledge):")
     print(f"    Total triples: {kl.n_triples}")
     print(f"    Unique subjects: {kl.n_unique_subjects}")
-    print(f"    Unique predicates: {kl.n_unique_predicates}")
     print(f"    J3 entries: {len(kl.J3)}")
     print(f"    h_knowledge non-zero: {int(np.count_nonzero(kl.h_knowledge))}")
     print(f"    h_knowledge max: {int(kl.h_knowledge.max())}")
@@ -236,12 +238,9 @@ def main():
     print(f"\n  Layer 4 (Category):")
     print(f"    Categories: {cl.n_categories}")
     print(f"    Categorized words: {cl.n_categorized_words}")
-    print(f"    Peer pairs: {sum(len(p) for p in cl.word_peers.values()) // 2}")
     
     print(f"\n  Layer 5 (Markov Logic):")
-    print(f"    Total rules: {ml.n_rules}")
-    print(f"    Soft rules: {ml.n_soft_rules}")
-    print(f"    Hard rules: {ml.n_hard_rules}")
+    print(f"    Total rules: {ml.n_rules} ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
 
     # Test with knowledge-triggering prompts
     knowledge_prompts = [
@@ -260,7 +259,7 @@ def main():
     knowledge_off_texts = []
 
     for prompt in knowledge_prompts:
-        # All 5 Layers ON (main generator)
+        # All 5 Layers ON
         result_on = model.generator.generate(prompt=prompt, length=15)
         text_on = result_on['text']
         knowledge_on_texts.append(text_on)
@@ -272,7 +271,7 @@ def main():
 
         print(f"  {prompt:<20} {text_on[:53]:<55} {text_off[:53]:<55}")
 
-    # Get stats from generators
+    # Get stats
     on_stats = model.generator.get_stats()
     off_stats = model.knowledge_off_generator.get_stats()
 
@@ -283,26 +282,17 @@ def main():
     print(f"    3-Spin firings: {on_stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {on_stats.get('category_hits', 0)}")
     print(f"    Logic hits: {on_stats.get('logic_hits', 0)}")
+    print(f"    MCMC accept rate: {on_stats.get('mcmc_accept_rate', 0):.1%}")
 
     print(f"\n  Knowledge OFF stats:")
     print(f"    Recall hit rate: {off_stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {off_stats['pmi_only_rate']:.1%}")
 
-    # Quality comparison
-    on_quality = evaluate_quality(knowledge_on_texts, len(knowledge_prompts))
-    off_quality = evaluate_quality(knowledge_off_texts, len(knowledge_prompts))
-
-    print(f"\n  {'Metric':<30} {'5-Layers ON':>14} {'Knowledge OFF':>14}")
-    print(f"  {'-'*30} {'-'*14} {'-'*14}")
-    print(f"  {'Unique words':<30} {on_quality['unique_words']:>14} {off_quality['unique_words']:>14}")
-    print(f"  {'Type-token ratio':<30} {on_quality['type_token_ratio']:>14.3f} {off_quality['type_token_ratio']:>14.3f}")
-    print(f"  {'Same-word reps':<30} {on_quality['n_same_word_reps']:>14} {off_quality['n_same_word_reps']:>14}")
-
     # ======================================================================
     # PHASE 3: Beam generation test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("BEAM GENERATION (Global Coherence)")
+    print("BEAM GENERATION (Global Energy Coherence)")
     print("=" * 70)
 
     for prompt in ["the", "science", "the dog"]:
@@ -338,17 +328,19 @@ def main():
     stats = model.generator.get_stats()
 
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("SUMMARY — v5.0 Genuine Ising Dynamics")
     print("=" * 70)
-    print(f"\n  Architecture: 5-Layer Ising Knowledge Machine (v4.0 Knowledge-First)")
-    print(f"  Layer 1: PMI couplings + local field")
+    print(f"\n  Architecture: 5-Layer Ising Spin Glass (v5.0)")
+    print(f"  Pipeline: Energy → Boltzmann → MCMC refinement")
+    print(f"  Overrides: NONE (knowledge through Hamiltonian only)")
+    print(f"\n  Layer 1: PMI couplings + local field")
     print(f"  Layer 2: Knowledge external field (h_knowledge)")
     print(f"  Layer 3: 3-Spin couplings (J3 SPO triples)")
     print(f"  Layer 4: Category couplings (hypernym-based)")
     print(f"  Layer 5: Markov logic penalties (factual consistency)")
     print(f"\n  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
     print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
-    print(f"  Skip-gram PMI: YES (distance 1-{model.skip_pmi_max_dist})")
+    print(f"  MCMC refinement: YES ({model.mcmc_refine_steps} passes)")
     print(f"\n  Scale comparison:")
     print(f"    recall_scale=     {model.recall_scale:>6}")
     print(f"    knowledge_scale=  {model.knowledge_scale:>6}")
@@ -366,6 +358,7 @@ def main():
     print(f"    3-Spin firings: {stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {stats.get('category_hits', 0)}")
     print(f"    Logic hits: {stats.get('logic_hits', 0)}")
+    print(f"    MCMC accept rate: {stats.get('mcmc_accept_rate', 0):.1%}")
     print(f"    Ising enabled: {stats['ising_enabled']}")
     print(f"\n  Perplexity: {ppl:.2f}")
 

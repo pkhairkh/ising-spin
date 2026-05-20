@@ -1,32 +1,38 @@
 """
-Ising Spin Language Model
+Ising Spin Glass Language Model — v5.0 Genuine Ising Dynamics
 
-Integer-only text generation using Ising PMI couplings with exact n-gram recall.
+ALL word selection goes through the Hamiltonian. No overrides, no bypasses.
+Every word is chosen by Boltzmann sampling from the energy landscape.
 
-Architecture:
-    - N-gram recall: PRIMARY next-word signal
-    - Ising PMI coupling: SECONDARY signal when recall misses
-    - Skip-gram PMI: Distance-specific couplings (Path 2d)
-    - POS grammar: HARD CONSTRAINTS on word types
-    - Integer Boltzmann sampling: lookup-table, NO np.exp in hot loop
-    - Ablation framework: measure Ising contribution
+Architecture (5 layers, ALL compete through E(w|ctx)):
+    Layer 1: PMI couplings J[w,w'] + local field h[w]
+    Layer 2: Knowledge external field h_knowledge[w] (SPO triples)
+    Layer 3: 3-Spin couplings J3[(s,p)] -> o (many-body Ising interaction)
+    Layer 4: Category couplings J_category (hypernym-based semantic smoothing)
+    Layer 5: Markov logic penalty (factual consistency, soft + hard)
 
-Path 2 additions:
-    - Beam generation: Global coherence via energy ranking
-    - Joint phrase sampling: MCMC over multi-word phrases
-    - Temperature annealing: Ising phase transition simulation
-    - Skip-gram PMI: Distance-weighted couplings
+Generation:
+    - All layers compete through integer energy function E(w|ctx)
+    - Boltzmann sampling: P(w) ~ exp(-beta * E(w))
+    - MCMC spin-flip refinement (Metropolis criterion)
+    - No overrides. Knowledge creates competing energy wells.
 
-Path 3 additions:
-    - Better tokenizer: Contractions, hyphens, numbers
-    - Sparse coupling matrix: scipy.sparse.csr_matrix
-    - Perplexity evaluation: PPL on held-out data
+Key principle: When (dog, barks)->bark and (dog, chases)->chase both fire,
+they create COMPETING energy wells. Boltzmann at temperature beta picks
+between them stochastically. Near the phase transition, knowledge has
+maximum influence with some thermal noise.
+
+INTEGER-ONLY CONSTRAINT (enforced):
+    - ALL generation-path computation uses integer arithmetic
+    - Boltzmann sampling via pre-computed lookup table (NO np.exp in hot loop)
+    - MCMC acceptance via the same lookup table (integer-only)
 
 References:
     - Levy & Goldberg (2014): Word2Vec as log-PMI matrix factorization
     - Marcoli et al. (arXiv:1508.00504): Spin Glass Models of Syntax
     - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
     - Creutz (1983): Demon algorithm for integer MCMC acceptance
+    - Nishimori (2001): Statistical Physics of Spin Glasses
 """
 
 from .model import (
@@ -52,4 +58,4 @@ from .model import (
     truncate_sequences,
 )
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"

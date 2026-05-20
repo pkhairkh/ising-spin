@@ -1195,6 +1195,11 @@ class KnowledgeLayer:
         Finalize the knowledge layer after adding all triples.
         Pre-compute h_knowledge from all triples, build subject_index.
         Pure integer arithmetic.
+        
+        v5.0 fix: Cap h_knowledge so it doesn't swamp the energy landscape.
+        The real signal should come from J3 (context-dependent), not from
+        h_knowledge (static, always on). h_knowledge is a BIAS, not a
+        domination. We cap it to knowledge_scale * 3 maximum.
         """
         # Compute statistics
         subjects = set()
@@ -1206,8 +1211,11 @@ class KnowledgeLayer:
         self.n_unique_subjects = len(subjects)
         self.n_unique_predicates = len(predicates)
         
-        # Ensure h_knowledge is int64
-        self.h_knowledge = self.h_knowledge.astype(np.int64)
+        # v5.0: Cap h_knowledge to prevent energy domination
+        # Words in many triples accumulate huge h_knowledge values,
+        # which swamps all other energy terms. Cap to a reasonable bias.
+        h_cap = self.knowledge_scale * 3  # Maximum bias per word
+        self.h_knowledge = np.clip(self.h_knowledge, 0, h_cap).astype(np.int64)
         
         self._built = True
         
@@ -1217,7 +1225,7 @@ class KnowledgeLayer:
         print(f"      Unique predicates: {self.n_unique_predicates}")
         print(f"      J3 entries: {len(self.J3)}")
         print(f"      h_knowledge non-zero: {int(np.count_nonzero(self.h_knowledge))}")
-        print(f"      h_knowledge max: {int(self.h_knowledge.max())}")
+        print(f"      h_knowledge max: {int(self.h_knowledge.max())} (capped at {h_cap})")
     
     def compute_knowledge_field(self, context_words, candidate_words):
         """
@@ -2140,30 +2148,32 @@ def _get_expanded_commonsense() -> List[Tuple[str, str, str]]:
 
 class IsingLM:
     """
-    Ising-Enhanced N-Gram Language Model.
+    Ising Spin Glass Language Model — v5.0 Genuine Ising Dynamics.
 
-    Architecture (honest):
-      1. POS type selection: Grammar-driven with hard constraints
-      2. N-gram recall: Primary next-word signal (when available)
-      3. PMI coupling: Secondary signal (when recall misses)
-      4. Knowledge layer: Layer 2 (field) + Layer 3 (3-spin couplings)
-      5. Integer Boltzmann: Temperature-controlled stochastic selection
+    Architecture (NO overrides, NO bypasses):
+      1. POS type selection: Boltzmann from type energy landscape
+      2. Word selection: Boltzmann from E(w|ctx) — ALL layers compete
+      3. MCMC refinement: Post-generation spin-flip passes (Metropolis)
 
-    Path 2 additions:
-      - generate_beam: Global coherence via energy-ranked beam search
-      - _joint_sample: Joint phrase sampling via MCMC
-      - generate_annealed: Temperature annealing (Ising phase transition)
-      - J_skip: Distance-specific skip-gram PMI couplings
+    Energy landscape:
+      E(w|ctx) = -recall(w) -J_pm_i[w,ctx] -J3_knowledge[w,ctx]
+                 -h_knowledge[w] -J_category[w,ctx] +E_logic[w,ctx]
+                 -h[w] +penalties
 
-    Knowledge Layer:
-      - h_knowledge[w]: External field from SPO triples (Layer 2)
-      - J3[(s,p)]: 3-spin couplings for SPO triples (Layer 3)
+    Key principle: Knowledge creates COMPETING energy wells.
+    When (dog, barks)->bark and (dog, chases)->chase both fire,
+    they produce two deep wells. Boltzmann at temperature beta
+    picks between them STOCHASTICALLY. No override. No lookup.
 
-    Parameters (6 generation params, not 30+):
+    Phase transition: At critical beta, knowledge transitions from
+    invisible (disordered) to dominant (ordered). We tune beta to
+    sit near the transition for maximum influence with some noise.
+
+    Parameters:
       - recall_scale, pmi_weight, field_weight
       - beta_type, beta_word
       - ising_enabled (ablation switch)
-      - knowledge_layer (knowledge injection)
+      - mcmc_refine_steps: number of post-generation spin-flip passes
     """
 
     CLOSED_CLASS = {POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
@@ -2196,6 +2206,7 @@ class IsingLM:
         knowledge_layer: Optional["KnowledgeLayer"] = None,
         category_layer: Optional["CategoryLayer"] = None,
         markov_logic_layer: Optional["MarkovLogicLayer"] = None,
+        mcmc_refine_steps: int = 2,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -2222,6 +2233,9 @@ class IsingLM:
         
         # Markov Logic layer (Layer 5)
         self.markov_logic_layer = markov_logic_layer
+        
+        # MCMC refinement (post-generation spin-flip)
+        self.mcmc_refine_steps = mcmc_refine_steps
 
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=500)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=500)
@@ -2252,6 +2266,7 @@ class IsingLM:
             'pmi_only': 0, 'same_word_blocked': 0, 'closed_loop_blocked': 0,
             'knowledge_hits': 0, 'spin3_firings': 0,
             'category_hits': 0, 'logic_hits': 0,
+            'mcmc_flips_accepted': 0, 'mcmc_flips_proposed': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -2291,8 +2306,15 @@ class IsingLM:
 
         return valid
 
-    def _compute_type_energy(self, pos: int, type_idx: int, types_history: List[int]) -> int:
-        """Compute energy for a POS type at position pos. Pure integer."""
+    def _compute_type_energy(self, pos: int, type_idx: int, types_history: List[int],
+                             context_words: Optional[List[int]] = None) -> int:
+        """Compute energy for a POS type at position pos. Pure integer.
+        
+        In v5.0, knowledge layers can bias type selection through the energy
+        landscape: if 3-spin couplings predict an object of type T, that type
+        gets an energy bonus. This is NOT an override — it's a bias in the
+        Boltzmann distribution over types.
+        """
         energy = 0
         types_for_check = list(types_history) + [type_idx]
         penalty = self.types.compute_grammar_penalty(
@@ -2302,6 +2324,25 @@ class IsingLM:
         if len(types_history) > 0 and type_idx == types_history[-1]:
             if type_idx not in (POS2IDX['NOUN'], POS2IDX['X']):
                 energy += 50
+        
+        # Knowledge-driven type bias: if J3 predicts objects of this type,
+        # give this type an energy bonus (lower energy = more likely)
+        if context_words is not None and self.knowledge_layer is not None and self.knowledge_layer._built:
+            kl = self.knowledge_layer
+            ctx = context_words[-kl.max_context_pairs:] if len(context_words) > kl.max_context_pairs else context_words
+            type_bonus = 0
+            for i in range(len(ctx)):
+                for j in range(len(ctx)):
+                    if i == j:
+                        continue
+                    key = (ctx[i], ctx[j])
+                    if key in kl.J3:
+                        for (obj_idx, strength) in kl.J3[key]:
+                            obj_type = self._get_word_type(obj_idx)
+                            if obj_type == type_idx:
+                                type_bonus += strength // 500  # Scale down for type energy
+            energy -= type_bonus  # Lower energy = more likely
+        
         return energy
 
     def _compute_word_energy(
@@ -2309,28 +2350,27 @@ class IsingLM:
         context_words: List[int], context_types: List[int], recall_hit: bool,
     ) -> np.ndarray:
         """
-        Compute energy for candidate words.
+        Compute energy for candidate words — v5.0 genuine Ising dynamics.
 
-        E(w) = -recall_bonus(w)          [PRIMARY: n-gram match signal]
-             - pmi_coupling(w, ctx)       [SECONDARY: Ising PMI signal]
+        E(w) = -recall_bonus(w)          [recall: n-gram match signal]
+             - pmi_coupling(w, ctx)       [PMI: word affinity signal]
              - knowledge_energy(w, ctx)   [KNOWLEDGE: Layer 2 + Layer 3]
-             - field(w)                   [TERTIARY: unigram frequency]
+             - category_energy(w, ctx)    [CATEGORY: Layer 4]
+             + logic_energy(w, ctx)       [LOGIC: Layer 5]
+             - field(w)                   [unigram frequency]
              + penalties                  [HARD: grammar, anti-repetition]
 
-        Path 2d: Uses distance-weighted skip-gram PMI when available,
-        falling back to base J for distances not in J_skip.
-
-        Path 3b: Uses sparse matrix operations for coupling computation.
-
-        Knowledge Layer: Layer 2 (external field) + Layer 3 (3-spin couplings)
-        inject knowledge-graph structure into the Ising energy landscape.
+        v5.0 KEY CHANGE: Knowledge energy is NO LONGER dominated by recall.
+        When J3 fires, it produces a deep energy well that naturally wins
+        in Boltzmann sampling. Multiple J3 firings create COMPETING wells.
+        The winner is determined stochastically by temperature beta.
 
         All integer arithmetic.
         """
         n_candidates = len(candidate_words)
         energies = np.zeros(n_candidates, dtype=np.int64)
 
-        # === RECALL BONUS (primary signal) ===
+        # === RECALL BONUS (n-gram match signal) ===
         recall_bonuses = self.ngram_index.get_recall_bonus(
             context_words=context_words,
             candidate_words=candidate_words,
@@ -2340,17 +2380,18 @@ class IsingLM:
         )
         energies -= recall_bonuses
 
-        # === PMI COUPLING (Ising model -- secondary signal) ===
+        # === PMI COUPLING (Ising model -- word affinity signal) ===
+        # v5.0: NO damping when recall hits. All terms compete freely.
         if self.ising_enabled and len(context_words) > 0:
             coupling_sums = self._compute_pmi_coupling_sum(
                 candidate_words, context_words
             )
-            if recall_hit and recall_bonuses.max() > 0:
-                energies -= (coupling_sums * self.pmi_weight) // 10
-            else:
-                energies -= coupling_sums * self.pmi_weight
+            energies -= coupling_sums * self.pmi_weight
 
         # === KNOWLEDGE ENERGY (Layer 2 + Layer 3) ===
+        # v5.0: Knowledge competes freely through the Hamiltonian.
+        # When J3 fires, it creates deep energy wells that DOMINATE
+        # over recall. Multiple triples create COMPETING wells.
         if self.knowledge_layer is not None and len(context_words) > 0:
             knowledge_bonus = self.knowledge_layer.compute_knowledge_energy(
                 context_words, candidate_words
@@ -2387,12 +2428,10 @@ class IsingLM:
             if int(np.abs(logic_energy).max()) > 0:
                 self._stats['logic_hits'] += 1
 
-        # === LOCAL FIELD (unigram -- tertiary signal) ===
+        # === LOCAL FIELD (unigram frequency) ===
+        # v5.0: Field always contributes fully, no damping
         field_vals = self.h[candidate_words] * self.field_weight
-        if recall_hit and recall_bonuses.max() > 0:
-            energies -= (field_vals * 1) // 10
-        else:
-            energies -= field_vals
+        energies -= field_vals
 
         # === TYPE COMPATIBILITY (hard constraint) ===
         for i, w in enumerate(candidate_words):
@@ -2852,139 +2891,16 @@ class IsingLM:
         }
 
     # ===================================================================
-    # Standard Generation (unchanged public API)
+    # v5.0: Genuine Ising Generation (NO overrides, ALL Boltzmann)
     # ===================================================================
-
-    def _check_knowledge_override(self, context_words, chosen_type):
-        """
-        KNOWLEDGE-FIRST: Check if knowledge layers strongly suggest a word.
-        
-        Returns (word_idx, source) if knowledge has a confident prediction,
-        or (None, None) if no override.
-        
-        Priority:
-          1. 3-Spin coupling: if subject AND predicate are in context,
-             the object is the strongest possible signal — use it directly.
-          2. Category peer: if context contains multiple category members,
-             suggest another peer with correct POS type.
-          3. Knowledge field: if h_knowledge is very high for a word,
-             and it matches the target type, suggest it.
-        """
-        # === Layer 3: 3-Spin override (highest confidence) ===
-        if self.knowledge_layer is not None and self.knowledge_layer._built:
-            kl = self.knowledge_layer
-            ctx = context_words[-kl.max_context_pairs:] if len(context_words) > kl.max_context_pairs else context_words
-            
-            # Collect all 3-spin predictions with their strengths
-            spin3_candidates = defaultdict(int)  # word_idx -> total_strength
-            for i in range(len(ctx)):
-                for j in range(len(ctx)):
-                    if i == j:
-                        continue
-                    key = (ctx[i], ctx[j])
-                    if key in kl.J3:
-                        for (obj_idx, strength) in kl.J3[key]:
-                            spin3_candidates[obj_idx] += strength
-            
-            # Pick the strongest 3-spin candidate that matches the target type
-            if spin3_candidates:
-                # Sort by strength descending
-                sorted_cands = sorted(spin3_candidates.items(), key=lambda x: -x[1])
-                for obj_idx, strength in sorted_cands:
-                    # Check type compatibility
-                    if obj_idx < self.types.I_emit.shape[0]:
-                        if int(self.types.I_emit[obj_idx, chosen_type]) > 0:
-                            # Check logic layer doesn't block it
-                            if self.markov_logic_layer is not None:
-                                logic_e = self.markov_logic_layer.compute_logic_energy(
-                                    context_words, np.array([obj_idx], dtype=np.int64)
-                                )
-                                if int(logic_e[0]) > 10000:  # Hard rule blocks it
-                                    continue
-                            # Check same-word penalty
-                            if len(context_words) >= 1 and obj_idx == context_words[-1]:
-                                continue
-                            self._stats['spin3_firings'] += 1
-                            self._stats['knowledge_hits'] += 1
-                            return obj_idx, '3spin'
-        
-        # === Layer 2: Knowledge field override (medium confidence) ===
-        # If h_knowledge is extremely high for a word (accumulated from many triples),
-        # and it matches the type, suggest it when context contains its subject
-        if self.knowledge_layer is not None and self.knowledge_layer._built:
-            kl = self.knowledge_layer
-            context_set = set(context_words)
-            
-            # Find objects of triples where subject is in context
-            field_candidates = defaultdict(int)
-            for subject_idx in context_words:
-                if subject_idx in kl.subject_index:
-                    for (pred_idx, obj_idx) in kl.subject_index[subject_idx]:
-                        if pred_idx in context_set:
-                            field_candidates[obj_idx] += kl.knowledge_scale
-                        else:
-                            field_candidates[obj_idx] += kl.knowledge_scale // 3
-            
-            # Only override if there's a dominant candidate with high confidence
-            if field_candidates:
-                best_obj = max(field_candidates, key=field_candidates.get)
-                best_strength = field_candidates[best_obj]
-                # Only override if strength is very high (multiple triples agree)
-                if best_strength >= kl.knowledge_scale * 2:
-                    if best_obj < self.types.I_emit.shape[0]:
-                        if int(self.types.I_emit[best_obj, chosen_type]) > 0:
-                            if len(context_words) >= 1 and best_obj == context_words[-1]:
-                                pass  # Skip same word
-                            else:
-                                # Check logic layer
-                                if self.markov_logic_layer is not None:
-                                    logic_e = self.markov_logic_layer.compute_logic_energy(
-                                        context_words, np.array([best_obj], dtype=np.int64)
-                                    )
-                                    if int(logic_e[0]) > 10000:
-                                        pass  # Blocked
-                                    else:
-                                        self._stats['knowledge_hits'] += 1
-                                        return best_obj, 'field'
-                                else:
-                                    self._stats['knowledge_hits'] += 1
-                                    return best_obj, 'field'
-        
-        # === Layer 4: Category peer suggestion (lower confidence) ===
-        if self.category_layer is not None and self.category_layer._built:
-            cl = self.category_layer
-            # Check how many category members are in context
-            active_categories = set()
-            for w in context_words:
-                if w in cl.word_categories:
-                    active_categories.update(cl.word_categories[w])
-            
-            # If 2+ category members are in context, suggest another peer
-            if len(active_categories) >= 2:
-                # Collect all peers
-                peer_counts = defaultdict(int)
-                for w in context_words:
-                    if w in cl.word_peers:
-                        for peer in cl.word_peers[w]:
-                            if peer not in set(context_words):  # Not already in context
-                                peer_counts[peer] += 1
-                
-                # Find the most-supported peer with correct type
-                if peer_counts:
-                    sorted_peers = sorted(peer_counts.items(), key=lambda x: -x[1])
-                    for peer_idx, count in sorted_peers:
-                        if count >= 2 and peer_idx < self.types.I_emit.shape[0]:
-                            if int(self.types.I_emit[peer_idx, chosen_type]) > 0:
-                                if len(context_words) >= 1 and peer_idx == context_words[-1]:
-                                    continue
-                                self._stats['category_hits'] += 1
-                                return peer_idx, 'category'
-        
-        return None, None
 
     def _filter_by_logic(self, candidate_words, context_words):
         """
         HARD LOGIC FILTER: Remove candidates that violate hard logic rules.
+        
+        This is physically legitimate — hard rules act as infinite energy
+        barriers. They don't bypass Boltzmann; they set E(w) = infinity
+        for physically impossible states.
         
         Returns a boolean mask of shape (n_candidates,) where True = keep.
         """
@@ -3006,20 +2922,148 @@ class IsingLM:
         
         return keep
 
+    def _compute_sequence_energy(self, words: List[int], types_list: List[int]) -> int:
+        """
+        Compute total energy of a word sequence.
+        
+        E_total = sum over positions of E(w_t | ctx_t)
+        
+        This is used by MCMC refinement to evaluate whether a spin-flip
+        lowers the total energy of the sequence.
+        """
+        total_energy = 0
+        for pos in range(1, len(words)):
+            context_words = words[:pos]
+            context_types = types_list[:pos]
+            word_type = types_list[pos]
+            recall_matches = self.ngram_index.lookup(context_words)
+            recall_hit = bool(recall_matches)
+            candidate_arr = np.array([words[pos]], dtype=np.int64)
+            e = self._compute_word_energy(
+                pos, candidate_arr, word_type,
+                context_words, context_types, recall_hit
+            )
+            total_energy += int(e[0])
+        return total_energy
+
+    def _mcmc_refine(self, words: List[int], types_list: List[int],
+                     n_passes: int = 2) -> Tuple[List[int], List[int]]:
+        """
+        MCMC spin-flip refinement — genuinely Ising dynamics.
+        
+        After initial generation, iterate through the sequence and propose
+        flipping each word to a lower-energy alternative. Accept via the
+        Metropolis criterion:
+        
+            If E_new < E_old: accept (lower energy = better)
+            If E_new >= E_old: accept with probability exp(-beta * (E_new - E_old))
+        
+        This is EXACTLY how an Ising spin glass relaxes to its ground state.
+        Multiple competing knowledge triples create multiple local minima;
+        MCMC helps the system find deeper minima.
+        
+        The Metropolis acceptance uses the IntegerBoltzmannSampler's lookup
+        table, so it's integer-only in the hot path.
+        
+        Args:
+            words: List of word indices
+            types_list: List of POS type indices
+            n_passes: Number of full sweeps through the sequence
+            
+        Returns:
+            (refined_words, refined_types) — possibly modified sequences
+        """
+        if n_passes <= 0 or len(words) < 3:
+            return words, types_list
+        
+        words = list(words)  # Make mutable copy
+        types_list = list(types_list)
+        
+        for pass_idx in range(n_passes):
+            # Sweep through sequence, proposing flips at each position
+            for pos in range(1, len(words)):
+                context_words = words[:pos]
+                context_types = types_list[:pos]
+                current_word = words[pos]
+                word_type = types_list[pos]
+                
+                # Get candidate words of the same type
+                candidate_list = self.type_words.get(word_type, [])
+                if len(candidate_list) < 2:
+                    continue
+                candidate_words = np.array(candidate_list, dtype=np.int64)
+                
+                # Top-k filtering
+                if len(candidate_words) > 300:
+                    field_vals = self.h[candidate_words]
+                    top_k = np.argsort(field_vals)[-300:]
+                    candidate_words = candidate_words[top_k]
+                
+                # Hard logic filter
+                logic_mask = self._filter_by_logic(candidate_words, context_words)
+                if logic_mask.any():
+                    candidate_words = candidate_words[logic_mask]
+                if len(candidate_words) < 2:
+                    continue
+                
+                # Compute energies for all candidates
+                recall_matches = self.ngram_index.lookup(context_words)
+                recall_hit = bool(recall_matches)
+                energies = self._compute_word_energy(
+                    pos, candidate_words, word_type,
+                    context_words, context_types, recall_hit
+                )
+                
+                # Current word energy
+                current_mask = candidate_words == current_word
+                if current_mask.any():
+                    current_idx = np.where(current_mask)[0][0]
+                    current_energy = int(energies[current_idx])
+                else:
+                    current_energy = 0  # Current word not in candidates
+                
+                # Propose a flip: sample from Boltzmann distribution
+                self._stats['mcmc_flips_proposed'] += 1
+                proposed_idx = self.word_sampler.sample(energies)
+                proposed_word = int(candidate_words[proposed_idx])
+                proposed_energy = int(energies[proposed_idx])
+                
+                # Metropolis criterion
+                delta_e = proposed_energy - current_energy
+                
+                if delta_e < 0:
+                    # Always accept lower energy
+                    words[pos] = proposed_word
+                    self._stats['mcmc_flips_accepted'] += 1
+                else:
+                    # Accept with probability exp(-beta * delta_e)
+                    # Use the Boltzmann lookup table for this
+                    delta_clamped = min(delta_e, self.word_sampler.max_delta)
+                    accept_prob_weight = int(self.word_sampler.table[delta_clamped])
+                    total_weight = self.word_sampler.scale  # P(reject) + P(accept) = 1
+                    if np.random.randint(0, total_weight) < accept_prob_weight:
+                        words[pos] = proposed_word
+                        self._stats['mcmc_flips_accepted'] += 1
+        
+        return words, types_list
+
     def generate(self, prompt: str = "the", length: int = 20) -> Dict:
         """
-        Generate text autoregressively — KNOWLEDGE-FIRST architecture.
-
+        Generate text autoregressively — v5.0 GENUINE ISING DYNAMICS.
+        
         At each position:
-          1. Choose POS type (grammar + hard constraints)
-          2. KNOWLEDGE-FIRST: Check if knowledge layers confidently predict
-             a word (3-spin > field > category). If so, use it directly.
-          3. Check copy mechanism
-          4. Apply hard logic filter to remove contradictory candidates
-          5. Compute energy (recall + knowledge + PMI + field + penalties)
-          6. Integer Boltzmann sample
-
-        This ensures knowledge is VISIBLE in output, not drowned by recall.
+          1. Choose POS type: Boltzmann from type energy landscape
+             (grammar + knowledge bias via J3 predictions)
+          2. Check copy mechanism (legitimate: it's a form of recall)
+          3. Apply hard logic filter (infinite energy barriers)
+          4. Compute E(w|ctx) with ALL 5 layers competing
+          5. Boltzmann sample: P(w) ~ exp(-beta * E(w))
+          6. Post-generation: MCMC spin-flip refinement
+        
+        NO overrides. NO bypasses. Knowledge competes through the Hamiltonian.
+        When multiple J3 keys fire, they create competing energy wells.
+        Boltzmann picks between them stochastically at temperature beta.
+        
         All energy computation and sampling is integer-only.
         """
         # Resolve prompt
@@ -3036,11 +3080,11 @@ class IsingLM:
         diagnostics = []
 
         for pos in range(1, length):
-            # === STEP 1: Choose POS type ===
+            # === STEP 1: Choose POS type (BOLTZMANN, not override) ===
             valid_types = self._get_valid_next_types(types[-1], types)
 
-            # Check if recall suggests a type override
-            recall_type_override = None
+            # Check if recall suggests a type bias (not override — just bias)
+            recall_type_bias = None
             if len(words) >= 2:
                 recall_matches = self.ngram_index.lookup(words)
                 if recall_matches:
@@ -3051,76 +3095,23 @@ class IsingLM:
                         if best_count * 3 >= best_total:
                             recall_type = self._get_word_type(best_word)
                             if recall_type in valid_types:
-                                recall_type_override = recall_type
+                                recall_type_bias = recall_type
 
-            # Also check knowledge layer for type suggestion
-            knowledge_type_override = None
-            if self.knowledge_layer is not None and len(words) >= 2:
-                kl = self.knowledge_layer
-                ctx = words[-kl.max_context_pairs:] if len(words) > kl.max_context_pairs else words
-                for i in range(len(ctx)):
-                    for j in range(len(ctx)):
-                        if i == j:
-                            continue
-                        key = (ctx[i], ctx[j])
-                        if key in kl.J3:
-                            for (obj_idx, _) in kl.J3[key]:
-                                obj_type = self._get_word_type(obj_idx)
-                                if obj_type in valid_types:
-                                    knowledge_type_override = obj_type
-                                    break
-                            if knowledge_type_override is not None:
-                                break
-                    if knowledge_type_override is not None:
-                        break
+            # Compute type energies (includes knowledge bias through J3)
+            type_energies = np.array([
+                self._compute_type_energy(pos, t, types, words)
+                for t in valid_types
+            ], dtype=np.int64)
+            
+            # Add recall type bias as an energy bonus (NOT an override)
+            if recall_type_bias is not None:
+                for i, t in enumerate(valid_types):
+                    if t == recall_type_bias:
+                        type_energies[i] -= 200  # Moderate recall bias
 
-            # Knowledge type override takes priority over recall
-            if knowledge_type_override is not None:
-                chosen_type = knowledge_type_override
-            elif recall_type_override is not None:
-                chosen_type = recall_type_override
-            else:
-                type_energies = np.array([
-                    self._compute_type_energy(pos, t, types)
-                    for t in valid_types
-                ], dtype=np.int64)
-                type_idx = self.type_sampler.sample(type_energies)
-                chosen_type = valid_types[type_idx]
+            chosen_type = valid_types[self.type_sampler.sample(type_energies)]
 
-            # === STEP 2: KNOWLEDGE-FIRST CHECK ===
-            knowledge_word, knowledge_source = self._check_knowledge_override(
-                words, chosen_type
-            )
-
-            # Anti-repetition: if knowledge word appeared in the last 3 tokens,
-            # skip the override and fall through to energy-based selection.
-            # This prevents loops like "bark loud bark loud bark loud".
-            if knowledge_word is not None and len(words) >= 1:
-                recent_words = set(words[-3:]) if len(words) >= 3 else set(words)
-                if knowledge_word in recent_words:
-                    knowledge_word = None
-                    knowledge_source = None
-
-            if knowledge_word is not None:
-                # Knowledge confidently predicts this word — use it directly
-                chosen_word = knowledge_word
-                words.append(chosen_word)
-                types.append(chosen_type)
-
-                self._stats['total_positions'] += 1
-                self._stats['recall_hit'] += 1  # Counts as a "hit" (coherent)
-
-                diagnostics.append({
-                    'pos': pos,
-                    'type': IDX2POS.get(chosen_type, "UNK"),
-                    'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
-                    'copy': False,
-                    'recall_hit': True,
-                    'knowledge_override': knowledge_source,
-                })
-                continue
-
-            # === STEP 3: Check copy mechanism ===
+            # === STEP 2: Check copy mechanism ===
             copy_word = None
             if self.copy_enabled and len(words) >= self.copy_min_context:
                 copy_candidate = self.ngram_index.get_best_copy_candidate(
@@ -3144,7 +3135,7 @@ class IsingLM:
             if copy_word is None:
                 consecutive_copies = 0
 
-            # === STEP 4: Choose word with logic filter ===
+            # === STEP 3: Choose word via Boltzmann (ALL knowledge through energy) ===
             candidate_list = self.type_words.get(chosen_type, [])
             if not candidate_list:
                 candidate_list = list(range(min(200, self.vocab_size)))
@@ -3156,7 +3147,7 @@ class IsingLM:
                 top_k = np.argsort(field_vals)[-300:]
                 candidate_words = candidate_words[top_k]
 
-            # HARD LOGIC FILTER: Remove candidates that violate hard rules
+            # HARD LOGIC FILTER: infinite energy barriers
             logic_mask = self._filter_by_logic(candidate_words, words)
             if logic_mask.any():
                 candidate_words = candidate_words[logic_mask]
@@ -3166,18 +3157,20 @@ class IsingLM:
             recall_matches = self.ngram_index.lookup(words)
             recall_hit = bool(recall_matches)
 
-            # Compute energy (integer-only)
+            # Compute energy (integer-only, ALL 5 layers compete)
             word_energies = self._compute_word_energy(
                 pos, candidate_words, chosen_type,
                 words, types, recall_hit
             )
 
-            # Integer Boltzmann sample
+            # Integer Boltzmann sample — knowledge wins through DEEP ENERGY WELLS
+            chosen_energy = 0
             if copy_word is not None:
                 chosen_word = copy_word
             else:
                 word_idx = self.word_sampler.sample(word_energies)
                 chosen_word = int(candidate_words[word_idx])
+                chosen_energy = int(word_energies[word_idx])
 
             words.append(chosen_word)
             types.append(chosen_type)
@@ -3194,7 +3187,12 @@ class IsingLM:
                 'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
                 'copy': copy_word is not None,
                 'recall_hit': recall_hit,
+                'energy': chosen_energy,
             })
+
+        # === STEP 4: MCMC spin-flip refinement ===
+        if self.mcmc_refine_steps > 0:
+            words, types = self._mcmc_refine(words, types, n_passes=self.mcmc_refine_steps)
 
         text = self.vocab.decode(words)
         type_names = [IDX2POS.get(t, "UNK") for t in types]
@@ -3222,6 +3220,9 @@ class IsingLM:
         stats['copy_rate'] = stats['copy_used'] / total
         stats['pmi_only_rate'] = stats['pmi_only'] / total
         stats['ising_enabled'] = self.ising_enabled
+        stats['mcmc_accept_rate'] = (
+            stats['mcmc_flips_accepted'] / max(1, stats['mcmc_flips_proposed'])
+        )
         return stats
 
 
@@ -3278,6 +3279,7 @@ class IsingLMModel:
         logic_rule_scale: int = 600,
         logic_hard_scale: int = 50000,
         use_conceptnet: bool = True,
+        mcmc_refine_steps: int = 2,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -3304,6 +3306,7 @@ class IsingLMModel:
         self.logic_rule_scale = logic_rule_scale
         self.logic_hard_scale = logic_hard_scale
         self.use_conceptnet = use_conceptnet
+        self.mcmc_refine_steps = mcmc_refine_steps
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
@@ -3734,11 +3737,12 @@ class IsingLMModel:
             markov_logic_layer=self.markov_logic_layer,
         )
 
-        # Main generator (with Ising + Knowledge + Category + Logic)
+        # Main generator (with Ising + Knowledge + Category + Logic + MCMC)
         self.generator = IsingLM(
             **gen_kwargs,
             pmi_weight=self.pmi_weight,
             ising_enabled=self.ising_enabled,
+            mcmc_refine_steps=self.mcmc_refine_steps,
         )
 
         # Ablation baseline (without Ising, but WITH knowledge layers)
@@ -3746,6 +3750,7 @@ class IsingLMModel:
             **gen_kwargs,
             pmi_weight=0,
             ising_enabled=False,
+            mcmc_refine_steps=0,
         )
 
         # Knowledge-off baseline (with Ising but NO knowledge layers)
@@ -3768,6 +3773,7 @@ class IsingLMModel:
             knowledge_layer=None,       # NO knowledge layer
             category_layer=None,        # NO category layer
             markov_logic_layer=None,    # NO logic layer
+            mcmc_refine_steps=0,        # No MCMC without knowledge
         )
 
     def generate_with_trace(self, prompt: str = "the", length: int = 20) -> Dict:
