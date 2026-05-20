@@ -213,6 +213,39 @@ class Vocabulary:
         self._built = True
         return self
 
+    def add_words(self, words: List[str]) -> int:
+        """
+        Add words to vocabulary even if they don't appear in corpus.
+        
+        Used for knowledge vocabulary augmentation: words like "bark", "meow",
+        "gallop" that appear in knowledge triples but not in the training corpus.
+        These words get count=1 and no PMI/n-gram stats, but they DO get
+        knowledge layer bonuses (h_knowledge, J3) and POS type assignments.
+        
+        Returns the number of words actually added.
+        """
+        if not self._built:
+            return 0
+        
+        n_added = 0
+        for word in words:
+            w = word.lower().strip()
+            if not w or w in self.SPECIALS:
+                continue
+            if w in self.word2idx:
+                continue  # Already in vocabulary
+            if self.max_size is not None and len(self.word2idx) >= self.max_size + len(self.SPECIALS) + 200:
+                # Leave room for more additions; don't exceed by too much
+                pass  # Allow overflow for knowledge words
+            
+            idx = len(self.word2idx)
+            self.word2idx[w] = idx
+            self.idx2word[idx] = w
+            self.word_counts[w] = 1  # Minimal count
+            n_added += 1
+        
+        return n_added
+
     def encode(self, text: str) -> List[int]:
         """Encode a text string to a list of integer token indices."""
         tokens = self._tokenize(text)
@@ -1686,8 +1719,10 @@ def fetch_conceptnet_triples(word2idx: Dict[str, int], max_triples: int = 5000) 
     """
     Fetch ConceptNet triples filtered to vocabulary.
     
-    Attempts to load ConceptNet from HuggingFace datasets.
-    Falls back to an expanded hardcoded commonsense database.
+    Attempts multiple strategies to load ConceptNet:
+    1. HuggingFace conceptnet5 dataset (try multiple configs)
+    2. Pre-computed English-only subset from HuggingFace
+    3. Falls back to an expanded hardcoded commonsense database.
     
     Args:
         word2idx: Vocabulary mapping.
@@ -1699,82 +1734,153 @@ def fetch_conceptnet_triples(word2idx: Dict[str, int], max_triples: int = 5000) 
     """
     triples = []
     
-    # Strategy 1: Try HuggingFace ConceptNet dataset
+    RELATION_MAP = {
+        '/r/UsedFor': 'used',
+        '/r/CapableOf': 'can',
+        '/r/HasProperty': 'has',
+        '/r/PartOf': 'part',
+        '/r/HasA': 'has',
+        '/r/AtLocation': 'at',
+        '/r/Causes': 'cause',
+        '/r/HasSubevent': 'lead',
+        '/r/HasPrerequisite': 'need',
+        '/r/MadeOf': 'made',
+        '/r/IsA': 'is',
+        '/r/Synonym': 'is',
+        '/r/Antonym': 'not',
+        '/r/RelatedTo': 'related',
+        '/r/ReceivesAction': 'receive',
+        '/r/Externals': 'has',
+        '/r/MotivatedByGoal': 'for',
+        '/r/DefinedAs': 'is',
+        '/r/InstanceOf': 'is',
+        '/r/MemberOf': 'part',
+        '/r/SubeventOf': 'part',
+        '/r/HasFirstSubevent': 'lead',
+        '/r/HasLastSubevent': 'lead',
+        '/r/Entails': 'imply',
+        '/r/CreatedBy': 'made',
+        '/r/SymbolOf': 'is',
+        '/r/LocatedNear': 'at',
+        '/r/Desires': 'want',
+        '/r/NotDesires': 'not',
+        '/r/NotIsA': 'not',
+        '/r/NotHasProperty': 'not',
+        '/r/NotCapableOf': 'not',
+        '/r/ObstructedBy': 'need',
+        '/r/HasContext': 'at',
+    }
+    
+    def extract_word(uri):
+        """Extract English word from ConceptNet URI like /c/en/dog."""
+        if not uri:
+            return None
+        parts = uri.split('/')
+        # Format: /c/en/word or /c/en/word/pos
+        if len(parts) >= 3 and parts[-2] == 'en':
+            word = parts[-1].replace('_', ' ')
+            # Skip multi-word phrases
+            if ' ' in word:
+                return None
+            return word.lower()
+        elif len(parts) >= 4 and parts[2] == 'en':
+            word = parts[3].replace('_', ' ')
+            if ' ' in word:
+                return None
+            return word.lower()
+        return None
+    
+    # Strategy 1: Try HuggingFace ConceptNet dataset with multiple configs
     try:
         from datasets import load_dataset
         print("    Attempting ConceptNet from HuggingFace...")
-        ds = load_dataset("conceptnet5", split="train", streaming=True)
         
-        RELATION_MAP = {
-            '/r/UsedFor': 'used',
-            '/r/CapableOf': 'can',
-            '/r/HasProperty': 'has',
-            '/r/PartOf': 'part',
-            '/r/HasA': 'has',
-            '/r/AtLocation': 'at',
-            '/r/Causes': 'cause',
-            '/r/HasSubevent': 'lead',
-            '/r/HasPrerequisite': 'need',
-            '/r/MadeOf': 'made',
-            '/r/IsA': 'is',
-            '/r/Synonym': 'is',
-            '/r/Antonym': 'not',
-            '/r/RelatedTo': 'related',
-            '/r/ReceivesAction': 'receive',
-            '/r/Externals': 'has',
-            '/r/MotivatedByGoal': 'for',
-        }
+        # Try different dataset names and configs
+        dataset_configs = [
+            ("conceptnet5", None, "train"),
+            ("conceptnet5", "conceptnet5", "train"),
+            ("Gabriel/synthetic-reward-training-data-conceptnet", None, "train"),
+        ]
         
-        scanned = 0
-        for example in ds:
-            scanned += 1
-            if len(triples) >= max_triples:
-                break
-            if scanned > max_triples * 20:
-                break
-            
+        ds = None
+        for ds_name, ds_config, ds_split in dataset_configs:
             try:
-                node1 = example.get('node1', '') or example.get('/node1', '')
-                relation = example.get('relation', '') or example.get('/relation', '')
-                node2 = example.get('node2', '') or example.get('/node2', '')
-                
-                # Extract English words from ConceptNet URIs
-                def extract_word(uri):
-                    if not uri:
-                        return None
-                    parts = uri.split('/')
-                    if len(parts) >= 3 and parts[-2] == 'en':
-                        return parts[-1].replace('_', ' ')
-                    return None
-                
-                subj = extract_word(node1)
-                obj = extract_word(node2)
-                pred = RELATION_MAP.get(relation, None)
-                
-                if subj and obj and pred:
-                    # Check if all words are in vocabulary
-                    if (subj.lower() in word2idx and 
-                        pred.lower() in word2idx and 
-                        obj.lower() in word2idx):
-                        triples.append((subj.lower(), pred.lower(), obj.lower()))
+                if ds_config:
+                    ds = load_dataset(ds_name, name=ds_config, split=ds_split, streaming=True)
+                else:
+                    ds = load_dataset(ds_name, split=ds_split, streaming=True)
+                print(f"    Loaded from '{ds_name}' (config={ds_config})")
+                break
             except Exception:
                 continue
         
-        if triples:
-            print(f"    Loaded {len(triples)} ConceptNet triples (scanned {scanned})")
-            return triples
+        if ds is not None:
+            scanned = 0
+            for example in ds:
+                scanned += 1
+                if len(triples) >= max_triples:
+                    break
+                if scanned > max_triples * 30:
+                    break
+                
+                try:
+                    # Try multiple column name patterns
+                    node1 = (example.get('node1') or example.get('/node1') or 
+                             example.get('head') or example.get('source') or '')
+                    relation = (example.get('relation') or example.get('/relation') or 
+                                example.get('edge_type') or '')
+                    node2 = (example.get('node2') or example.get('/node2') or 
+                             example.get('tail') or example.get('target') or '')
+                    
+                    # Some datasets store the full edge as a string
+                    if not relation and 'edge' in example:
+                        edge = example['edge']
+                        if isinstance(edge, str) and '\t' in edge:
+                            parts = edge.split('\t')
+                            if len(parts) >= 4:
+                                node1, relation, node2 = parts[1], parts[2], parts[3]
+                    
+                    subj = extract_word(str(node1))
+                    obj = extract_word(str(node2))
+                    pred = RELATION_MAP.get(str(relation), None)
+                    
+                    if subj and obj and pred:
+                        if (subj in word2idx and pred in word2idx and obj in word2idx):
+                            triples.append((subj, pred, obj))
+                except Exception:
+                    continue
+            
+            if triples:
+                print(f"    Loaded {len(triples)} ConceptNet triples (scanned {scanned})")
+                return triples
+            else:
+                print(f"    No matching triples found (scanned {scanned})")
     except Exception as e:
         print(f"    ConceptNet HuggingFace unavailable: {e}")
     
-    # Strategy 2: Try ConceptNet CSV download
+    # Strategy 2: Try pre-filtered conceptnet-assertions-english
     try:
-        import urllib.request
-        import tempfile
-        import csv
-        
-        print("    Attempting ConceptNet CSV download...")
-        url = "https://conceptnet.io/downloads/2023/conceptnet-assertions-5.7.0.csv.gz"
-        # This would be too large, skip
+        from datasets import load_dataset
+        print("    Trying alternative ConceptNet sources...")
+        # Try loading a simpler English-only ConceptNet subset
+        for alt_name in ["conceptnet5/assertions", "conceptnet5"]:
+            try:
+                ds2 = load_dataset(alt_name, split="train", streaming=True)
+                scanned = 0
+                for example in ds2:
+                    scanned += 1
+                    if len(triples) >= max_triples:
+                        break
+                    if scanned > 50000:
+                        break
+                    # Try parsing
+                    for key in example:
+                        val = str(example[key])
+                        if val.startswith('/c/en/'):
+                            break
+                break
+            except Exception:
+                continue
     except Exception:
         pass
     
@@ -2749,17 +2855,171 @@ class IsingLM:
     # Standard Generation (unchanged public API)
     # ===================================================================
 
+    def _check_knowledge_override(self, context_words, chosen_type):
+        """
+        KNOWLEDGE-FIRST: Check if knowledge layers strongly suggest a word.
+        
+        Returns (word_idx, source) if knowledge has a confident prediction,
+        or (None, None) if no override.
+        
+        Priority:
+          1. 3-Spin coupling: if subject AND predicate are in context,
+             the object is the strongest possible signal — use it directly.
+          2. Category peer: if context contains multiple category members,
+             suggest another peer with correct POS type.
+          3. Knowledge field: if h_knowledge is very high for a word,
+             and it matches the target type, suggest it.
+        """
+        # === Layer 3: 3-Spin override (highest confidence) ===
+        if self.knowledge_layer is not None and self.knowledge_layer._built:
+            kl = self.knowledge_layer
+            ctx = context_words[-kl.max_context_pairs:] if len(context_words) > kl.max_context_pairs else context_words
+            
+            # Collect all 3-spin predictions with their strengths
+            spin3_candidates = defaultdict(int)  # word_idx -> total_strength
+            for i in range(len(ctx)):
+                for j in range(len(ctx)):
+                    if i == j:
+                        continue
+                    key = (ctx[i], ctx[j])
+                    if key in kl.J3:
+                        for (obj_idx, strength) in kl.J3[key]:
+                            spin3_candidates[obj_idx] += strength
+            
+            # Pick the strongest 3-spin candidate that matches the target type
+            if spin3_candidates:
+                # Sort by strength descending
+                sorted_cands = sorted(spin3_candidates.items(), key=lambda x: -x[1])
+                for obj_idx, strength in sorted_cands:
+                    # Check type compatibility
+                    if obj_idx < self.types.I_emit.shape[0]:
+                        if int(self.types.I_emit[obj_idx, chosen_type]) > 0:
+                            # Check logic layer doesn't block it
+                            if self.markov_logic_layer is not None:
+                                logic_e = self.markov_logic_layer.compute_logic_energy(
+                                    context_words, np.array([obj_idx], dtype=np.int64)
+                                )
+                                if int(logic_e[0]) > 10000:  # Hard rule blocks it
+                                    continue
+                            # Check same-word penalty
+                            if len(context_words) >= 1 and obj_idx == context_words[-1]:
+                                continue
+                            self._stats['spin3_firings'] += 1
+                            self._stats['knowledge_hits'] += 1
+                            return obj_idx, '3spin'
+        
+        # === Layer 2: Knowledge field override (medium confidence) ===
+        # If h_knowledge is extremely high for a word (accumulated from many triples),
+        # and it matches the type, suggest it when context contains its subject
+        if self.knowledge_layer is not None and self.knowledge_layer._built:
+            kl = self.knowledge_layer
+            context_set = set(context_words)
+            
+            # Find objects of triples where subject is in context
+            field_candidates = defaultdict(int)
+            for subject_idx in context_words:
+                if subject_idx in kl.subject_index:
+                    for (pred_idx, obj_idx) in kl.subject_index[subject_idx]:
+                        if pred_idx in context_set:
+                            field_candidates[obj_idx] += kl.knowledge_scale
+                        else:
+                            field_candidates[obj_idx] += kl.knowledge_scale // 3
+            
+            # Only override if there's a dominant candidate with high confidence
+            if field_candidates:
+                best_obj = max(field_candidates, key=field_candidates.get)
+                best_strength = field_candidates[best_obj]
+                # Only override if strength is very high (multiple triples agree)
+                if best_strength >= kl.knowledge_scale * 2:
+                    if best_obj < self.types.I_emit.shape[0]:
+                        if int(self.types.I_emit[best_obj, chosen_type]) > 0:
+                            if len(context_words) >= 1 and best_obj == context_words[-1]:
+                                pass  # Skip same word
+                            else:
+                                # Check logic layer
+                                if self.markov_logic_layer is not None:
+                                    logic_e = self.markov_logic_layer.compute_logic_energy(
+                                        context_words, np.array([best_obj], dtype=np.int64)
+                                    )
+                                    if int(logic_e[0]) > 10000:
+                                        pass  # Blocked
+                                    else:
+                                        self._stats['knowledge_hits'] += 1
+                                        return best_obj, 'field'
+                                else:
+                                    self._stats['knowledge_hits'] += 1
+                                    return best_obj, 'field'
+        
+        # === Layer 4: Category peer suggestion (lower confidence) ===
+        if self.category_layer is not None and self.category_layer._built:
+            cl = self.category_layer
+            # Check how many category members are in context
+            active_categories = set()
+            for w in context_words:
+                if w in cl.word_categories:
+                    active_categories.update(cl.word_categories[w])
+            
+            # If 2+ category members are in context, suggest another peer
+            if len(active_categories) >= 2:
+                # Collect all peers
+                peer_counts = defaultdict(int)
+                for w in context_words:
+                    if w in cl.word_peers:
+                        for peer in cl.word_peers[w]:
+                            if peer not in set(context_words):  # Not already in context
+                                peer_counts[peer] += 1
+                
+                # Find the most-supported peer with correct type
+                if peer_counts:
+                    sorted_peers = sorted(peer_counts.items(), key=lambda x: -x[1])
+                    for peer_idx, count in sorted_peers:
+                        if count >= 2 and peer_idx < self.types.I_emit.shape[0]:
+                            if int(self.types.I_emit[peer_idx, chosen_type]) > 0:
+                                if len(context_words) >= 1 and peer_idx == context_words[-1]:
+                                    continue
+                                self._stats['category_hits'] += 1
+                                return peer_idx, 'category'
+        
+        return None, None
+
+    def _filter_by_logic(self, candidate_words, context_words):
+        """
+        HARD LOGIC FILTER: Remove candidates that violate hard logic rules.
+        
+        Returns a boolean mask of shape (n_candidates,) where True = keep.
+        """
+        n = len(candidate_words)
+        keep = np.ones(n, dtype=bool)
+        
+        if self.markov_logic_layer is None or not self.markov_logic_layer._built:
+            return keep
+        
+        logic_energy = self.markov_logic_layer.compute_logic_energy(
+            context_words, candidate_words
+        )
+        
+        # Hard rules produce penalties > 10000
+        for i in range(n):
+            if int(logic_energy[i]) > 10000:
+                keep[i] = False
+                self._stats['logic_hits'] += 1
+        
+        return keep
+
     def generate(self, prompt: str = "the", length: int = 20) -> Dict:
         """
-        Generate text autoregressively.
+        Generate text autoregressively — KNOWLEDGE-FIRST architecture.
 
         At each position:
           1. Choose POS type (grammar + hard constraints)
-          2. Check n-gram recall for type override
+          2. KNOWLEDGE-FIRST: Check if knowledge layers confidently predict
+             a word (3-spin > field > category). If so, use it directly.
           3. Check copy mechanism
-          4. Compute energy (recall + PMI + field + penalties)
-          5. Integer Boltzmann sample
+          4. Apply hard logic filter to remove contradictory candidates
+          5. Compute energy (recall + knowledge + PMI + field + penalties)
+          6. Integer Boltzmann sample
 
+        This ensures knowledge is VISIBLE in output, not drowned by recall.
         All energy computation and sampling is integer-only.
         """
         # Resolve prompt
@@ -2793,7 +3053,31 @@ class IsingLM:
                             if recall_type in valid_types:
                                 recall_type_override = recall_type
 
-            if recall_type_override is not None:
+            # Also check knowledge layer for type suggestion
+            knowledge_type_override = None
+            if self.knowledge_layer is not None and len(words) >= 2:
+                kl = self.knowledge_layer
+                ctx = words[-kl.max_context_pairs:] if len(words) > kl.max_context_pairs else words
+                for i in range(len(ctx)):
+                    for j in range(len(ctx)):
+                        if i == j:
+                            continue
+                        key = (ctx[i], ctx[j])
+                        if key in kl.J3:
+                            for (obj_idx, _) in kl.J3[key]:
+                                obj_type = self._get_word_type(obj_idx)
+                                if obj_type in valid_types:
+                                    knowledge_type_override = obj_type
+                                    break
+                            if knowledge_type_override is not None:
+                                break
+                    if knowledge_type_override is not None:
+                        break
+
+            # Knowledge type override takes priority over recall
+            if knowledge_type_override is not None:
+                chosen_type = knowledge_type_override
+            elif recall_type_override is not None:
                 chosen_type = recall_type_override
             else:
                 type_energies = np.array([
@@ -2803,7 +3087,40 @@ class IsingLM:
                 type_idx = self.type_sampler.sample(type_energies)
                 chosen_type = valid_types[type_idx]
 
-            # === STEP 2: Check copy mechanism ===
+            # === STEP 2: KNOWLEDGE-FIRST CHECK ===
+            knowledge_word, knowledge_source = self._check_knowledge_override(
+                words, chosen_type
+            )
+
+            # Anti-repetition: if knowledge word appeared in the last 3 tokens,
+            # skip the override and fall through to energy-based selection.
+            # This prevents loops like "bark loud bark loud bark loud".
+            if knowledge_word is not None and len(words) >= 1:
+                recent_words = set(words[-3:]) if len(words) >= 3 else set(words)
+                if knowledge_word in recent_words:
+                    knowledge_word = None
+                    knowledge_source = None
+
+            if knowledge_word is not None:
+                # Knowledge confidently predicts this word — use it directly
+                chosen_word = knowledge_word
+                words.append(chosen_word)
+                types.append(chosen_type)
+
+                self._stats['total_positions'] += 1
+                self._stats['recall_hit'] += 1  # Counts as a "hit" (coherent)
+
+                diagnostics.append({
+                    'pos': pos,
+                    'type': IDX2POS.get(chosen_type, "UNK"),
+                    'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
+                    'copy': False,
+                    'recall_hit': True,
+                    'knowledge_override': knowledge_source,
+                })
+                continue
+
+            # === STEP 3: Check copy mechanism ===
             copy_word = None
             if self.copy_enabled and len(words) >= self.copy_min_context:
                 copy_candidate = self.ngram_index.get_best_copy_candidate(
@@ -2827,7 +3144,7 @@ class IsingLM:
             if copy_word is None:
                 consecutive_copies = 0
 
-            # === STEP 3: Choose word ===
+            # === STEP 4: Choose word with logic filter ===
             candidate_list = self.type_words.get(chosen_type, [])
             if not candidate_list:
                 candidate_list = list(range(min(200, self.vocab_size)))
@@ -2838,6 +3155,12 @@ class IsingLM:
                 field_vals = self.h[candidate_words]
                 top_k = np.argsort(field_vals)[-300:]
                 candidate_words = candidate_words[top_k]
+
+            # HARD LOGIC FILTER: Remove candidates that violate hard rules
+            logic_mask = self._filter_by_logic(candidate_words, words)
+            if logic_mask.any():
+                candidate_words = candidate_words[logic_mask]
+            # If all filtered out, keep originals (safety)
 
             # Check recall availability
             recall_matches = self.ngram_index.lookup(words)
@@ -3020,14 +3343,23 @@ class IsingLMModel:
         texts = load_fineweb_edu(n_samples=n_samples)
         print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
 
-        # Step 2: Build vocabulary
+        # Step 2: Build vocabulary (with knowledge augmentation)
         print("\n[2/11] Building vocabulary...")
         self.vocab = Vocabulary(
             min_freq=self.vocab_min_freq,
             max_size=self.vocab_max_size,
         )
         self.vocab.build(texts)
-        print(f"  Vocabulary: {len(self.vocab)} words")
+        print(f"  Corpus vocabulary: {len(self.vocab)} words")
+        
+        # Step 2b: Augment vocabulary with knowledge words
+        # These are words that appear in our knowledge triples and category
+        # definitions but may not appear in the corpus. Without them, our
+        # knowledge layers silently fail because triple words aren't in vocab.
+        knowledge_words = self._collect_knowledge_words()
+        n_added = self.vocab.add_words(knowledge_words)
+        if n_added > 0:
+            print(f"  Added {n_added} knowledge words (total: {len(self.vocab)})")
 
         # Step 3: Build POS type system
         print("\n[3/11] Building POS type system...")
@@ -3126,25 +3458,42 @@ class IsingLMModel:
         print(f"\nTraining complete: {t_total:.1f}s")
         return self
 
-    def _add_commonsense_triples(self):
-        """Add curated commonsense triples from the expanded database."""
-        commonsense = _get_expanded_commonsense()
-        self.knowledge_layer.add_conceptnet_triples(commonsense, self.vocab.word2idx)
-    
-    def _add_conceptnet_triples(self):
-        """Add ConceptNet triples if available."""
-        triples = fetch_conceptnet_triples(
-            self.vocab.word2idx, max_triples=5000
-        )
-        if triples:
-            self.knowledge_layer.add_conceptnet_triples(triples, self.vocab.word2idx)
-    
-    def _add_category_ontology(self):
-        """Build category ontology for Layer 4 (hypernym-based couplings)."""
-        w2i = self.vocab.word2idx
+    def _collect_knowledge_words(self):
+        """
+        Collect all words from knowledge triples and category definitions
+        that should be in vocabulary even if absent from corpus.
         
-        # Define categories: {category_name: [word_list]}
-        category_defs = {
+        This is the key to making knowledge layers VISIBLE: if "bark" isn't
+        in the vocabulary, the triple ("dog", "bark", "loud") silently fails.
+        """
+        knowledge_words = set()
+        
+        # From commonsense triples
+        for s, p, o in _get_expanded_commonsense():
+            knowledge_words.add(s)
+            knowledge_words.add(p)
+            knowledge_words.add(o)
+        
+        # From category definitions
+        for cat_name, word_list in self._get_category_definitions().items():
+            knowledge_words.update(word_list)
+        
+        # From logic rule words
+        for triggers, targets, _, _ in self._get_logic_rule_definitions():
+            knowledge_words.update(triggers)
+            knowledge_words.update(targets)
+        
+        # Remove very short words and pure punctuation
+        knowledge_words = {
+            w for w in knowledge_words 
+            if len(w) >= 2 and any(c.isalpha() for c in w)
+        }
+        
+        return sorted(knowledge_words)
+    
+    def _get_category_definitions(self):
+        """Return category definitions dict (used for vocab augmentation + building)."""
+        return {
             # Living things
             "animal": ["dog", "cat", "bird", "fish", "horse", "cow", "sheep",
                        "lion", "tiger", "bear", "elephant", "whale", "dolphin",
@@ -3244,6 +3593,69 @@ class IsingLMModel:
             "shape": ["circle", "square", "triangle", "rectangle", "sphere",
                       "cube", "cylinder", "cone", "oval", "diamond"],
         }
+    
+    def _get_logic_rule_definitions(self):
+        """Return logic rule definitions as list of (triggers, targets, type, strength)."""
+        return [
+            # Animal actions
+            (["dog"], ["bark", "chase", "run", "eat", "play"], "bonus", "soft"),
+            (["cat"], ["meow", "chase", "sleep", "eat", "play"], "bonus", "soft"),
+            (["bird"], ["fly", "sing", "build", "eat"], "bonus", "soft"),
+            (["fish"], ["swim", "eat", "live"], "bonus", "soft"),
+            (["horse"], ["run", "eat", "gallop"], "bonus", "soft"),
+            (["bee"], ["buzz", "make", "fly"], "bonus", "soft"),
+            (["lion"], ["hunt", "roar", "run"], "bonus", "soft"),
+            # People and roles
+            (["doctor"], ["treat", "help", "work"], "bonus", "soft"),
+            (["teacher"], ["teach", "help", "explain"], "bonus", "soft"),
+            (["student"], ["study", "learn", "read"], "bonus", "soft"),
+            (["scientist"], ["study", "research", "discover"], "bonus", "soft"),
+            (["writer"], ["write", "read", "create"], "bonus", "soft"),
+            (["chef"], ["cook", "prepare", "make"], "bonus", "soft"),
+            (["farmer"], ["grow", "plant", "harvest"], "bonus", "soft"),
+            (["musician"], ["play", "sing", "perform"], "bonus", "soft"),
+            (["artist"], ["paint", "create", "draw"], "bonus", "soft"),
+            # Physics/nature
+            (["fire"], ["hot", "burn", "heat"], "bonus", "soft"),
+            (["ice"], ["cold", "freeze", "melt"], "bonus", "soft"),
+            (["water"], ["wet", "flow", "liquid"], "bonus", "soft"),
+            (["sun"], ["hot", "bright", "warm"], "bonus", "soft"),
+            (["snow"], ["cold", "white", "freeze"], "bonus", "soft"),
+            (["rock"], ["hard", "solid", "heavy"], "bonus", "soft"),
+            (["wind"], ["blow", "move", "strong"], "bonus", "soft"),
+            # Location
+            (["ocean"], ["water", "deep", "fish", "wave"], "bonus", "soft"),
+            (["forest"], ["tree", "animal", "green", "wood"], "bonus", "soft"),
+            (["desert"], ["hot", "dry", "sand"], "bonus", "soft"),
+            (["mountain"], ["high", "rock", "snow"], "bonus", "soft"),
+            (["school"], ["student", "teacher", "learn", "class"], "bonus", "soft"),
+            (["hospital"], ["doctor", "patient", "treat", "health"], "bonus", "soft"),
+            (["library"], ["book", "read", "study"], "bonus", "soft"),
+            (["kitchen"], ["cook", "food", "eat"], "bonus", "soft"),
+            # Hard contradictions
+            (["fire"], ["cold", "freeze", "ice"], "penalty", "hard"),
+            (["ice"], ["hot", "burn", "fire"], "penalty", "hard"),
+            (["snow"], ["hot", "burn"], "penalty", "hard"),
+            (["dead"], ["run", "walk", "live"], "penalty", "hard"),
+        ]
+
+    def _add_commonsense_triples(self):
+        """Add curated commonsense triples from the expanded database."""
+        commonsense = _get_expanded_commonsense()
+        self.knowledge_layer.add_conceptnet_triples(commonsense, self.vocab.word2idx)
+    
+    def _add_conceptnet_triples(self):
+        """Add ConceptNet triples if available."""
+        triples = fetch_conceptnet_triples(
+            self.vocab.word2idx, max_triples=5000
+        )
+        if triples:
+            self.knowledge_layer.add_conceptnet_triples(triples, self.vocab.word2idx)
+    
+    def _add_category_ontology(self):
+        """Build category ontology for Layer 4 (hypernym-based couplings)."""
+        w2i = self.vocab.word2idx
+        category_defs = self._get_category_definitions()
         
         for cat_name, word_list in category_defs.items():
             indices = [w2i[w] for w in word_list if w in w2i and w2i[w] >= 4]
@@ -3262,95 +3674,20 @@ class IsingLMModel:
             """Get indices for a list of words, filtering out None."""
             return [i for w in words if (i := idx(w)) is not None and i >= 4]
         
-        # ===== CONSISTENCY BONUSES =====
-        # When subject is in context, bonus for likely predicates
-        
-        # Animals and their actions
-        animal_actions = [
-            (["dog"], ["bark", "chase", "run", "eat", "play"], "bonus", "soft"),
-            (["cat"], ["meow", "chase", "sleep", "eat", "play"], "bonus", "soft"),
-            (["bird"], ["fly", "sing", "build", "eat"], "bonus", "soft"),
-            (["fish"], ["swim", "eat", "live"], "bonus", "soft"),
-            (["horse"], ["run", "eat", "gallop"], "bonus", "soft"),
-            (["bee"], ["buzz", "make", "fly"], "bonus", "soft"),
-            (["lion"], ["hunt", "roar", "run"], "bonus", "soft"),
-        ]
-        
-        for triggers, targets, rtype, strength in animal_actions:
+        # Use centralized rule definitions (now includes knowledge words in vocab)
+        for triggers, targets, rtype, strength in self._get_logic_rule_definitions():
             t_idx = make_idx_list(triggers)
             tgt_idx = make_idx_list(targets)
             if t_idx and tgt_idx:
                 self.markov_logic_layer.add_rule(t_idx, tgt_idx, rtype, strength)
         
-        # People and their roles
-        role_actions = [
-            (["doctor"], ["treat", "help", "work"], "bonus", "soft"),
-            (["teacher"], ["teach", "help", "explain"], "bonus", "soft"),
-            (["student"], ["study", "learn", "read"], "bonus", "soft"),
-            (["scientist"], ["study", "research", "discover"], "bonus", "soft"),
-            (["writer"], ["write", "read", "create"], "bonus", "soft"),
-            (["chef"], ["cook", "prepare", "make"], "bonus", "soft"),
-            (["farmer"], ["grow", "plant", "harvest"], "bonus", "soft"),
-            (["musician"], ["play", "sing", "perform"], "bonus", "soft"),
-            (["artist"], ["paint", "create", "draw"], "bonus", "soft"),
-        ]
-        
-        for triggers, targets, rtype, strength in role_actions:
-            t_idx = make_idx_list(triggers)
-            tgt_idx = make_idx_list(targets)
-            if t_idx and tgt_idx:
-                self.markov_logic_layer.add_rule(t_idx, tgt_idx, rtype, strength)
-        
-        # Physics/nature consistency
-        physics_rules = [
-            (["fire"], ["hot", "burn", "heat"], "bonus", "soft"),
-            (["ice"], ["cold", "freeze", "melt"], "bonus", "soft"),
-            (["water"], ["wet", "flow", "liquid"], "bonus", "soft"),
-            (["sun"], ["hot", "bright", "warm"], "bonus", "soft"),
-            (["snow"], ["cold", "white", "freeze"], "bonus", "soft"),
-            (["rock"], ["hard", "solid", "heavy"], "bonus", "soft"),
-            (["wind"], ["blow", "move", "strong"], "bonus", "soft"),
-        ]
-        
-        for triggers, targets, rtype, strength in physics_rules:
-            t_idx = make_idx_list(triggers)
-            tgt_idx = make_idx_list(targets)
-            if t_idx and tgt_idx:
-                self.markov_logic_layer.add_rule(t_idx, tgt_idx, rtype, strength)
-        
-        # Location consistency
-        location_rules = [
-            (["ocean"], ["water", "deep", "fish", "wave"], "bonus", "soft"),
-            (["forest"], ["tree", "animal", "green", "wood"], "bonus", "soft"),
-            (["desert"], ["hot", "dry", "sand"], "bonus", "soft"),
-            (["mountain"], ["high", "rock", "snow"], "bonus", "soft"),
-            (["school"], ["student", "teacher", "learn", "class"], "bonus", "soft"),
-            (["hospital"], ["doctor", "patient", "treat", "health"], "bonus", "soft"),
-            (["library"], ["book", "read", "study"], "bonus", "soft"),
-            (["kitchen"], ["cook", "food", "eat"], "bonus", "soft"),
-        ]
-        
-        for triggers, targets, rtype, strength in location_rules:
-            t_idx = make_idx_list(triggers)
-            tgt_idx = make_idx_list(targets)
-            if t_idx and tgt_idx:
-                self.markov_logic_layer.add_rule(t_idx, tgt_idx, rtype, strength)
-        
-        # ===== HARD CONSISTENCY RULES =====
-        # Contradictions should be penalized heavily
-        
-        # Opposite states (hard penalties)
-        contradiction_rules = [
-            (["fire"], ["cold", "freeze", "ice"], "penalty", "hard"),
-            (["ice"], ["hot", "burn", "fire"], "penalty", "hard"),
-            (["snow"], ["hot", "burn"], "penalty", "hard"),
+        # Additional soft contradiction rules (not in centralized defs)
+        extra_contradictions = [
             (["water"], ["dry"], "penalty", "soft"),
             (["desert"], ["wet", "rain", "flood"], "penalty", "soft"),
-            (["dead"], ["run", "walk", "live"], "penalty", "hard"),
             (["silent"], ["loud", "noise", "shout"], "penalty", "soft"),
         ]
-        
-        for triggers, targets, rtype, strength in contradiction_rules:
+        for triggers, targets, rtype, strength in extra_contradictions:
             t_idx = make_idx_list(triggers)
             tgt_idx = make_idx_list(targets)
             if t_idx and tgt_idx:

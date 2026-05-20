@@ -127,7 +127,7 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING KNOWLEDGE MACHINE (v3.0 — 5-Layer Architecture)")
+    print("ISING KNOWLEDGE MACHINE (v4.0 — Knowledge-First Architecture)")
     print("=" * 70)
     print()
     print("5-Layer Architecture:")
@@ -137,19 +137,19 @@ def main():
     print("  Layer 4: Category Couplings J_category (hypernym-based)")
     print("  Layer 5: Markov Logic Penalty (factual consistency)")
     print()
-    print("Scaling Improvements:")
-    print("  Vocabulary: V=8000 (was 3000)")
-    print("  Triple coverage: 500+ hardcoded + ConceptNet")
-    print("  knowledge_scale=2000, spin3_scale=3000 (much stronger)")
-    print("  30+ category groups, 30+ logic rules")
+    print("v4.0 Improvements:")
+    print("  KNOWLEDGE-FIRST: Knowledge layers override recall when confident")
+    print("  Vocab augmentation: Knowledge words added even if absent from corpus")
+    print("  Improved ConceptNet loader with multiple fallback strategies")
+    print("  Hard logic filter removes contradictory candidates BEFORE sampling")
     print()
 
     t0 = time.time()
 
     model = IsingLMModel(
-        # Vocabulary — SCALED UP from 3000 to 8000
-        vocab_min_freq=3,            # Was 5, lowered to include more words
-        vocab_max_size=8000,         # Was 3000, now 8000
+        # Vocabulary — with knowledge augmentation
+        vocab_min_freq=3,
+        vocab_max_size=8000,
 
         # N-gram and PMI settings
         ngram_max_n=5,
@@ -158,15 +158,15 @@ def main():
         pmi_min_count=2,
         pmi_cap=10,
 
-        # Energy scales — STRENGTHENED knowledge influence
-        recall_scale=1000,           # Primary signal (unchanged)
-        pmi_weight=3,
+        # Energy scales — v4.0: Knowledge-first architecture
+        recall_scale=800,            # Lowered from 1000 — recall no longer dominates
+        pmi_weight=5,                # Increased from 3 — PMI matters more when recall misses
         field_weight=1,
-        knowledge_scale=2000,        # Was 500, now 2000 (4x stronger)
-        spin3_scale=3000,            # Was 800, now 3000 (3.75x stronger)
-        category_scale=400,          # NEW: Layer 4
-        logic_rule_scale=600,        # NEW: Layer 5 soft
-        logic_hard_scale=50000,      # NEW: Layer 5 hard
+        knowledge_scale=2000,        # Layer 2: strong external field
+        spin3_scale=3000,            # Layer 3: strongest knowledge signal (override)
+        category_scale=600,          # Layer 4: increased from 400
+        logic_rule_scale=800,        # Layer 5: increased from 600
+        logic_hard_scale=50000,      # Layer 5: hard contradictions
 
         # Sampling parameters
         beta_type=0.01,
@@ -205,9 +205,11 @@ def main():
         n_copies = sum(1 for d in result['diagnostics'] if d['copy'])
         n_recalls = sum(1 for d in result['diagnostics'] if d['recall_hit'])
         n_pmi = sum(1 for d in result['diagnostics'] if not d['recall_hit'])
+        n_knowledge = sum(1 for d in result['diagnostics'] if d.get('knowledge_override'))
         flag = " LOOP" if "of the of the" in text else ""
         print(f"  '{prompt}' -> {text}{flag}")
-        print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}")
+        knowledge_str = f" knowledge={n_knowledge}" if n_knowledge > 0 else ""
+        print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}{knowledge_str}")
 
     # ======================================================================
     # PHASE 2: 5-Layer Knowledge Test
@@ -338,7 +340,7 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"\n  Architecture: 5-Layer Ising Knowledge Machine")
+    print(f"\n  Architecture: 5-Layer Ising Knowledge Machine (v4.0 Knowledge-First)")
     print(f"  Layer 1: PMI couplings + local field")
     print(f"  Layer 2: Knowledge external field (h_knowledge)")
     print(f"  Layer 3: 3-Spin couplings (J3 SPO triples)")

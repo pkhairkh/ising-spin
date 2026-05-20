@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ising-spin"
-version = "3.0.0"
-description = "Ising-Enhanced N-Gram Language Model — Integer-only text generation using PMI couplings and Boltzmann sampling"
+version = "4.0.0"
+description = "Ising Knowledge Machine — Knowledge-First integer-only text generation using 5-layer Ising spin model"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
