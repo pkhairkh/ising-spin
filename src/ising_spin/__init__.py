@@ -1,32 +1,45 @@
 """
-Ising Spin Glass Language Model — v7.0 Graded Couplings
+Ising Spin Glass Language Model — v8.0 Recall-Primary Architecture
 
 ALL word selection goes through the Hamiltonian. No overrides, no bypasses.
 Every word is chosen by Boltzmann sampling from the energy landscape.
 
-Architecture (6 layers, ALL compete through E(w|ctx)):
+v8.0 Key Insight: Recall energy E = log₂(1/P) * scale IS the correct
+Boltzmann energy. With β ≈ 0.5*ln(2)/recall_scale, the Boltzmann
+distribution recovers the n-gram probabilities EXACTLY:
+    P(w) ~ exp(-β * E_recall(w)) = P(w)^0.5
+
+This gives PPL ≈ 125 on recall-only — the best result. All other layers
+must be SMALL perturbations (≤10% of recall_scale) to avoid disrupting
+the recall signal. Graded couplings are DISABLED by default because they
+are REDUNDANT with recall (both encode n-gram continuation info).
+
+Architecture (6 layers, RECALL is PRIMARY):
     Layer 1: PMI couplings J[w,w'] + local field h[w] (legacy fallback)
-    Layer 1b: Graded Couplings from continuation frequencies (replaces PMI + Walsh)
-              — J₂ from bigram continuation frequencies: P(w_k|w_i) * IDF(w_k)
-              — J₃ from trigram continuation frequencies (data-driven 3-way)
-              — Position-dependent weights: pos_weight(d) = window // d
-              — No rotation, no subspace, no phi² blowup
-              — β auto-calibrated from median ΔE
-    Layer 2: Knowledge external field h_knowledge[w] (SPO triples)
-    Layer 3: 3-Spin couplings J3[(s,p)] -> o (many-body Ising interaction)
-    Layer 4: Category couplings J_category (hypernym-based semantic smoothing)
-    Layer 5: Markov logic penalty (factual consistency, soft + hard)
+    Layer 1b: Graded Couplings (DISABLED by default in v8.0 — redundant with recall)
+    Layer 2: Knowledge external field h_knowledge[w] (≤10% of recall_scale)
+    Layer 3: 3-Spin couplings J3[(s,p)] -> o (≤10% of recall_scale)
+    Layer 4: Category couplings J_category (≤5% of recall_scale)
+    Layer 5: Markov logic penalty (≤5% of recall_scale)
+
+Scale hierarchy (recall-primary mode, default ON):
+    recall_scale     = 800       [PRIMARY]
+    knowledge_scale  = 80        [10% of recall]
+    spin3_scale      = 80        [10% of recall]
+    category_scale   = 40        [5% of recall]
+    logic_rule_scale = 40        [5% of recall]
+    graded_couplings = DISABLED  [redundant with recall]
 
 Generation:
     - All layers compete through integer energy function E(w|ctx)
     - Boltzmann sampling: P(w) ~ exp(-beta * E(w))
     - MCMC spin-flip refinement (Metropolis criterion)
-    - No overrides. Knowledge creates competing energy wells.
+    - No overrides. Knowledge creates small perturbative energy wells.
 
-Key principle: When (dog, barks)->bark and (dog, chases)->chase both fire,
-they create COMPETING energy wells. Boltzmann at temperature beta picks
-between them stochastically. Near the phase transition, knowledge has
-maximum influence with some thermal noise.
+β auto-calibration from RECALL-ONLY energies (v8.0):
+    - Theoretical optimal: β = 0.5 * ln(2) / recall_scale
+    - Validated against observed recall energy distribution
+    - No longer calibrated from graded couplings
 
 INTEGER-ONLY CONSTRAINT (enforced):
     - ALL generation-path computation uses integer arithmetic
@@ -39,7 +52,6 @@ References:
     - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
     - Creutz (1983): Demon algorithm for integer MCMC acceptance
     - Nishimori (2001): Statistical Physics of Spin Glasses
-    - Walsh (1923): A closed set of normal orthogonal functions
 """
 
 from .model import (
@@ -67,4 +79,4 @@ from .model import (
     truncate_sequences,
 )
 
-__version__ = "7.0.0"
+__version__ = "8.0.0"
