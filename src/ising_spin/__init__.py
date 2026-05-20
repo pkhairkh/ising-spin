@@ -1,28 +1,28 @@
 """
-Ising Spin Language Model — V12 Coherent Generation
+Ising Spin Language Model — V14 Clean Rebuild
 
-Integer-only text generation using Ising spin models with exact token recall.
+Integer-only text generation using Ising PMI couplings with exact n-gram recall.
 
-Architecture (V12 — Coherent Autoregressive + Exact Recall):
-    - Autoregressive generation: P(w_t | w_1,...,w_{t-1}) at each position
-    - Exact n-gram recall: GFST-HMB-inspired exact token storage and retrieval
-    - Kneser-Ney backoff: continuation counts for graceful fallback
-    - Interpolation: adaptive recall/PMI/unigram weighting
-    - Type-compatible recall: grammar constraints override recall suggestions
-    - Function-word anti-loop: max 2 consecutive closed-class words
-    - Copy-fade: smooth transitions between copied and generated segments
-    - Copy loop detection: prevent infinite phrase repetition
-    - ALL generation-path computation is INTEGER ARITHMETIC ONLY
+Architecture (V14 — Honest):
+    - N-gram recall: PRIMARY next-word signal
+    - Ising PMI coupling: SECONDARY signal when recall misses
+    - POS grammar: HARD CONSTRAINTS on word types
+    - Integer Boltzmann sampling: lookup-table, NO np.exp in hot loop
+    - Ablation framework: measure Ising contribution
 
-Pipeline:
-    V8 training infrastructure → V12 coherent generation
-    (PMI, types, emissions, deps, NMF → autoregressive + exact recall)
+Key differences from V8-V13:
+    - Genuinely integer-only hot path (lookup-table Boltzmann)
+    - ~650 lines vs 7000+ (clean single-file architecture)
+    - 6 generation parameters vs 30+ (no ad-hoc patching)
+    - No dead MCMC code (V8's 126KB sampler is removed)
+    - Honest naming (no pretending MCMC does generation)
+    - Built-in ablation to measure Ising vs n-gram contribution
 
 References:
-    - Reinhart & De las Coves (arXiv:2208.08301): Grammar of the Ising Model
+    - Levy & Goldberg (2014): Word2Vec as log-PMI matrix factorization
     - Marcolli et al. (arXiv:1508.00504): Spin Glass Models of Syntax
     - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
-    - GFST-HMB (github.com/pkhairkh/gfst-hmb-public): Exact token recall
+    - Creutz (1983): Demon algorithm for integer MCMC acceptance
 """
 
-__version__ = "12.0.0"
+__version__ = "14.0.0"
