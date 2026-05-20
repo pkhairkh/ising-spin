@@ -5,6 +5,7 @@ Ising-Enhanced N-Gram Language Model — Runner.
 Architecture:
   Primary:   N-gram exact recall (when context matches)
   Secondary: Ising PMI coupling (when recall misses)
+  Knowledge: Layer 2 (external field) + Layer 3 (3-spin couplings)
   Tertiary:  Unigram field (base frequency)
   Sampling:  Integer Boltzmann via lookup table (NO np.exp)
 
@@ -18,6 +19,11 @@ Path 3 additions:
   - Better tokenizer (contractions, hyphens, numbers)
   - Sparse coupling matrix (scipy.sparse.csr_matrix)
   - Perplexity evaluation on held-out data
+
+Path 4 additions:
+  - Knowledge Layer (SPO triples + 3-spin couplings)
+  - Layer 2: Knowledge external field h_knowledge[w]
+  - Layer 3: 3-spin couplings J3[(s,p)] -> [(o, strength)]
 """
 
 import sys
@@ -28,7 +34,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from ising_spin.model import (
-    IsingLMModel, IsingLM, POS2IDX, IDX2POS
+    IsingLMModel, IsingLM, KnowledgeLayer, POS2IDX, IDX2POS
 )
 
 
@@ -132,12 +138,13 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING-ENHANCED N-GRAM LANGUAGE MODEL (v2.0)")
+    print("ISING-ENHANCED N-GRAM LANGUAGE MODEL (v3.0 — Knowledge Machine)")
     print("=" * 70)
     print()
     print("Architecture:")
     print("  Primary:   N-gram exact recall")
     print("  Secondary: Ising PMI coupling (sparse)")
+    print("  Knowledge: Layer 2 (field) + Layer 3 (3-spin couplings)")
     print("  Tertiary:  Unigram field")
     print("  Sampling:  Integer Boltzmann (lookup table, NO np.exp)")
     print()
@@ -151,6 +158,12 @@ def main():
     print("  3a: Better tokenizer (contractions, hyphens, numbers)")
     print("  3b: Sparse coupling matrix (scipy.sparse)")
     print("  3c: Perplexity evaluation")
+    print()
+    print("Path 4 Features (NEW):")
+    print("  4a: Knowledge external field h_knowledge[w] (Layer 2)")
+    print("  4b: 3-spin couplings J3[(s,p)] (Layer 3)")
+    print("  4c: SPO triple extraction from corpus")
+    print("  4d: Curated commonsense triples (~50)")
     print()
 
     t0 = time.time()
@@ -175,6 +188,8 @@ def main():
         max_closed_class_run=2,
         ising_enabled=True,
         skip_pmi_max_dist=5,
+        knowledge_scale=500,
+        spin3_scale=800,
     )
 
     model.train(n_samples=20000)
@@ -291,6 +306,86 @@ def main():
         print(f"  {i+1}. {text}")
 
     # ======================================================================
+    # PHASE 7: Knowledge Layer Test
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("KNOWLEDGE LAYER TEST")
+    print("=" * 70)
+    print("\n  Testing: Knowledge ON vs Knowledge OFF")
+    print("  Using knowledge-triggering prompts that should activate SPO triples.\n")
+
+    # Knowledge layer diagnostics
+    kl = model.knowledge_layer
+    print(f"  Knowledge Layer Statistics:")
+    print(f"    Total triples: {kl.n_triples}")
+    print(f"    Unique subjects: {kl.n_unique_subjects}")
+    print(f"    Unique predicates: {kl.n_unique_predicates}")
+    print(f"    J3 entries: {len(kl.J3)}")
+    print(f"    h_knowledge non-zero: {int(np.count_nonzero(kl.h_knowledge))}")
+    print(f"    h_knowledge max: {int(kl.h_knowledge.max())}")
+
+    # Test with knowledge-triggering prompts
+    knowledge_prompts = [
+        "the dog", "water can", "the sun", "paris is",
+        "the bird", "fish in", "the teacher", "the student",
+        "science is", "fire and", "ice is", "the book",
+        "education is", "research is", "school is",
+    ]
+
+    print(f"\n  {'Prompt':<20} {'Knowledge ON':<55} {'Knowledge OFF':<55}")
+    print(f"  {'-'*20} {'-'*55} {'-'*55}")
+
+    knowledge_on_texts = []
+    knowledge_off_texts = []
+    knowledge_on_stats = {'knowledge_hits': 0, 'spin3_firings': 0, 'total': 0}
+    knowledge_off_stats = {'knowledge_hits': 0, 'spin3_firings': 0, 'total': 0}
+
+    for prompt in knowledge_prompts:
+        # Knowledge ON (main generator)
+        result_on = model.generator.generate(prompt=prompt, length=15)
+        text_on = result_on['text']
+        knowledge_on_texts.append(text_on)
+        
+        # Knowledge OFF 
+        result_off = model.knowledge_off_generator.generate(prompt=prompt, length=15)
+        text_off = result_off['text']
+        knowledge_off_texts.append(text_off)
+
+        # Track stats
+        for _ in result_on['diagnostics']:
+            knowledge_on_stats['total'] += 1
+        for _ in result_off['diagnostics']:
+            knowledge_off_stats['total'] += 1
+
+        print(f"  {prompt:<20} {text_on[:53]:<55} {text_off[:53]:<55}")
+
+    # Get stats from generators
+    on_stats = model.generator.get_stats()
+    off_stats = model.knowledge_off_generator.get_stats()
+
+    print(f"\n  Knowledge ON stats:")
+    print(f"    Knowledge hits: {on_stats.get('knowledge_hits', 0)}")
+    print(f"    3-Spin firings: {on_stats.get('spin3_firings', 0)}")
+    print(f"    Recall hit rate: {on_stats['recall_hit_rate']:.1%}")
+    print(f"    PMI-only rate: {on_stats['pmi_only_rate']:.1%}")
+
+    print(f"\n  Knowledge OFF stats:")
+    print(f"    Knowledge hits: 0 (disabled)")
+    print(f"    3-Spin firings: 0 (disabled)")
+    print(f"    Recall hit rate: {off_stats['recall_hit_rate']:.1%}")
+    print(f"    PMI-only rate: {off_stats['pmi_only_rate']:.1%}")
+
+    # Quality comparison
+    on_quality = evaluate_quality(knowledge_on_texts, len(knowledge_prompts))
+    off_quality = evaluate_quality(knowledge_off_texts, len(knowledge_prompts))
+
+    print(f"\n  {'Metric':<30} {'Knowledge ON':>14} {'Knowledge OFF':>14}")
+    print(f"  {'-'*30} {'-'*14} {'-'*14}")
+    print(f"  {'Unique words':<30} {on_quality['unique_words']:>14} {off_quality['unique_words']:>14}")
+    print(f"  {'Type-token ratio':<30} {on_quality['type_token_ratio']:>14.3f} {off_quality['type_token_ratio']:>14.3f}")
+    print(f"  {'Same-word reps':<30} {on_quality['n_same_word_reps']:>14} {off_quality['n_same_word_reps']:>14}")
+
+    # ======================================================================
     # Summary
     # ======================================================================
     stats = model.generator.get_stats()
@@ -298,14 +393,18 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary)")
+    print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary) + Knowledge (Layer 2+3)")
     print(f"  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
     print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
     print(f"  Skip-gram PMI: YES (distance 1-{model.skip_pmi_max_dist})")
+    print(f"  Knowledge triples: {kl.n_triples}")
+    print(f"  Knowledge J3 entries: {len(kl.J3)}")
     print(f"\n  Generation statistics:")
     print(f"    Recall hit rate: {stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {stats['pmi_only_rate']:.1%}")
     print(f"    Copy rate: {stats['copy_rate']:.1%}")
+    print(f"    Knowledge hits: {stats.get('knowledge_hits', 0)}")
+    print(f"    3-Spin firings: {stats.get('spin3_firings', 0)}")
     print(f"    Ising enabled: {stats['ising_enabled']}")
     print(f"\n  Perplexity: {ppl:.2f}")
 

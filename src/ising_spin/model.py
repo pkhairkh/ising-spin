@@ -974,6 +974,363 @@ def compute_skip_pmi_couplings(
 
 
 # ===========================================================================
+# KNOWLEDGE LAYER (Layer 2 + Layer 3)
+# ===========================================================================
+
+class KnowledgeLayer:
+    """
+    Knowledge injection layer for the Ising Knowledge Machine.
+    
+    Implements:
+      Layer 2: Knowledge External Field — biases individual spins toward 
+               knowledge-consistent states via h_knowledge[w]
+      Layer 3: 3-Spin Couplings — represents SPO triples as many-body 
+               Ising interactions where J3[s,p,o] creates an energy 
+               contribution when subject and predicate are both present
+    
+    All computation is INTEGER-ONLY during generation.
+    
+    References:
+      - Haydarov et al. (2025): Coupled Ising-Potts rich critical dynamics
+      - Bertalan & Nishimori (2012): First-order phase transitions in p-spin
+      - Li et al. (2021): Hamming-space KG embeddings (XOR + popcount)
+      - Hashizume & Suzuki (2011): Many-body spin-pair glass phases
+    """
+    
+    def __init__(self, vocab_size: int, knowledge_scale: int = 500,
+                 spin3_scale: int = 800, max_context_pairs: int = 20):
+        self.vocab_size = vocab_size
+        self.knowledge_scale = knowledge_scale  # Layer 2: field strength
+        self.spin3_scale = spin3_scale           # Layer 3: 3-spin coupling strength
+        self.max_context_pairs = max_context_pairs
+        
+        # Layer 2: External field. h_knowledge[w] = sum of integer bonuses
+        self.h_knowledge = np.zeros(vocab_size, dtype=np.int64)
+        
+        # Layer 3: 3-spin couplings. 
+        # Key: (subject_idx, predicate_idx) tuple
+        # Value: list of (object_idx, coupling_strength_int)
+        self.J3: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        
+        # Index for Layer 2: which words are subjects of triples
+        # subject_idx -> list of (predicate_idx, object_idx)
+        self.subject_index: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        
+        # For tracking
+        self.n_triples = 0
+        self.n_unique_subjects = 0
+        self.n_unique_predicates = 0
+        self._built = False
+    
+    def add_triples_from_corpus(self, sequences, idx2word, types_system, min_count=3):
+        """
+        Extract SPO triples from training corpus using dependency patterns.
+        
+        Strategy: Use simple pattern extraction:
+          - (NOUN, VERB/PREP, NOUN): subject-verb/prep-object patterns
+          - (NOUN, AUX, ADJ/NOUN): subject-aux-predication patterns
+        
+        For each pattern, count occurrences and keep those above min_count.
+        The coupling strength is computed as integer: count * spin3_scale.
+        
+        Uses existing POS type system for word classification.
+        """
+        # We need to classify each word's primary POS type
+        # Use a simplified approach: check the allowed_types from the POSTypeSystem
+        TAG_PRIORITY = {
+            POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
+            POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
+            POS2IDX["PREP"]: 6, POS2IDX["NUM"]: 7, POS2IDX["ADV"]: 8,
+            POS2IDX["ADJ"]: 9, POS2IDX["NOUN"]: 10, POS2IDX["VERB"]: 11,
+            POS2IDX["X"]: 12,
+        }
+        
+        def get_primary_type(word_idx):
+            if word_idx in types_system.allowed_types and types_system.allowed_types[word_idx]:
+                tags = list(types_system.allowed_types[word_idx])
+                return min(tags, key=lambda t: TAG_PRIORITY.get(t, 99))
+            return POS2IDX["X"]
+        
+        # Count SPO triples from consecutive triples in sequences
+        triple_counts = Counter()
+        
+        for seq in sequences:
+            for i in range(len(seq) - 2):
+                w0 = seq[i]
+                w1 = seq[i + 1]
+                w2 = seq[i + 2]
+                
+                # Skip special tokens
+                if w0 < 4 or w1 < 4 or w2 < 4:
+                    continue
+                
+                t0 = get_primary_type(w0)
+                t1 = get_primary_type(w1)
+                t2 = get_primary_type(w2)
+                
+                # Pattern: NOUN VERB NOUN (subject-verb-object)
+                if t0 in (POS2IDX["NOUN"], POS2IDX["PRON"]) and \
+                   t1 in (POS2IDX["VERB"], POS2IDX["AUX"]) and \
+                   t2 in (POS2IDX["NOUN"], POS2IDX["PRON"], POS2IDX["NUM"]):
+                    triple_counts[(w0, w1, w2)] += 1
+                
+                # Pattern: NOUN PREP NOUN (noun-preposition-noun)
+                elif t0 in (POS2IDX["NOUN"], POS2IDX["PRON"]) and \
+                     t1 == POS2IDX["PREP"] and \
+                     t2 in (POS2IDX["NOUN"], POS2IDX["PRON"], POS2IDX["NUM"]):
+                    triple_counts[(w0, w1, w2)] += 1
+                
+                # Pattern: NOUN AUX ADJ (subject-aux-adjective)
+                elif t0 in (POS2IDX["NOUN"], POS2IDX["PRON"]) and \
+                     t1 == POS2IDX["AUX"] and \
+                     t2 == POS2IDX["ADJ"]:
+                    triple_counts[(w0, w1, w2)] += 1
+        
+        # Only keep triples above min_count
+        n_extracted = 0
+        for (s, p, o), count in triple_counts.items():
+            if count >= min_count:
+                coupling_strength = count * self.spin3_scale
+                
+                # Add to J3
+                key = (s, p)
+                if key not in self.J3:
+                    self.J3[key] = []
+                self.J3[key].append((o, coupling_strength))
+                
+                # Add to subject_index
+                self.subject_index[s].append((p, o))
+                
+                # Add to h_knowledge (Layer 2)
+                # Each triple adds a base field to subject, predicate, and object
+                self.h_knowledge[s] += self.knowledge_scale
+                self.h_knowledge[p] += self.knowledge_scale // 2
+                self.h_knowledge[o] += self.knowledge_scale
+                
+                self.n_triples += 1
+                n_extracted += 1
+        
+        print(f"    Extracted {n_extracted} SPO triples from corpus "
+              f"(min_count={min_count}, scanned {len(triple_counts)} patterns)")
+    
+    def add_conceptnet_triples(self, triples_text, word2idx):
+        """
+        Add triples from ConceptNet-style text format.
+        Each triple is (subject_word, relation_word, object_word).
+        Only add triples where all three words are in vocabulary.
+        """
+        n_added = 0
+        for triple in triples_text:
+            if len(triple) != 3:
+                continue
+            subj, pred, obj = triple
+            
+            # Look up indices
+            s_idx = word2idx.get(subj.lower(), None)
+            p_idx = word2idx.get(pred.lower(), None)
+            o_idx = word2idx.get(obj.lower(), None)
+            
+            # Skip if any word is not in vocabulary or is a special token
+            if s_idx is None or p_idx is None or o_idx is None:
+                continue
+            if s_idx < 4 or p_idx < 4 or o_idx < 4:
+                continue
+            
+            # Add to J3
+            key = (s_idx, p_idx)
+            if key not in self.J3:
+                self.J3[key] = []
+            # Use a fixed coupling strength for curated triples
+            self.J3[key].append((o_idx, self.spin3_scale * 2))
+            
+            # Add to subject_index
+            self.subject_index[s_idx].append((p_idx, o_idx))
+            
+            # Add to h_knowledge (Layer 2)
+            self.h_knowledge[s_idx] += self.knowledge_scale
+            self.h_knowledge[p_idx] += self.knowledge_scale // 2
+            self.h_knowledge[o_idx] += self.knowledge_scale
+            
+            self.n_triples += 1
+            n_added += 1
+        
+        print(f"    Added {n_added} ConceptNet-style triples "
+              f"(out of {len(triples_text)} provided)")
+    
+    def build(self):
+        """
+        Finalize the knowledge layer after adding all triples.
+        Pre-compute h_knowledge from all triples, build subject_index.
+        Pure integer arithmetic.
+        """
+        # Compute statistics
+        subjects = set()
+        predicates = set()
+        for key, objects in self.J3.items():
+            subjects.add(key[0])
+            predicates.add(key[1])
+        
+        self.n_unique_subjects = len(subjects)
+        self.n_unique_predicates = len(predicates)
+        
+        # Ensure h_knowledge is int64
+        self.h_knowledge = self.h_knowledge.astype(np.int64)
+        
+        self._built = True
+        
+        print(f"    Knowledge layer built:")
+        print(f"      Total triples: {self.n_triples}")
+        print(f"      Unique subjects: {self.n_unique_subjects}")
+        print(f"      Unique predicates: {self.n_unique_predicates}")
+        print(f"      J3 entries: {len(self.J3)}")
+        print(f"      h_knowledge non-zero: {int(np.count_nonzero(self.h_knowledge))}")
+        print(f"      h_knowledge max: {int(self.h_knowledge.max())}")
+    
+    def compute_knowledge_field(self, context_words, candidate_words):
+        """
+        Layer 2: Compute knowledge external field contribution.
+        
+        For each context word that is a SUBJECT of some triple,
+        add knowledge_scale to h_knowledge[object] for all matching
+        objects where the predicate also appears in context.
+        
+        If only subject is in context (no predicate match), add
+        knowledge_scale // 3 (weaker signal).
+        
+        Returns: integer array of shape (n_candidates,) with field bonuses.
+        Pure integer arithmetic.
+        """
+        n_candidates = len(candidate_words)
+        bonuses = np.zeros(n_candidates, dtype=np.int64)
+        
+        if not self._built:
+            return bonuses
+        
+        # Build a set of context word indices for fast lookup
+        context_set = set(context_words)
+        
+        # Build a dict of bonus per candidate word index
+        word_bonuses = defaultdict(int)
+        
+        for subject_idx in context_words:
+            if subject_idx not in self.subject_index:
+                continue
+            for (pred_idx, obj_idx) in self.subject_index[subject_idx]:
+                if pred_idx in context_set:
+                    # Full match: subject AND predicate in context
+                    word_bonuses[obj_idx] += self.knowledge_scale
+                else:
+                    # Weaker signal: only subject in context
+                    word_bonuses[obj_idx] += self.knowledge_scale // 3
+        
+        # Map bonuses to candidate_words array
+        for i, w in enumerate(candidate_words):
+            w_int = int(w)
+            if w_int in word_bonuses:
+                bonuses[i] += word_bonuses[w_int]
+        
+        return bonuses
+    
+    def compute_3spin_coupling(self, context_words, candidate_words):
+        """
+        Layer 3: Compute 3-spin coupling contribution.
+        
+        For each PAIR (wi, wj) in context_words, check if (wi, wj)
+        or (wj, wi) is a key in J3. If so, add the coupling strength
+        to the matching object words in candidate_words.
+        
+        This is the novel 3-body Ising interaction: the energy depends
+        on the JOINT state of subject AND predicate being present.
+        
+        Returns: integer array of shape (n_candidates,) with 3-spin bonuses.
+        Pure integer arithmetic.
+        """
+        n_candidates = len(candidate_words)
+        bonuses = np.zeros(n_candidates, dtype=np.int64)
+        
+        if not self._built or not self.J3:
+            return bonuses
+        
+        # Take the last max_context_pairs words to limit computation
+        ctx = context_words[-self.max_context_pairs:] if len(context_words) > self.max_context_pairs else context_words
+        
+        # Build a dict of bonus per candidate word index
+        word_bonuses = defaultdict(int)
+        
+        # Check all pairs in context
+        for i in range(len(ctx)):
+            for j in range(len(ctx)):
+                if i == j:
+                    continue
+                wi = ctx[i]
+                wj = ctx[j]
+                
+                # Check J3[(wi, wj)] -- wi is subject, wj is predicate
+                key_forward = (wi, wj)
+                if key_forward in self.J3:
+                    for (obj_idx, strength) in self.J3[key_forward]:
+                        word_bonuses[obj_idx] += strength
+        
+        # Map bonuses to candidate_words array
+        for i, w in enumerate(candidate_words):
+            w_int = int(w)
+            if w_int in word_bonuses:
+                bonuses[i] += word_bonuses[w_int]
+        
+        return bonuses
+    
+    def compute_knowledge_energy(self, context_words, candidate_words):
+        """
+        Combined knowledge energy contribution (Layer 2 + Layer 3).
+        
+        Returns: integer array of shape (n_candidates,) with total 
+        knowledge bonuses (subtract from energy for lower energy = more likely).
+        """
+        if not self._built:
+            return np.zeros(len(candidate_words), dtype=np.int64)
+        
+        field_bonus = self.compute_knowledge_field(context_words, candidate_words)
+        spin3_bonus = self.compute_3spin_coupling(context_words, candidate_words)
+        return field_bonus + spin3_bonus
+    
+    def get_diagnostics(self, context_words, candidate_words):
+        """
+        Get diagnostic information about knowledge layer activation.
+        
+        Returns dict with counts of field hits, 3-spin hits, etc.
+        """
+        if not self._built:
+            return {'field_hits': 0, 'spin3_hits': 0, 'active_triples': 0}
+        
+        context_set = set(context_words)
+        field_hits = 0
+        spin3_hits = 0
+        active_triples = 0
+        
+        # Count field hits
+        for subject_idx in context_words:
+            if subject_idx in self.subject_index:
+                field_hits += 1
+        
+        # Count 3-spin hits
+        ctx = context_words[-self.max_context_pairs:] if len(context_words) > self.max_context_pairs else context_words
+        for i in range(len(ctx)):
+            for j in range(len(ctx)):
+                if i == j:
+                    continue
+                key = (ctx[i], ctx[j])
+                if key in self.J3:
+                    spin3_hits += len(self.J3[key])
+                    active_triples += 1
+        
+        return {
+            'field_hits': field_hits,
+            'spin3_hits': spin3_hits,
+            'active_triples': active_triples,
+        }
+
+
+# ===========================================================================
 # ISING-ENHANCED N-GRAM LANGUAGE MODEL
 # ===========================================================================
 
@@ -985,7 +1342,8 @@ class IsingLM:
       1. POS type selection: Grammar-driven with hard constraints
       2. N-gram recall: Primary next-word signal (when available)
       3. PMI coupling: Secondary signal (when recall misses)
-      4. Integer Boltzmann: Temperature-controlled stochastic selection
+      4. Knowledge layer: Layer 2 (field) + Layer 3 (3-spin couplings)
+      5. Integer Boltzmann: Temperature-controlled stochastic selection
 
     Path 2 additions:
       - generate_beam: Global coherence via energy-ranked beam search
@@ -993,10 +1351,15 @@ class IsingLM:
       - generate_annealed: Temperature annealing (Ising phase transition)
       - J_skip: Distance-specific skip-gram PMI couplings
 
+    Knowledge Layer:
+      - h_knowledge[w]: External field from SPO triples (Layer 2)
+      - J3[(s,p)]: 3-spin couplings for SPO triples (Layer 3)
+
     Parameters (6 generation params, not 30+):
       - recall_scale, pmi_weight, field_weight
       - beta_type, beta_word
       - ising_enabled (ablation switch)
+      - knowledge_layer (knowledge injection)
     """
 
     CLOSED_CLASS = {POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
@@ -1026,6 +1389,7 @@ class IsingLM:
         max_closed_class_run: int = 2,
         ising_enabled: bool = True,
         J_skip: Optional[Dict[int, sp.csr_matrix]] = None,
+        knowledge_layer: Optional["KnowledgeLayer"] = None,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -1043,6 +1407,9 @@ class IsingLM:
         # Path 2d: Skip-gram PMI couplings (distance-specific)
         self.J_skip = J_skip if J_skip is not None else {}
         self.max_skip_dist = max(self.J_skip.keys()) if self.J_skip else 0
+
+        # Knowledge layer (Layer 2 + Layer 3)
+        self.knowledge_layer = knowledge_layer
 
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=500)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=500)
@@ -1071,6 +1438,7 @@ class IsingLM:
         self._stats = {
             'total_positions': 0, 'recall_hit': 0, 'copy_used': 0,
             'pmi_only': 0, 'same_word_blocked': 0, 'closed_loop_blocked': 0,
+            'knowledge_hits': 0, 'spin3_firings': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -1132,6 +1500,7 @@ class IsingLM:
 
         E(w) = -recall_bonus(w)          [PRIMARY: n-gram match signal]
              - pmi_coupling(w, ctx)       [SECONDARY: Ising PMI signal]
+             - knowledge_energy(w, ctx)   [KNOWLEDGE: Layer 2 + Layer 3]
              - field(w)                   [TERTIARY: unigram frequency]
              + penalties                  [HARD: grammar, anti-repetition]
 
@@ -1139,6 +1508,9 @@ class IsingLM:
         falling back to base J for distances not in J_skip.
 
         Path 3b: Uses sparse matrix operations for coupling computation.
+
+        Knowledge Layer: Layer 2 (external field) + Layer 3 (3-spin couplings)
+        inject knowledge-graph structure into the Ising energy landscape.
 
         All integer arithmetic.
         """
@@ -1164,6 +1536,19 @@ class IsingLM:
                 energies -= (coupling_sums * self.pmi_weight) // 10
             else:
                 energies -= coupling_sums * self.pmi_weight
+
+        # === KNOWLEDGE ENERGY (Layer 2 + Layer 3) ===
+        if self.knowledge_layer is not None and len(context_words) > 0:
+            knowledge_bonus = self.knowledge_layer.compute_knowledge_energy(
+                context_words, candidate_words
+            )
+            energies -= knowledge_bonus
+            # Track diagnostics
+            if int(knowledge_bonus.max()) > 0:
+                self._stats['knowledge_hits'] += 1
+            kd = self.knowledge_layer.get_diagnostics(context_words, candidate_words)
+            if kd['spin3_hits'] > 0:
+                self._stats['spin3_firings'] += 1
 
         # === LOCAL FIELD (unigram -- tertiary signal) ===
         field_vals = self.h[candidate_words] * self.field_weight
@@ -1801,11 +2186,13 @@ class IsingLMModel:
       4. Compute PMI couplings (sparse)
       5. Compute skip-gram PMI couplings (distance-specific)
       6. Build n-gram index
-      7. Create generator(s)
+      7. Build knowledge layer (SPO triples + 3-spin couplings)
+      8. Create generator(s)
 
     Generation:
-      - With Ising (default)
-      - Without Ising (ablation baseline)
+      - With Ising + Knowledge (default)
+      - Without Ising (ablation baseline, but WITH knowledge)
+      - Without Knowledge (knowledge-off baseline, with Ising)
       - Beam generation (global coherence)
       - Annealed generation (phase transition)
     """
@@ -1831,6 +2218,8 @@ class IsingLMModel:
         max_closed_class_run: int = 2,
         ising_enabled: bool = True,
         skip_pmi_max_dist: int = 5,
+        knowledge_scale: int = 500,
+        spin3_scale: int = 800,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -1851,6 +2240,8 @@ class IsingLMModel:
         self.max_closed_class_run = max_closed_class_run
         self.ising_enabled = ising_enabled
         self.skip_pmi_max_dist = skip_pmi_max_dist
+        self.knowledge_scale = knowledge_scale
+        self.spin3_scale = spin3_scale
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
@@ -1858,6 +2249,7 @@ class IsingLMModel:
         self.h: Optional[np.ndarray] = None
         self.J_skip: Optional[Dict[int, sp.csr_matrix]] = None
         self.ngram_index: Optional[NGramIndex] = None
+        self.knowledge_layer: Optional[KnowledgeLayer] = None
         self.generator: Optional[IsingLM] = None
         self.baseline_generator: Optional[IsingLM] = None
         self.sequences: Optional[List[List[int]]] = None
@@ -1868,22 +2260,24 @@ class IsingLMModel:
         print("=" * 70)
         print("ISING-ENHANCED N-GRAM LANGUAGE MODEL -- TRAINING")
         print("=" * 70)
-        print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary)")
+        print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary) + Knowledge (Layer 2+3)")
         print(f"  Integer-only hot path: Lookup-table Boltzmann (NO np.exp)")
         print(f"  Ising enabled: {self.ising_enabled}")
         print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
         print(f"  Skip-gram PMI: YES (distance {1}-{self.skip_pmi_max_dist})")
+        print(f"  Knowledge scale: {self.knowledge_scale}")
+        print(f"  3-Spin scale: {self.spin3_scale}")
         print()
 
         t0 = time.time()
 
         # Step 1: Load corpus
-        print("[1/6] Loading corpus...")
+        print("[1/8] Loading corpus...")
         texts = load_fineweb_edu(n_samples=n_samples)
         print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
 
         # Step 2: Build vocabulary
-        print("\n[2/6] Building vocabulary...")
+        print("\n[2/8] Building vocabulary...")
         self.vocab = Vocabulary(
             min_freq=self.vocab_min_freq,
             max_size=self.vocab_max_size,
@@ -1892,7 +2286,7 @@ class IsingLMModel:
         print(f"  Vocabulary: {len(self.vocab)} words")
 
         # Step 3: Build POS type system
-        print("\n[3/6] Building POS type system...")
+        print("\n[3/8] Building POS type system...")
         self.types = POSTypeSystem(
             vocab_size=len(self.vocab),
             window=self.pmi_window,
@@ -1913,7 +2307,7 @@ class IsingLMModel:
         print(f"  POS system built: {N_POS} types, {n_typed} words typed")
 
         # Step 4: Compute PMI couplings (sparse)
-        print("\n[4/6] Computing PMI couplings (sparse)...")
+        print("\n[4/8] Computing PMI couplings (sparse)...")
         self.J, self.h = compute_pmi_couplings(
             self.sequences, len(self.vocab),
             window=self.pmi_window,
@@ -1922,7 +2316,7 @@ class IsingLMModel:
         )
 
         # Step 5: Compute skip-gram PMI couplings
-        print(f"\n[5/6] Computing skip-gram PMI couplings (dist 1-{self.skip_pmi_max_dist})...")
+        print(f"\n[5/8] Computing skip-gram PMI couplings (dist 1-{self.skip_pmi_max_dist})...")
         self.J_skip = compute_skip_pmi_couplings(
             self.sequences, len(self.vocab),
             max_dist=self.skip_pmi_max_dist,
@@ -1931,20 +2325,79 @@ class IsingLMModel:
         )
 
         # Step 6: Build n-gram index
-        print("\n[6/6] Building n-gram index...")
+        print("\n[6/8] Building n-gram index...")
         self.ngram_index = NGramIndex(
             max_n=self.ngram_max_n,
             min_count=self.ngram_min_count,
         )
         self.ngram_index.build(self.sequences)
 
-        # Build generators
-        print("\nBuilding generators...")
+        # Step 7: Build knowledge layer
+        print("\n[7/8] Building knowledge layer...")
+        self.knowledge_layer = KnowledgeLayer(
+            vocab_size=len(self.vocab),
+            knowledge_scale=self.knowledge_scale,
+            spin3_scale=self.spin3_scale,
+        )
+        # Extract SPO triples from corpus
+        self.knowledge_layer.add_triples_from_corpus(
+            self.sequences, self.vocab.idx2word, self.types, min_count=3
+        )
+        # Add hardcoded commonsense triples
+        self._add_commonsense_triples()
+        # Finalize
+        self.knowledge_layer.build()
+
+        # Step 8: Build generators
+        print("\n[8/8] Building generators...")
         self._build_generators()
 
         t_total = time.time() - t0
         print(f"\nTraining complete: {t_total:.1f}s")
         return self
+
+    def _add_commonsense_triples(self):
+        """Add curated commonsense triples likely to be in vocabulary."""
+        commonsense = [
+            # Animals and actions
+            ("dog", "chase", "cat"), ("cat", "chase", "mouse"),
+            ("bird", "fly", "sky"), ("fish", "swim", "water"),
+            ("horse", "run", "field"), ("snake", "eat", "mouse"),
+            # Nature and physics
+            ("water", "freeze", "ice"), ("ice", "melt", "water"),
+            ("sun", "is", "star"), ("earth", "is", "planet"),
+            ("water", "boil", "steam"), ("rain", "fall", "ground"),
+            ("fire", "burn", "wood"), ("snow", "fall", "winter"),
+            # Geography
+            ("paris", "is", "capital"), ("france", "has", "capital"),
+            ("london", "is", "capital"), ("england", "has", "capital"),
+            # People and roles
+            ("student", "study", "subject"), ("teacher", "teach", "student"),
+            ("doctor", "treat", "patient"), ("child", "learn", "school"),
+            ("scientist", "study", "nature"), ("writer", "write", "book"),
+            # Basic relations
+            ("food", "is", "important"), ("water", "is", "important"),
+            ("air", "is", "important"), ("earth", "is", "important"),
+            # Actions and objects
+            ("car", "run", "road"), ("boat", "sail", "water"),
+            ("plane", "fly", "sky"), ("train", "run", "track"),
+            # Properties
+            ("iron", "is", "metal"), ("gold", "is", "metal"),
+            ("oxygen", "is", "gas"), ("hydrogen", "is", "gas"),
+            # Education
+            ("school", "is", "important"), ("education", "is", "important"),
+            ("science", "is", "important"), ("research", "is", "important"),
+            # More commonsense
+            ("mother", "love", "child"), ("father", "love", "child"),
+            ("music", "is", "art"), ("painting", "is", "art"),
+            ("book", "contain", "information"), ("library", "contain", "book"),
+            ("computer", "process", "information"), ("internet", "connect", "people"),
+            # Causal
+            ("heat", "cause", "expansion"), ("cold", "cause", "contraction"),
+            ("exercise", "improve", "health"), ("food", "provide", "energy"),
+            ("sleep", "improve", "health"), ("reading", "improve", "knowledge"),
+        ]
+        self.knowledge_layer.add_conceptnet_triples(commonsense, self.vocab.word2idx)
 
     def _build_generators(self):
         """Build Ising and ablation generators."""
@@ -1962,20 +2415,41 @@ class IsingLMModel:
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
             J_skip=self.J_skip,
+            knowledge_layer=self.knowledge_layer,
         )
 
-        # Main generator (with Ising)
+        # Main generator (with Ising + Knowledge)
         self.generator = IsingLM(
             **gen_kwargs,
             pmi_weight=self.pmi_weight,
             ising_enabled=self.ising_enabled,
         )
 
-        # Ablation baseline (without Ising)
+        # Ablation baseline (without Ising, but WITH knowledge for comparison)
         self.baseline_generator = IsingLM(
             **gen_kwargs,
             pmi_weight=0,
             ising_enabled=False,
+        )
+
+        # Knowledge-off baseline (with Ising but NO knowledge)
+        self.knowledge_off_generator = IsingLM(
+            vocab=self.vocab,
+            ngram_index=self.ngram_index,
+            J=self.J, h=self.h, types=self.types,
+            recall_scale=self.recall_scale,
+            pmi_weight=self.pmi_weight,
+            field_weight=self.field_weight,
+            beta_type=self.beta_type,
+            beta_word=self.beta_word,
+            copy_enabled=self.copy_enabled,
+            copy_min_context=self.copy_min_context,
+            copy_min_confidence=self.copy_min_confidence,
+            same_word_penalty=self.same_word_penalty,
+            max_closed_class_run=self.max_closed_class_run,
+            ising_enabled=self.ising_enabled,
+            J_skip=self.J_skip,
+            knowledge_layer=None,  # NO knowledge layer
         )
 
     def generate_with_trace(self, prompt: str = "the", length: int = 20) -> Dict:
