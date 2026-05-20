@@ -1,16 +1,17 @@
 """
-Ising Spin Glass Language Model — v6.0 Walsh-Hadamard Spectral Couplings
+Ising Spin Glass Language Model — v7.0 Graded Couplings
 
 ALL word selection goes through the Hamiltonian. No overrides, no bypasses.
 Every word is chosen by Boltzmann sampling from the energy landscape.
 
 Architecture (6 layers, ALL compete through E(w|ctx)):
-    Layer 1: PMI couplings J[w,w'] + local field h[w]
-    Layer 1b: Walsh-Hadamard Spectral Couplings (replaces PMI when enabled)
-              — Householder subspace rotation V→d for efficiency
-              — Order-1 (ĥ₁): graded context-target (replaces PMI)
-              — Order-2 (ĥ₂): pairwise context interaction
-              — Order-3 (ĥ₃): triple context interaction
+    Layer 1: PMI couplings J[w,w'] + local field h[w] (legacy fallback)
+    Layer 1b: Graded Couplings from continuation frequencies (replaces PMI + Walsh)
+              — J₂ from bigram continuation frequencies: P(w_k|w_i) * IDF(w_k)
+              — J₃ from trigram continuation frequencies (data-driven 3-way)
+              — Position-dependent weights: pos_weight(d) = window // d
+              — No rotation, no subspace, no phi² blowup
+              — β auto-calibrated from median ΔE
     Layer 2: Knowledge external field h_knowledge[w] (SPO triples)
     Layer 3: 3-Spin couplings J3[(s,p)] -> o (many-body Ising interaction)
     Layer 4: Category couplings J_category (hypernym-based semantic smoothing)
@@ -38,6 +39,7 @@ References:
     - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
     - Creutz (1983): Demon algorithm for integer MCMC acceptance
     - Nishimori (2001): Statistical Physics of Spin Glasses
+    - Walsh (1923): A closed set of normal orthogonal functions
 """
 
 from .model import (
@@ -51,6 +53,7 @@ from .model import (
     CategoryLayer,
     MarkovLogicLayer,
     WalshSpectralLayer,
+    GradedCouplings,
     compute_log_floor_pmi,
     compute_pmi_couplings,
     compute_skip_pmi_couplings,
@@ -64,4 +67,4 @@ from .model import (
     truncate_sequences,
 )
 
-__version__ = "6.0.0"
+__version__ = "7.0.0"

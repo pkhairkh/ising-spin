@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Ising Spin Glass Language Model — Runner v6.0.
+Ising Spin Glass Language Model — Runner v7.0.
 
-Walsh-Hadamard Spectral Couplings + Householder subspace rotation.
+Graded Couplings from continuation frequencies (no rotation).
 ALL word selection through the Hamiltonian. No overrides. No bypasses.
 Knowledge creates competing energy wells. Boltzmann sampling at temperature
 beta picks between them stochastically.
 
 6-Layer Architecture (ALL compete through E(w|ctx)):
-  Layer 1: PMI Couplings (word affinities) + Local Field
-  Layer 1b: Walsh-Hadamard Spectral Couplings (replaces PMI when enabled)
-            — Householder subspace rotation V→d for efficiency
-            — Order-1 (ĥ₁): graded context-target (replaces PMI)
-            — Order-2 (ĥ₂): pairwise context interaction
-            — Order-3 (ĥ₃): triple context interaction
+  Layer 1: PMI Couplings (word affinities) + Local Field (legacy fallback)
+  Layer 1b: Graded Couplings (replaces PMI + Walsh when enabled)
+            — J₂ from bigram continuation frequencies: P(w_k|w_i) * IDF(w_k)
+            — J₃ from trigram continuation frequencies (data-driven 3-way)
+            — Position-dependent weights: pos_weight(d) = window // d
+            — No rotation, no subspace, no phi² blowup
+            — β auto-calibrated from median ΔE
   Layer 2: Knowledge External Field h_knowledge[w]
   Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples
   Layer 4: Category Couplings J_category (hypernym-based)
@@ -21,14 +22,14 @@ beta picks between them stochastically.
 
 Post-generation: MCMC spin-flip refinement (Metropolis criterion)
 
-v6.0 changes from v5.0:
-  - Added Walsh-Hadamard Spectral Layer (Layer 1b)
-  - Householder subspace rotation: V→d for efficiency
-  - Order-1 Walsh coefficients replace PMI (graded, not binary)
-  - Order-2 and Order-3 Walsh coefficients replace heuristic J3
-  - Graded recall bonus: always proportional to continuation probability
-  - All Walsh coefficients are integers; Q quantized to int16
-  - Sparse storage for order-2/3 (only |coeff| > min_coeff stored)
+v7.0 changes from v6.0:
+  - Replaced Walsh-Hadamard + Householder with Graded Couplings
+  - J₂ from bigram continuation frequencies (graded, not binary)
+  - J₃ from trigram continuation frequencies (data-driven, not heuristic SPO)
+  - Position-dependent coupling weights (RoPE-inspired integer decay)
+  - β auto-calibrated from median ΔE
+  - No rotation, no subspace, no phi² blowup
+  - All couplings are integers by construction
 """
 
 import sys
@@ -40,7 +41,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from ising_spin.model import (
     IsingLMModel, IsingLM, KnowledgeLayer, CategoryLayer, MarkovLogicLayer,
-    WalshSpectralLayer, POS2IDX, IDX2POS
+    WalshSpectralLayer, GradedCouplings, POS2IDX, IDX2POS
 )
 
 
@@ -80,8 +81,8 @@ def run_ablation(model, prompts, length=20):
     print("\n" + "=" * 70)
     print("ABLATION STUDY: Ising ON vs Ising OFF")
     print("=" * 70)
-    print("\n  v6.0: Both use energy-only pipeline (no overrides).")
-    print("  Ising OFF: PMI=0, but knowledge + category + logic + Walsh still active.\n")
+    print("\n  v7.0: Both use energy-only pipeline (no overrides).")
+    print("  Ising OFF: PMI=0 + graded OFF, but knowledge + category + logic still active.\n")
 
     ising_texts = []
     baseline_texts = []
@@ -134,23 +135,23 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING SPIN GLASS LANGUAGE MODEL (v6.0 — Walsh-Hadamard Spectral)")
+    print("ISING SPIN GLASS LANGUAGE MODEL (v7.0 — Graded Couplings)")
     print("=" * 70)
     print()
     print("6-Layer Architecture (ALL compete through Hamiltonian):")
-    print("  Layer 1: PMI Couplings + Local Field")
-    print("  Layer 1b: Walsh-Hadamard Spectral Couplings (Householder + HWT)")
+    print("  Layer 1: PMI Couplings + Local Field (legacy fallback)")
+    print("  Layer 1b: Graded Couplings from continuation frequencies")
     print("  Layer 2: Knowledge External Field h_knowledge[w]")
     print("  Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples")
     print("  Layer 4: Category Couplings (hypernym-based)")
     print("  Layer 5: Markov Logic Penalty (factual consistency)")
     print()
-    print("v6.0: Walsh-Hadamard Spectral Couplings")
-    print("  Householder subspace rotation: V→d for efficiency.")
-    print("  Order-1 (ĥ₁): graded context-target (replaces PMI).")
-    print("  Order-2 (ĥ₂) + Order-3 (ĥ₃): context interactions.")
-    print("  ALL coefficients are integers. Q quantized to int16.")
-    print("  Graded recall bonus: ∝ continuation probability.")
+    print("v7.0: Graded Couplings (no rotation)")
+    print("  J₂ from bigram continuation frequencies: P(w_k|w_i) * IDF(w_k)")
+    print("  J₃ from trigram continuation frequencies (data-driven 3-way)")
+    print("  Position-dependent weights: pos_weight(d) = window // d")
+    print("  β auto-calibrated from median ΔE")
+    print("  All couplings are integers by construction.")
     print()
 
     t0 = time.time()
@@ -167,12 +168,11 @@ def main():
         pmi_min_count=2,
         pmi_cap=10,
 
-        # Energy scales — v5.0: Knowledge MUST dominate when J3 fires
-        # Recall 5-gram match: count*800*4^4 = ~1M. J3 must beat that.
-        # With spin3_scale=50000, J3 triple (count=3) = 150,000. ConceptNet (2x) = 100,000.
-        # At beta=0.15, exp(-0.15*100000) vs exp(-0.15*128000): knowledge word ~450x more likely.
+        # Energy scales — v7.0: Graded couplings are the PRIMARY signal
+        # Recall bonus is for exact n-gram matches (high confidence)
+        # Graded couplings provide the backup for non-exact matches
         recall_scale=800,            # n-gram recall (moderate)
-        pmi_weight=5,                # PMI coupling strength
+        pmi_weight=5,                # PMI coupling strength (fallback only)
         field_weight=1,              # Unigram field
         knowledge_scale=15000,       # Layer 2: knowledge external field (STRONG)
         spin3_scale=50000,           # Layer 3: 3-spin (DOMINATES when it fires)
@@ -180,11 +180,9 @@ def main():
         logic_rule_scale=2000,       # Layer 5: soft logic
         logic_hard_scale=50000,      # Layer 5: hard contradictions
 
-        # Sampling parameters — v5.0: low beta for soft Boltzmann distribution
-        # With energy ranges of ~100K, beta=0.0005 gives soft distribution
-        # where top candidate gets ~20-40% probability (not 99.99%)
+        # Sampling parameters — β will be auto-calibrated
         beta_type=0.001,
-        beta_word=0.0005,
+        beta_word=0.001,             # Will be overridden by auto-calibration
         copy_enabled=True,
         copy_min_context=2,
         copy_min_confidence=0.25,
@@ -199,14 +197,19 @@ def main():
         # ConceptNet
         use_conceptnet=True,
 
-        # v6.0: Walsh-Hadamard spectral couplings
-        # Walsh energy replaces PMI with graded, spectrally-learned couplings
-        # walsh_weight controls overall scale — needs to be comparable to recall_scale
-        walsh_enabled=True,
+        # v6.0: Walsh-Hadamard spectral couplings (DISABLED in v7.0)
+        walsh_enabled=False,         # Replaced by graded couplings
         walsh_subspace_rank=64,
-        walsh_max_order=2,       # Order-3 too sparse with 20K training samples
-        walsh_weight=1,          # Weight for Walsh spectral energy term
+        walsh_max_order=2,
+        walsh_weight=1,
         walsh_min_coeff=3,
+
+        # v7.0: Graded Couplings from continuation frequencies
+        # These replace PMI + Walsh with graded, data-driven couplings
+        graded_couplings_enabled=True,
+        coupling_scale=1000,         # J₂ scale: P(w_k|w_i) * IDF * 1000
+        trigram_scale=2000,          # J₃ scale: P(w_k|w_i,w_j) * IDF * 2000
+        auto_calibrate_beta=True,    # Auto-set β from energy scale
     )
 
     model.train(n_samples=20000)
@@ -218,7 +221,7 @@ def main():
     # PHASE 1: Quick generation test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("QUICK GENERATION TEST (v6.0 — Walsh-Hadamard Spectral)")
+    print("QUICK GENERATION TEST (v7.0 — Graded Couplings)")
     print("=" * 70)
 
     prompts = ["the", "a", "in", "science", "research", "students", "he",
@@ -241,7 +244,7 @@ def main():
     print("\n" + "=" * 70)
     print("6-LAYER KNOWLEDGE TEST (Energy Competition, Not Overrides)")
     print("=" * 70)
-    print("\n  v6.0: All 6 Layers ON vs Knowledge Layers OFF")
+    print("\n  v7.0: All 6 Layers ON vs Knowledge Layers OFF")
     print("  Knowledge wins through DEEP ENERGY WELLS, not overrides.\n")
 
     # Knowledge layer diagnostics
@@ -263,16 +266,17 @@ def main():
     print(f"\n  Layer 5 (Markov Logic):")
     print(f"    Total rules: {ml.n_rules} ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
 
-    # Walsh spectral layer diagnostics
-    if model.walsh_layer is not None:
-        wl = model.walsh_layer
-        print(f"\n  Layer 1b (Walsh Spectral):")
-        print(f"    Subspace rank: {wl.subspace_rank}")
-        print(f"    Max order: {wl.max_order}")
-        print(f"    Order-0 non-zero: {wl.n_coeffs[0]}")
-        print(f"    Order-1 non-zero: {wl.n_coeffs[1]}")
-        print(f"    Order-2 non-zero: {wl.n_coeffs[2]}")
-        print(f"    Order-3 non-zero: {wl.n_coeffs[3]}")
+    # Graded couplings diagnostics
+    if model.graded_couplings is not None:
+        gc = model.graded_couplings
+        print(f"\n  Layer 1b (Graded Couplings):")
+        print(f"    J₂ non-zero: {gc.J2.nnz:,}")
+        if gc.J2.nnz > 0:
+            print(f"    J₂ range: [{int(gc.J2.data.min())}, {int(gc.J2.data.max())}]")
+            print(f"    J₂ mean (non-zero): {int(gc.J2.data.mean())}")
+        n_j3 = sum(len(v) for v in gc.J3.values())
+        print(f"    J₃ entries: {n_j3:,} in {len(gc.J3):,} contexts")
+        print(f"    IDF range: [{int(gc.idf.min())}, {int(gc.idf.max())}]")
 
     # Test with knowledge-triggering prompts
     knowledge_prompts = [
@@ -314,7 +318,7 @@ def main():
     print(f"    3-Spin firings: {on_stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {on_stats.get('category_hits', 0)}")
     print(f"    Logic hits: {on_stats.get('logic_hits', 0)}")
-    print(f"    Walsh hits: {on_stats.get('walsh_hits', 0)}")
+    print(f"    Graded hits: {on_stats.get('graded_hits', 0)}")
     print(f"    MCMC accept rate: {on_stats.get('mcmc_accept_rate', 0):.1%}")
 
     print(f"\n  Knowledge OFF stats:")
@@ -361,13 +365,13 @@ def main():
     stats = model.generator.get_stats()
 
     print("\n" + "=" * 70)
-    print("SUMMARY — v6.0 Walsh-Hadamard Spectral Couplings")
+    print("SUMMARY — v7.0 Graded Couplings")
     print("=" * 70)
-    print(f"\n  Architecture: 6-Layer Ising Spin Glass (v6.0)")
+    print(f"\n  Architecture: 6-Layer Ising Spin Glass (v7.0)")
     print(f"  Pipeline: Energy → Boltzmann → MCMC refinement")
     print(f"  Overrides: NONE (knowledge through Hamiltonian only)")
-    print(f"\n  Layer 1: PMI couplings + local field")
-    print(f"  Layer 1b: Walsh-Hadamard Spectral (Householder + HWT)")
+    print(f"\n  Layer 1: PMI couplings + local field (legacy fallback)")
+    print(f"  Layer 1b: Graded Couplings from continuation frequencies")
     print(f"  Layer 2: Knowledge external field (h_knowledge)")
     print(f"  Layer 3: 3-Spin couplings (J3 SPO triples)")
     print(f"  Layer 4: Category couplings (hypernym-based)")
@@ -375,21 +379,23 @@ def main():
     print(f"\n  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
     print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
     print(f"  MCMC refinement: YES ({model.mcmc_refine_steps} passes)")
-    print(f"  Walsh spectral: {'YES' if model.walsh_layer is not None else 'NO'}")
+    print(f"  Graded couplings: {'YES' if model.graded_couplings is not None else 'NO'}")
+    print(f"  β_word (auto-calibrated): {model.beta_word:.6f}")
     print(f"\n  Scale comparison:")
     print(f"    recall_scale=     {model.recall_scale:>6}")
+    print(f"    coupling_scale=   {model.coupling_scale:>6}")
+    print(f"    trigram_scale=    {model.trigram_scale:>6}")
     print(f"    knowledge_scale=  {model.knowledge_scale:>6}")
     print(f"    spin3_scale=      {model.spin3_scale:>6}")
     print(f"    category_scale=   {model.category_scale:>6}")
     print(f"    logic_rule_scale= {model.logic_rule_scale:>6}")
-    print(f"    walsh_weight=     {model.walsh_weight:>6}")
     print(f"\n  Knowledge Layer: {kl.n_triples} triples, {len(kl.J3)} J3 entries")
     print(f"  Category Layer: {cl.n_categories} categories, {cl.n_categorized_words} words")
     print(f"  Logic Layer: {ml.n_rules} rules ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
-    if model.walsh_layer is not None:
-        wl = model.walsh_layer
-        print(f"  Walsh Layer: rank={wl.subspace_rank}, order={wl.max_order}, "
-              f"coeffs=[{wl.n_coeffs[0]}, {wl.n_coeffs[1]}, {wl.n_coeffs[2]}, {wl.n_coeffs[3]}]")
+    if model.graded_couplings is not None:
+        gc = model.graded_couplings
+        n_j3 = sum(len(v) for v in gc.J3.values())
+        print(f"  Graded Layer: J₂={gc.J2.nnz:,} non-zero, J₃={n_j3:,} entries")
     print(f"\n  Generation statistics:")
     print(f"    Recall hit rate: {stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {stats['pmi_only_rate']:.1%}")
@@ -398,7 +404,7 @@ def main():
     print(f"    3-Spin firings: {stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {stats.get('category_hits', 0)}")
     print(f"    Logic hits: {stats.get('logic_hits', 0)}")
-    print(f"    Walsh hits: {stats.get('walsh_hits', 0)}")
+    print(f"    Graded hits: {stats.get('graded_hits', 0)}")
     print(f"    MCMC accept rate: {stats.get('mcmc_accept_rate', 0):.1%}")
     print(f"    Ising enabled: {stats['ising_enabled']}")
     print(f"\n  Perplexity: {ppl:.2f}")
