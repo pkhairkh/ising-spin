@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ising-spin"
-version = "5.0.0"
-description = "Ising Spin Glass Language Model — Genuine Ising Dynamics with 5-layer Hamiltonian, no overrides, knowledge through energy wells"
+version = "6.0.0"
+description = "Ising Spin Glass Language Model — Walsh-Hadamard Spectral Couplings with 6-layer Hamiltonian, Householder subspace rotation, no overrides, knowledge through energy wells"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

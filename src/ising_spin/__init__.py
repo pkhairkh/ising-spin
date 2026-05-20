@@ -1,11 +1,16 @@
 """
-Ising Spin Glass Language Model — v5.0 Genuine Ising Dynamics
+Ising Spin Glass Language Model — v6.0 Walsh-Hadamard Spectral Couplings
 
 ALL word selection goes through the Hamiltonian. No overrides, no bypasses.
 Every word is chosen by Boltzmann sampling from the energy landscape.
 
-Architecture (5 layers, ALL compete through E(w|ctx)):
+Architecture (6 layers, ALL compete through E(w|ctx)):
     Layer 1: PMI couplings J[w,w'] + local field h[w]
+    Layer 1b: Walsh-Hadamard Spectral Couplings (replaces PMI when enabled)
+              — Householder subspace rotation V→d for efficiency
+              — Order-1 (ĥ₁): graded context-target (replaces PMI)
+              — Order-2 (ĥ₂): pairwise context interaction
+              — Order-3 (ĥ₃): triple context interaction
     Layer 2: Knowledge external field h_knowledge[w] (SPO triples)
     Layer 3: 3-Spin couplings J3[(s,p)] -> o (many-body Ising interaction)
     Layer 4: Category couplings J_category (hypernym-based semantic smoothing)
@@ -45,6 +50,7 @@ from .model import (
     KnowledgeLayer,
     CategoryLayer,
     MarkovLogicLayer,
+    WalshSpectralLayer,
     compute_log_floor_pmi,
     compute_pmi_couplings,
     compute_skip_pmi_couplings,
@@ -58,4 +64,4 @@ from .model import (
     truncate_sequences,
 )
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"

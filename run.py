@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Ising Spin Glass Language Model — Runner v5.0.
+Ising Spin Glass Language Model — Runner v6.0.
 
-Genuine Ising Dynamics: ALL word selection through the Hamiltonian.
-No overrides. No bypasses. Knowledge creates competing energy wells.
-Boltzmann sampling at temperature beta picks between them stochastically.
+Walsh-Hadamard Spectral Couplings + Householder subspace rotation.
+ALL word selection through the Hamiltonian. No overrides. No bypasses.
+Knowledge creates competing energy wells. Boltzmann sampling at temperature
+beta picks between them stochastically.
 
-5-Layer Architecture (ALL compete through E(w|ctx)):
+6-Layer Architecture (ALL compete through E(w|ctx)):
   Layer 1: PMI Couplings (word affinities) + Local Field
+  Layer 1b: Walsh-Hadamard Spectral Couplings (replaces PMI when enabled)
+            — Householder subspace rotation V→d for efficiency
+            — Order-1 (ĥ₁): graded context-target (replaces PMI)
+            — Order-2 (ĥ₂): pairwise context interaction
+            — Order-3 (ĥ₃): triple context interaction
   Layer 2: Knowledge External Field h_knowledge[w]
   Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples
   Layer 4: Category Couplings J_category (hypernym-based)
@@ -15,14 +21,14 @@ Boltzmann sampling at temperature beta picks between them stochastically.
 
 Post-generation: MCMC spin-flip refinement (Metropolis criterion)
 
-v5.0 changes from v4.0:
-  - KILLED _check_knowledge_override() — no more bypassing Boltzmann
-  - KILLED knowledge_type_override — types biased through energy, not override
-  - ALL knowledge through Hamiltonian — deep energy wells from J3
-  - NO PMI damping when recall hits — all terms compete freely
-  - MCMC spin-flip refinement — genuinely Ising dynamics
-  - Competing triples create competing energy wells
-  - Phase transition: knowledge influence varies with beta
+v6.0 changes from v5.0:
+  - Added Walsh-Hadamard Spectral Layer (Layer 1b)
+  - Householder subspace rotation: V→d for efficiency
+  - Order-1 Walsh coefficients replace PMI (graded, not binary)
+  - Order-2 and Order-3 Walsh coefficients replace heuristic J3
+  - Graded recall bonus: always proportional to continuation probability
+  - All Walsh coefficients are integers; Q quantized to int16
+  - Sparse storage for order-2/3 (only |coeff| > min_coeff stored)
 """
 
 import sys
@@ -34,7 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from ising_spin.model import (
     IsingLMModel, IsingLM, KnowledgeLayer, CategoryLayer, MarkovLogicLayer,
-    POS2IDX, IDX2POS
+    WalshSpectralLayer, POS2IDX, IDX2POS
 )
 
 
@@ -74,8 +80,8 @@ def run_ablation(model, prompts, length=20):
     print("\n" + "=" * 70)
     print("ABLATION STUDY: Ising ON vs Ising OFF")
     print("=" * 70)
-    print("\n  v5.0: Both use energy-only pipeline (no overrides).")
-    print("  Ising OFF: PMI=0, but knowledge + category + logic still active.\n")
+    print("\n  v6.0: Both use energy-only pipeline (no overrides).")
+    print("  Ising OFF: PMI=0, but knowledge + category + logic + Walsh still active.\n")
 
     ising_texts = []
     baseline_texts = []
@@ -128,21 +134,23 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING SPIN GLASS LANGUAGE MODEL (v5.0 — Genuine Ising Dynamics)")
+    print("ISING SPIN GLASS LANGUAGE MODEL (v6.0 — Walsh-Hadamard Spectral)")
     print("=" * 70)
     print()
-    print("5-Layer Architecture (ALL compete through Hamiltonian):")
+    print("6-Layer Architecture (ALL compete through Hamiltonian):")
     print("  Layer 1: PMI Couplings + Local Field")
+    print("  Layer 1b: Walsh-Hadamard Spectral Couplings (Householder + HWT)")
     print("  Layer 2: Knowledge External Field h_knowledge[w]")
     print("  Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples")
     print("  Layer 4: Category Couplings (hypernym-based)")
     print("  Layer 5: Markov Logic Penalty (factual consistency)")
     print()
-    print("v5.0: Genuine Ising Dynamics")
-    print("  NO overrides. NO bypasses. Knowledge through Hamiltonian only.")
-    print("  Deep energy wells from J3 compete with recall in Boltzmann sampling.")
-    print("  MCMC spin-flip refinement (Metropolis criterion).")
-    print("  Phase transition: knowledge influence varies with beta.")
+    print("v6.0: Walsh-Hadamard Spectral Couplings")
+    print("  Householder subspace rotation: V→d for efficiency.")
+    print("  Order-1 (ĥ₁): graded context-target (replaces PMI).")
+    print("  Order-2 (ĥ₂) + Order-3 (ĥ₃): context interactions.")
+    print("  ALL coefficients are integers. Q quantized to int16.")
+    print("  Graded recall bonus: ∝ continuation probability.")
     print()
 
     t0 = time.time()
@@ -190,6 +198,15 @@ def main():
 
         # ConceptNet
         use_conceptnet=True,
+
+        # v6.0: Walsh-Hadamard spectral couplings
+        # Walsh energy replaces PMI with graded, spectrally-learned couplings
+        # walsh_weight controls overall scale — needs to be comparable to recall_scale
+        walsh_enabled=True,
+        walsh_subspace_rank=64,
+        walsh_max_order=2,       # Order-3 too sparse with 20K training samples
+        walsh_weight=1,          # Weight for Walsh spectral energy term
+        walsh_min_coeff=3,
     )
 
     model.train(n_samples=20000)
@@ -201,7 +218,7 @@ def main():
     # PHASE 1: Quick generation test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("QUICK GENERATION TEST (v5.0 — Energy-Only, No Overrides)")
+    print("QUICK GENERATION TEST (v6.0 — Walsh-Hadamard Spectral)")
     print("=" * 70)
 
     prompts = ["the", "a", "in", "science", "research", "students", "he",
@@ -222,9 +239,9 @@ def main():
     # PHASE 2: 5-Layer Knowledge Test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("5-LAYER KNOWLEDGE TEST (Energy Competition, Not Overrides)")
+    print("6-LAYER KNOWLEDGE TEST (Energy Competition, Not Overrides)")
     print("=" * 70)
-    print("\n  v5.0: All 5 Layers ON vs Knowledge Layers OFF")
+    print("\n  v6.0: All 6 Layers ON vs Knowledge Layers OFF")
     print("  Knowledge wins through DEEP ENERGY WELLS, not overrides.\n")
 
     # Knowledge layer diagnostics
@@ -245,6 +262,17 @@ def main():
     
     print(f"\n  Layer 5 (Markov Logic):")
     print(f"    Total rules: {ml.n_rules} ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
+
+    # Walsh spectral layer diagnostics
+    if model.walsh_layer is not None:
+        wl = model.walsh_layer
+        print(f"\n  Layer 1b (Walsh Spectral):")
+        print(f"    Subspace rank: {wl.subspace_rank}")
+        print(f"    Max order: {wl.max_order}")
+        print(f"    Order-0 non-zero: {wl.n_coeffs[0]}")
+        print(f"    Order-1 non-zero: {wl.n_coeffs[1]}")
+        print(f"    Order-2 non-zero: {wl.n_coeffs[2]}")
+        print(f"    Order-3 non-zero: {wl.n_coeffs[3]}")
 
     # Test with knowledge-triggering prompts
     knowledge_prompts = [
@@ -279,13 +307,14 @@ def main():
     on_stats = model.generator.get_stats()
     off_stats = model.knowledge_off_generator.get_stats()
 
-    print(f"\n  5-Layers ON stats:")
+    print(f"\n  6-Layers ON stats:")
     print(f"    Recall hit rate: {on_stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {on_stats['pmi_only_rate']:.1%}")
     print(f"    Knowledge hits: {on_stats.get('knowledge_hits', 0)}")
     print(f"    3-Spin firings: {on_stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {on_stats.get('category_hits', 0)}")
     print(f"    Logic hits: {on_stats.get('logic_hits', 0)}")
+    print(f"    Walsh hits: {on_stats.get('walsh_hits', 0)}")
     print(f"    MCMC accept rate: {on_stats.get('mcmc_accept_rate', 0):.1%}")
 
     print(f"\n  Knowledge OFF stats:")
@@ -332,12 +361,13 @@ def main():
     stats = model.generator.get_stats()
 
     print("\n" + "=" * 70)
-    print("SUMMARY — v5.0 Genuine Ising Dynamics")
+    print("SUMMARY — v6.0 Walsh-Hadamard Spectral Couplings")
     print("=" * 70)
-    print(f"\n  Architecture: 5-Layer Ising Spin Glass (v5.0)")
+    print(f"\n  Architecture: 6-Layer Ising Spin Glass (v6.0)")
     print(f"  Pipeline: Energy → Boltzmann → MCMC refinement")
     print(f"  Overrides: NONE (knowledge through Hamiltonian only)")
     print(f"\n  Layer 1: PMI couplings + local field")
+    print(f"  Layer 1b: Walsh-Hadamard Spectral (Householder + HWT)")
     print(f"  Layer 2: Knowledge external field (h_knowledge)")
     print(f"  Layer 3: 3-Spin couplings (J3 SPO triples)")
     print(f"  Layer 4: Category couplings (hypernym-based)")
@@ -345,15 +375,21 @@ def main():
     print(f"\n  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
     print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
     print(f"  MCMC refinement: YES ({model.mcmc_refine_steps} passes)")
+    print(f"  Walsh spectral: {'YES' if model.walsh_layer is not None else 'NO'}")
     print(f"\n  Scale comparison:")
     print(f"    recall_scale=     {model.recall_scale:>6}")
     print(f"    knowledge_scale=  {model.knowledge_scale:>6}")
     print(f"    spin3_scale=      {model.spin3_scale:>6}")
     print(f"    category_scale=   {model.category_scale:>6}")
     print(f"    logic_rule_scale= {model.logic_rule_scale:>6}")
+    print(f"    walsh_weight=     {model.walsh_weight:>6}")
     print(f"\n  Knowledge Layer: {kl.n_triples} triples, {len(kl.J3)} J3 entries")
     print(f"  Category Layer: {cl.n_categories} categories, {cl.n_categorized_words} words")
     print(f"  Logic Layer: {ml.n_rules} rules ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
+    if model.walsh_layer is not None:
+        wl = model.walsh_layer
+        print(f"  Walsh Layer: rank={wl.subspace_rank}, order={wl.max_order}, "
+              f"coeffs=[{wl.n_coeffs[0]}, {wl.n_coeffs[1]}, {wl.n_coeffs[2]}, {wl.n_coeffs[3]}]")
     print(f"\n  Generation statistics:")
     print(f"    Recall hit rate: {stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {stats['pmi_only_rate']:.1%}")
@@ -362,6 +398,7 @@ def main():
     print(f"    3-Spin firings: {stats.get('spin3_firings', 0)}")
     print(f"    Category hits: {stats.get('category_hits', 0)}")
     print(f"    Logic hits: {stats.get('logic_hits', 0)}")
+    print(f"    Walsh hits: {stats.get('walsh_hits', 0)}")
     print(f"    MCMC accept rate: {stats.get('mcmc_accept_rate', 0):.1%}")
     print(f"    Ising enabled: {stats['ising_enabled']}")
     print(f"\n  Perplexity: {ppl:.2f}")
