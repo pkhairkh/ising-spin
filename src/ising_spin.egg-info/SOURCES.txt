@@ -1,0 +1,9 @@
+pyproject.toml
+src/ising_spin/__init__.py
+src/ising_spin/model.py
+src/ising_spin.egg-info/PKG-INFO
+src/ising_spin.egg-info/SOURCES.txt
+src/ising_spin.egg-info/dependency_links.txt
+src/ising_spin.egg-info/requires.txt
+src/ising_spin.egg-info/top_level.txt
+tests/test_model.py

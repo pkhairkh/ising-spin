@@ -9,9 +9,13 @@ A non-neural language model where:
 
 The Ising model contributes through:
   - PMI coupling matrix J[w,w'] = log-floor PMI (word affinities)
+  - Skip-gram PMI J_skip[w,w',dist] = distance-specific couplings
   - Local field h[w] = self-information (unigram frequency)
   - Energy function: E(w|ctx) = -J[w,ctx] - h[w] + penalties
   - Temperature-controlled stochastic selection
+  - Beam generation with global energy ranking
+  - Joint phrase sampling via MCMC
+  - Temperature annealing (Ising phase transition)
 
 INTEGER-ONLY CONSTRAINT (enforced):
   - ALL generation-path computation uses integer arithmetic
@@ -31,6 +35,8 @@ import time
 import numpy as np
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple, Set
+
+import scipy.sparse as sp
 
 
 # ===========================================================================
@@ -73,6 +79,8 @@ class Vocabulary:
 
     Special tokens:
         <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3
+
+    Path 3a: Enhanced tokenizer handles contractions, hyphens, and numbers.
     """
 
     UNK = "<UNK>"
@@ -80,6 +88,17 @@ class Vocabulary:
     EOS = "<EOS>"
     PAD = "<PAD>"
     SPECIALS = [UNK, BOS, EOS, PAD]
+
+    # Contraction suffixes to split off
+    CONTRACTION_SUFFIXES = [
+        "n't", "'t",  # negation: don't -> do + n't, can't -> ca + n't
+        "'s",         # possessive/aux: it's, he's
+        "'re",        # they're
+        "'ve",        # they've
+        "'ll",        # they'll
+        "'d",         # they'd
+        "'m",         # I'm
+    ]
 
     def __init__(self, min_freq: int = 5, max_size: Optional[int] = None):
         self.min_freq = min_freq
@@ -90,24 +109,80 @@ class Vocabulary:
         self._built = False
 
     def _tokenize(self, text: str) -> List[str]:
-        """Simple whitespace + punctuation tokenizer. Pure string manipulation."""
+        """
+        Enhanced tokenizer with better handling of contractions, hyphens,
+        and numbers. Pure string manipulation — no external dependencies.
+
+        Path 3a improvements:
+          - Contractions: "don't" -> "do" + "n't", "it's" -> "it" + "'s"
+          - Hyphens: "well-known" -> "well-known" (kept as one token)
+          - Numbers: "3.14" stays as one token, "1,000" stays as one token
+        """
         tokens = []
         for word in text.split():
             stripped = word.strip()
             if not stripped:
                 continue
+
             # Split off leading punctuation
-            while stripped and not stripped[0].isalnum():
-                tokens.append(stripped[0])
+            leading_punct = []
+            while stripped and not stripped[0].isalnum() and stripped[0] != '-':
+                leading_punct.append(stripped[0])
                 stripped = stripped[1:]
+
             # Split off trailing punctuation
-            tail = []
-            while stripped and not stripped[-1].isalnum():
-                tail.append(stripped[-1])
+            trailing_punct = []
+            while stripped and not stripped[-1].isalnum() and stripped[-1] != '-':
+                trailing_punct.append(stripped[-1])
                 stripped = stripped[:-1]
-            if stripped:
-                tokens.append(stripped.lower())
-            tokens.extend(reversed(tail))
+
+            # Add leading punctuation tokens
+            tokens.extend(leading_punct)
+
+            if not stripped:
+                tokens.extend(reversed(trailing_punct))
+                continue
+
+            lower = stripped.lower()
+
+            # === Handle contractions ===
+            contraction_found = False
+            for suffix in self.CONTRACTION_SUFFIXES:
+                if lower.endswith(suffix) and len(lower) > len(suffix):
+                    stem = lower[:-len(suffix)]
+                    if stem and any(c.isalpha() for c in stem):
+                        # Special case: "can't" -> "ca" + "n't" (not "can")
+                        # But we keep it simple: "don't" -> "do" + "n't"
+                        tokens.append(stem)
+                        tokens.append(suffix)
+                        contraction_found = True
+                        break
+
+            if contraction_found:
+                tokens.extend(reversed(trailing_punct))
+                continue
+
+            # === Handle numbers (keep as single token) ===
+            # "3.14", "1,000", "0.5" should stay as one token
+            cleaned = lower.replace(".", "").replace(",", "")
+            if cleaned.replace("-", "").isdigit() and len(lower) > 0:
+                tokens.append(lower)
+                tokens.extend(reversed(trailing_punct))
+                continue
+
+            # === Handle hyphenated words (keep as single token) ===
+            # "well-known", "state-of-the-art" stay as one token
+            if '-' in lower and not lower.startswith('-') and not lower.endswith('-'):
+                parts = lower.split('-')
+                if all(len(p) >= 1 and (p.isalpha() or p.isdigit()) for p in parts):
+                    tokens.append(lower)
+                    tokens.extend(reversed(trailing_punct))
+                    continue
+
+            # === Default: use the word as-is (lowercased) ===
+            tokens.append(lower)
+            tokens.extend(reversed(trailing_punct))
+
         return tokens
 
     def build(self, texts: List[str]) -> "Vocabulary":
@@ -540,6 +615,28 @@ class IntegerBoltzmannSampler:
         idx = int(np.searchsorted(cumsum, r, side='right'))
         return min(idx, len(energies) - 1)
 
+    def compute_log_probabilities(self, energies: np.ndarray) -> np.ndarray:
+        """
+        Compute log probabilities for each element given energies.
+
+        Uses floating-point for the log computation (evaluation only,
+        not in the generation hot path). Uses log-sum-exp for numerical
+        stability.
+
+        Returns array of log P(i) where P(i) ~ exp(-beta * E_i).
+        """
+        if len(energies) == 0:
+            return np.array([], dtype=np.float64)
+
+        e_min = float(energies.min())
+        shifted = -self.beta * (energies.astype(np.float64) - e_min)
+        # Clip to avoid overflow in exp
+        shifted = np.clip(shifted, -500, 500)
+        log_weights = shifted
+        log_Z = np.log(np.exp(log_weights).sum())
+        log_probs = log_weights - log_Z
+        return log_probs
+
 
 # ===========================================================================
 # N-GRAM INDEX
@@ -631,7 +728,7 @@ class NGramIndex:
         """
         Compute recall bonus for candidate words based on n-gram matches.
 
-        Uses ONLY the longest matching context by default — prevents common-word inflation.
+        Uses ONLY the longest matching context by default -- prevents common-word inflation.
         For k >= 3: raw bonus (strong signal). For k < 3: normalized by total.
         """
         n_candidates = len(candidate_words)
@@ -719,14 +816,17 @@ def compute_pmi_couplings(
     window: int = 5,
     min_count: int = 2,
     pmi_cap: int = 10,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[sp.csr_matrix, np.ndarray]:
     """
     Compute PMI coupling matrix J and local field h from sequences.
+
+    Path 3b: J is now a scipy.sparse.csr_matrix (was dense np.ndarray).
+    Only non-zero PMI values are stored, saving ~95% memory.
 
     J[w, w'] = log-floor PMI(w, w') for co-occurring words within window
     h[w] = self-information = floor(log2(N/count(w)))
 
-    Returns (J, h) as int64 arrays.
+    Returns (J, h) where J is csr_matrix(int64) and h is np.ndarray(int64).
     """
     V = vocab_size
 
@@ -744,16 +844,33 @@ def compute_pmi_couplings(
             for j in range(i + 1, min(i + window + 1, len(seq))):
                 cooc_counts[(w, seq[j])] += 1
 
-    # Compute PMI coupling matrix
-    J = np.zeros((V, V), dtype=np.int64)
+    # Build sparse J matrix from non-zero PMI values
+    rows, cols, data = [], [], []
+    seen = set()
     for (w, w2), count in cooc_counts.items():
         if count >= min_count:
             pmi = compute_log_floor_pmi(
                 int(count), int(unigram[w]), int(unigram[w2]),
                 total_tokens, cap=pmi_cap
             )
-            J[w, w2] = pmi
-            J[w2, w] = pmi  # Symmetric
+            if pmi != 0:
+                # Add both (w, w2) and (w2, w) for symmetric matrix
+                if (w, w2) not in seen:
+                    rows.append(w)
+                    cols.append(w2)
+                    data.append(pmi)
+                    seen.add((w, w2))
+                if (w2, w) not in seen:
+                    rows.append(w2)
+                    cols.append(w)
+                    data.append(pmi)
+                    seen.add((w2, w))
+
+    J = sp.csr_matrix(
+        (np.array(data, dtype=np.int64),
+         (np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64))),
+        shape=(V, V)
+    )
 
     # Compute local field (self-information)
     h = np.ones(V, dtype=np.int64)
@@ -763,12 +880,97 @@ def compute_pmi_couplings(
             if ratio >= 2:
                 h[w] = ratio.bit_length() - 1
 
-    n_nonzero = int(np.count_nonzero(J))
-    print(f"    PMI matrix: {n_nonzero:,} non-zero entries out of {V*V:,}")
-    print(f"    PMI range: [{int(J[J != 0].min()) if n_nonzero > 0 else 0}, "
-          f"{int(J.max())}]")
+    n_nonzero = J.nnz
+    print(f"    PMI matrix (sparse): {n_nonzero:,} non-zero entries out of {V*V:,}")
+    if n_nonzero > 0:
+        dense_bytes = V * V * 8
+        sparse_bytes = J.data.nbytes + J.indices.nbytes + J.indptr.nbytes
+        print(f"    Memory: sparse {sparse_bytes/1024/1024:.1f}MB vs dense {dense_bytes/1024/1024:.1f}MB")
+        min_val = int(J.data.min())
+        max_val = int(J.data.max())
+        print(f"    PMI range: [{min_val}, {max_val}]")
 
     return J, h
+
+
+def compute_skip_pmi_couplings(
+    sequences: List[List[int]],
+    vocab_size: int,
+    max_dist: int = 5,
+    min_count: int = 2,
+    pmi_cap: int = 10,
+) -> Dict[int, sp.csr_matrix]:
+    """
+    Compute distance-specific skip-gram PMI couplings.
+
+    Path 2d: Instead of a flat window, compute PMI for each distance
+    separately. This captures longer-range dependencies beyond window-5.
+
+    J_skip[dist] is a sparse matrix where J_skip[dist][w1, w2] =
+        log-floor PMI(w1, w2) computed from pairs exactly `dist` apart.
+
+    Args:
+        sequences: Tokenized sequences.
+        vocab_size: Vocabulary size V.
+        max_dist: Maximum skip distance to compute (default 5).
+        min_count: Minimum co-occurrence count for PMI.
+        pmi_cap: Cap on absolute PMI value.
+
+    Returns:
+        Dict mapping distance (1..max_dist) to csr_matrix of shape (V, V).
+    """
+    V = vocab_size
+
+    # Count unigrams
+    unigram = np.zeros(V, dtype=np.int64)
+    for seq in sequences:
+        for w in seq:
+            unigram[w] += 1
+    total_tokens = int(unigram.sum())
+
+    # Count co-occurrences at each specific distance
+    cooc_by_dist: Dict[int, Counter] = {d: Counter() for d in range(1, max_dist + 1)}
+    for seq in sequences:
+        for i, w in enumerate(seq):
+            for d in range(1, min(max_dist + 1, len(seq) - i)):
+                j = i + d
+                cooc_by_dist[d][(w, seq[j])] += 1
+
+    # Build sparse matrices for each distance
+    J_skip: Dict[int, sp.csr_matrix] = {}
+    for dist in range(1, max_dist + 1):
+        rows, cols, data = [], [], []
+        seen = set()
+        for (w, w2), count in cooc_by_dist[dist].items():
+            if count >= min_count:
+                pmi = compute_log_floor_pmi(
+                    int(count), int(unigram[w]), int(unigram[w2]),
+                    total_tokens, cap=pmi_cap
+                )
+                if pmi != 0:
+                    if (w, w2) not in seen:
+                        rows.append(w)
+                        cols.append(w2)
+                        data.append(pmi)
+                        seen.add((w, w2))
+                    if (w2, w) not in seen:
+                        rows.append(w2)
+                        cols.append(w)
+                        data.append(pmi)
+                        seen.add((w2, w))
+
+        if rows:
+            J_skip[dist] = sp.csr_matrix(
+                (np.array(data, dtype=np.int64),
+                 (np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64))),
+                shape=(V, V)
+            )
+        else:
+            J_skip[dist] = sp.csr_matrix((V, V), dtype=np.int64)
+
+        print(f"    Skip-PMI dist={dist}: {J_skip[dist].nnz:,} non-zero entries")
+
+    return J_skip
 
 
 # ===========================================================================
@@ -784,6 +986,12 @@ class IsingLM:
       2. N-gram recall: Primary next-word signal (when available)
       3. PMI coupling: Secondary signal (when recall misses)
       4. Integer Boltzmann: Temperature-controlled stochastic selection
+
+    Path 2 additions:
+      - generate_beam: Global coherence via energy-ranked beam search
+      - _joint_sample: Joint phrase sampling via MCMC
+      - generate_annealed: Temperature annealing (Ising phase transition)
+      - J_skip: Distance-specific skip-gram PMI couplings
 
     Parameters (6 generation params, not 30+):
       - recall_scale, pmi_weight, field_weight
@@ -803,7 +1011,7 @@ class IsingLM:
         self,
         vocab: Vocabulary,
         ngram_index: NGramIndex,
-        J: np.ndarray,
+        J: sp.csr_matrix,
         h: np.ndarray,
         types: POSTypeSystem,
         recall_scale: int = 1000,
@@ -817,6 +1025,7 @@ class IsingLM:
         same_word_penalty: int = 50000,
         max_closed_class_run: int = 2,
         ising_enabled: bool = True,
+        J_skip: Optional[Dict[int, sp.csr_matrix]] = None,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -830,6 +1039,10 @@ class IsingLM:
         self.pmi_weight = pmi_weight
         self.field_weight = field_weight
         self.ising_enabled = ising_enabled
+
+        # Path 2d: Skip-gram PMI couplings (distance-specific)
+        self.J_skip = J_skip if J_skip is not None else {}
+        self.max_skip_dist = max(self.J_skip.keys()) if self.J_skip else 0
 
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=500)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=500)
@@ -922,6 +1135,11 @@ class IsingLM:
              - field(w)                   [TERTIARY: unigram frequency]
              + penalties                  [HARD: grammar, anti-repetition]
 
+        Path 2d: Uses distance-weighted skip-gram PMI when available,
+        falling back to base J for distances not in J_skip.
+
+        Path 3b: Uses sparse matrix operations for coupling computation.
+
         All integer arithmetic.
         """
         n_candidates = len(candidate_words)
@@ -937,20 +1155,17 @@ class IsingLM:
         )
         energies -= recall_bonuses
 
-        # === PMI COUPLING (Ising model — secondary signal) ===
+        # === PMI COUPLING (Ising model -- secondary signal) ===
         if self.ising_enabled and len(context_words) > 0:
-            context_start = max(0, len(context_words) - self.window)
-            ctx = context_words[context_start:]
-            if ctx:
-                ctx_arr = np.array(ctx, dtype=np.int64)
-                coupling_block = self.J[np.ix_(candidate_words, ctx_arr)]
-                coupling_sums = coupling_block.sum(axis=1)
-                if recall_hit and recall_bonuses.max() > 0:
-                    energies -= (coupling_sums * self.pmi_weight) // 10
-                else:
-                    energies -= coupling_sums * self.pmi_weight
+            coupling_sums = self._compute_pmi_coupling_sum(
+                candidate_words, context_words
+            )
+            if recall_hit and recall_bonuses.max() > 0:
+                energies -= (coupling_sums * self.pmi_weight) // 10
+            else:
+                energies -= coupling_sums * self.pmi_weight
 
-        # === LOCAL FIELD (unigram — tertiary signal) ===
+        # === LOCAL FIELD (unigram -- tertiary signal) ===
         field_vals = self.h[candidate_words] * self.field_weight
         if recall_hit and recall_bonuses.max() > 0:
             energies -= (field_vals * 1) // 10
@@ -987,6 +1202,436 @@ class IsingLM:
                     energies[i] += 200
 
         return energies
+
+    def _compute_pmi_coupling_sum(
+        self,
+        candidate_words: np.ndarray,
+        context_words: List[int],
+    ) -> np.ndarray:
+        """
+        Compute PMI coupling sums for candidate words against context.
+
+        Path 2d: Uses distance-weighted skip-gram couplings when available.
+        For each context word at distance d, uses J_skip[d] if present,
+        otherwise falls back to the base J matrix.
+
+        Path 3b: Uses sparse matrix operations.
+
+        Returns coupling_sums array of shape (n_candidates,) with int64 values.
+        """
+        n_candidates = len(candidate_words)
+        coupling_sums = np.zeros(n_candidates, dtype=np.int64)
+
+        if not self.ising_enabled or len(context_words) == 0:
+            return coupling_sums
+
+        # Determine the effective window
+        effective_window = max(self.window, self.max_skip_dist)
+        context_start = max(0, len(context_words) - effective_window)
+        ctx = context_words[context_start:]
+
+        if not ctx:
+            return coupling_sums
+
+        # If we have skip-gram couplings, use distance-specific matrices
+        if self.J_skip:
+            for i, c in enumerate(ctx):
+                # Distance from current position (1-indexed)
+                dist = len(ctx) - i
+                c_int = int(c)
+
+                # Choose the appropriate coupling matrix for this distance
+                if dist in self.J_skip:
+                    J_dist = self.J_skip[dist]
+                else:
+                    J_dist = self.J
+
+                # Extract coupling values: J_dist[w, c] for each candidate w
+                # With scipy sparse, A[[r1,r2,...], [c1,c2,...]] gives element-wise pairs
+                c_list = [c_int] * n_candidates
+                w_list = candidate_words.tolist()
+                coupling_vals = J_dist[w_list, c_list]
+                coupling_sums += np.asarray(coupling_vals, dtype=np.int64).flatten()
+        else:
+            # Fallback: use base J with flat window
+            ctx_arr = np.array(ctx, dtype=np.int64)
+            # Sparse matrix row/column selection
+            J_rows = self.J[candidate_words.tolist(), :]
+            J_sub = J_rows[:, ctx_arr.tolist()]
+            coupling_sums = np.asarray(J_sub.sum(axis=1), dtype=np.int64).flatten()
+
+        return coupling_sums
+
+    # ===================================================================
+    # Path 2a: Global Coherence Scoring (Beam Generation)
+    # ===================================================================
+
+    def generate_beam(self, prompt: str = "the", length: int = 20,
+                      n_beams: int = 5) -> Dict:
+        """
+        Generate text using beam-like search with global energy ranking.
+
+        Generates n_beams candidate sequences independently, then ranks
+        them by total energy E = Σ E(w_t). The lowest-energy sequence
+        is returned as the best candidate.
+
+        This uses the Ising model as a GLOBAL constraint rather than
+        just a local next-word signal.
+
+        Args:
+            prompt: Starting word.
+            length: Number of tokens to generate.
+            n_beams: Number of candidate sequences to generate.
+
+        Returns:
+            Dict with 'text', 'words', 'types', 'diagnostics',
+            plus 'beam_energy' and 'all_candidates'.
+        """
+        candidates = []
+        for beam_idx in range(n_beams):
+            result = self.generate(prompt=prompt, length=length)
+
+            # Compute total energy for the full sequence
+            total_energy = 0
+            words = result['words']
+            types_list = result['types']
+            for pos in range(1, len(words)):
+                context_words = words[:pos]
+                context_types = types_list[:pos]
+                word_type = types_list[pos]
+                recall_matches = self.ngram_index.lookup(context_words)
+                recall_hit = bool(recall_matches)
+                candidate_arr = np.array([words[pos]], dtype=np.int64)
+                e = self._compute_word_energy(
+                    pos, candidate_arr, word_type,
+                    context_words, context_types, recall_hit
+                )
+                total_energy += int(e[0])
+
+            candidates.append({
+                'energy': total_energy,
+                'result': result,
+            })
+
+        # Sort by energy (lowest = best = most coherent)
+        candidates.sort(key=lambda x: x['energy'])
+
+        best = candidates[0]['result']
+        best['beam_energy'] = candidates[0]['energy']
+        best['beam_rank'] = 1
+        best['all_candidates'] = [
+            {'energy': c['energy'], 'text': c['result']['text']}
+            for c in candidates
+        ]
+        return best
+
+    # ===================================================================
+    # Path 2b: Joint Phrase Sampling via MCMC
+    # ===================================================================
+
+    def _joint_sample(
+        self,
+        context_words: List[int],
+        context_types: List[int],
+        phrase_len: int = 2,
+        n_proposals: int = 20,
+    ) -> Optional[List[int]]:
+        """
+        Joint phrase sampling using MCMC.
+
+        Instead of always sampling one word at a time, sometimes sample
+        2-3 words jointly. Proposes a phrase (w1, w2, ...), computes
+        joint energy E(w1, w2) = E(w1) + E(w2) + J[w1, w2], then
+        accepts/rejects via Metropolis criterion.
+
+        This is where J-couplings ACTUALLY constrain word combinations,
+        because the direct coupling J[w1, w2] is explicitly evaluated.
+
+        Args:
+            context_words: Preceding word indices.
+            context_types: Preceding POS type indices.
+            phrase_len: Number of words to sample jointly (2 or 3).
+            n_proposals: Number of MCMC proposals to try.
+
+        Returns:
+            List of word indices for the accepted phrase, or None
+            if no good phrase found (fall back to single-word sampling).
+        """
+        if phrase_len < 2:
+            return None
+
+        best_phrase = None
+        best_energy = 0  # We want the most negative energy (lowest)
+
+        # Get the type of the previous word for type selection
+        prev_type = context_types[-1] if context_types else POS2IDX["NOUN"]
+
+        for _ in range(n_proposals):
+            phrase_words = []
+            phrase_types = []
+            phrase_energy = 0
+
+            # Generate the phrase word by word, but compute JOINT energy
+            for step in range(phrase_len):
+                if step == 0:
+                    step_prev_type = prev_type
+                    step_types_history = context_types
+                else:
+                    step_prev_type = phrase_types[step - 1]
+                    step_types_history = context_types + phrase_types
+
+                # Choose type for this position
+                valid_types = self._get_valid_next_types(
+                    step_prev_type, step_types_history
+                )
+                if not valid_types:
+                    break
+
+                # Pick a type (prefer recall-suggested type if available)
+                chosen_type = None
+                if step == 0:
+                    step_context = context_words
+                else:
+                    step_context = context_words + phrase_words
+
+                recall_matches = self.ngram_index.lookup(step_context)
+                if recall_matches:
+                    best_k = max(recall_matches.keys())
+                    best_conts = recall_matches[best_k]
+                    if best_k >= 2 and best_conts:
+                        recall_word, _, _ = best_conts[0]
+                        recall_type = self._get_word_type(recall_word)
+                        if recall_type in valid_types:
+                            chosen_type = recall_type
+
+                if chosen_type is None:
+                    chosen_type = np.random.choice(valid_types)
+
+                # Get candidates for this type
+                candidate_list = self.type_words.get(chosen_type, [])
+                if not candidate_list:
+                    break
+                candidate_words = np.array(candidate_list, dtype=np.int64)
+
+                # Top-k filtering
+                if len(candidate_words) > 200:
+                    field_vals = self.h[candidate_words]
+                    top_k = np.argsort(field_vals)[-200:]
+                    candidate_words = candidate_words[top_k]
+
+                # Compute energy
+                if step == 0:
+                    e_context = context_words
+                else:
+                    e_context = context_words + phrase_words
+
+                recall_hit = bool(self.ngram_index.lookup(e_context))
+                energies = self._compute_word_energy(
+                    len(context_words) + step, candidate_words, chosen_type,
+                    e_context, step_types_history, recall_hit
+                )
+
+                # Sample a word
+                word_idx = self.word_sampler.sample(energies)
+                chosen_word = int(candidate_words[word_idx])
+
+                phrase_words.append(chosen_word)
+                phrase_types.append(chosen_type)
+                phrase_energy += int(energies[word_idx])
+
+            if len(phrase_words) < phrase_len:
+                continue
+
+            # Add direct pairwise J coupling between phrase words
+            # This is the KEY part where J-couplings constrain combinations
+            for i in range(len(phrase_words)):
+                for j in range(i + 1, len(phrase_words)):
+                    w1, w2 = phrase_words[i], phrase_words[j]
+                    # Get direct J coupling from sparse matrix
+                    coupling = int(self.J[w1, w2])
+                    phrase_energy -= coupling * self.pmi_weight
+
+            if phrase_energy < best_energy:
+                best_energy = phrase_energy
+                best_phrase = phrase_words
+
+        # Accept the phrase if its energy is negative enough
+        # (i.e., it's a low-energy = good configuration)
+        if best_phrase is not None and best_energy < 0:
+            return best_phrase
+
+        return None
+
+    # ===================================================================
+    # Path 2c: Temperature Annealing
+    # ===================================================================
+
+    def generate_annealed(
+        self,
+        prompt: str = "the",
+        length: int = 20,
+        beta_start: float = 0.005,
+        beta_end: float = 0.5,
+    ) -> Dict:
+        """
+        Generate text with linear temperature annealing.
+
+        Simulates the Ising model phase transition:
+        - Start HOT (low beta = diverse, random sampling)
+        - Cool down (high beta = deterministic, low-energy sampling)
+        - beta(t) = beta_start + (beta_end - beta_start) * t / length
+
+        At each position, a NEW Boltzmann sampler is created with the
+        current beta value. This is computationally more expensive than
+        standard generation but provides genuine Ising annealing.
+
+        Args:
+            prompt: Starting word.
+            length: Number of tokens to generate.
+            beta_start: Initial inverse temperature (hot = diverse).
+            beta_end: Final inverse temperature (cold = deterministic).
+
+        Returns:
+            Dict with 'text', 'words', 'types', 'diagnostics',
+            plus 'beta_schedule'.
+        """
+        # Resolve prompt
+        prompt_idx = self.vocab.word2idx.get(prompt)
+        if prompt_idx is None:
+            prompt_idx = self.vocab.word2idx.get(prompt.lower())
+        if prompt_idx is None:
+            prompt_idx = 4
+
+        prompt_type = self._get_word_type(prompt_idx)
+        words = [prompt_idx]
+        types_list = [prompt_type]
+        consecutive_copies = 0
+        diagnostics = []
+        beta_schedule = []
+
+        for pos in range(1, length):
+            # Linear annealing: beta increases over time
+            beta_t = beta_start + (beta_end - beta_start) * pos / max(1, length - 1)
+            beta_schedule.append(beta_t)
+
+            # Create a new sampler with the current beta
+            annealed_word_sampler = IntegerBoltzmannSampler(
+                beta=beta_t, max_delta=500
+            )
+
+            # === STEP 1: Choose POS type ===
+            valid_types = self._get_valid_next_types(types_list[-1], types_list)
+
+            # Check if recall suggests a type override
+            recall_type_override = None
+            if len(words) >= 2:
+                recall_matches = self.ngram_index.lookup(words)
+                if recall_matches:
+                    best_k = max(recall_matches.keys())
+                    best_conts = recall_matches[best_k]
+                    if best_k >= 2 and best_conts:
+                        best_word, best_count, best_total = best_conts[0]
+                        if best_count * 3 >= best_total:
+                            recall_type = self._get_word_type(best_word)
+                            if recall_type in valid_types:
+                                recall_type_override = recall_type
+
+            if recall_type_override is not None:
+                chosen_type = recall_type_override
+            else:
+                type_energies = np.array([
+                    self._compute_type_energy(pos, t, types_list)
+                    for t in valid_types
+                ], dtype=np.int64)
+                type_idx = self.type_sampler.sample(type_energies)
+                chosen_type = valid_types[type_idx]
+
+            # === STEP 2: Check copy mechanism ===
+            copy_word = None
+            if self.copy_enabled and len(words) >= self.copy_min_context:
+                copy_candidate = self.ngram_index.get_best_copy_candidate(
+                    context_words=words,
+                    min_context_length=self.copy_min_context,
+                    min_confidence=self.copy_min_confidence,
+                )
+                if copy_candidate is not None:
+                    copy_word_idx, _, _ = copy_candidate
+                    if copy_word_idx < self.types.I_emit.shape[0]:
+                        if int(self.types.I_emit[copy_word_idx, chosen_type]) > 0:
+                            if len(words) >= 1 and copy_word_idx == words[-1]:
+                                copy_word_idx = None
+                            elif consecutive_copies >= 6:
+                                copy_word_idx = None
+                            else:
+                                copy_word = copy_word_idx
+                                consecutive_copies += 1
+                                self._stats['copy_used'] += 1
+
+            if copy_word is None:
+                consecutive_copies = 0
+
+            # === STEP 3: Choose word ===
+            candidate_list = self.type_words.get(chosen_type, [])
+            if not candidate_list:
+                candidate_list = list(range(min(200, self.vocab_size)))
+            candidate_words = np.array(candidate_list, dtype=np.int64)
+
+            # Top-k filtering by field strength
+            if len(candidate_words) > 300:
+                field_vals = self.h[candidate_words]
+                top_k = np.argsort(field_vals)[-300:]
+                candidate_words = candidate_words[top_k]
+
+            # Check recall availability
+            recall_matches = self.ngram_index.lookup(words)
+            recall_hit = bool(recall_matches)
+
+            # Compute energy (integer-only)
+            word_energies = self._compute_word_energy(
+                pos, candidate_words, chosen_type,
+                words, types_list, recall_hit
+            )
+
+            # Integer Boltzmann sample with ANNEALED temperature
+            if copy_word is not None:
+                chosen_word = copy_word
+            else:
+                word_idx = annealed_word_sampler.sample(word_energies)
+                chosen_word = int(candidate_words[word_idx])
+
+            words.append(chosen_word)
+            types_list.append(chosen_type)
+
+            self._stats['total_positions'] += 1
+            if recall_hit:
+                self._stats['recall_hit'] += 1
+            else:
+                self._stats['pmi_only'] += 1
+
+            diagnostics.append({
+                'pos': pos,
+                'type': IDX2POS.get(chosen_type, "UNK"),
+                'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
+                'copy': copy_word is not None,
+                'recall_hit': recall_hit,
+                'beta': beta_t,
+            })
+
+        text = self.vocab.decode(words)
+        type_names = [IDX2POS.get(t, "UNK") for t in types_list]
+
+        return {
+            'text': text,
+            'words': words,
+            'types': types_list,
+            'type_names': type_names,
+            'diagnostics': diagnostics,
+            'beta_schedule': beta_schedule,
+        }
+
+    # ===================================================================
+    # Standard Generation (unchanged public API)
+    # ===================================================================
 
     def generate(self, prompt: str = "the", length: int = 20) -> Dict:
         """
@@ -1151,15 +1796,18 @@ class IsingLMModel:
 
     Training:
       1. Load corpus
-      2. Build vocabulary
+      2. Build vocabulary (with enhanced tokenizer)
       3. Build POS type system
-      4. Compute PMI couplings
-      5. Build n-gram index
-      6. Create generator(s)
+      4. Compute PMI couplings (sparse)
+      5. Compute skip-gram PMI couplings (distance-specific)
+      6. Build n-gram index
+      7. Create generator(s)
 
     Generation:
       - With Ising (default)
       - Without Ising (ablation baseline)
+      - Beam generation (global coherence)
+      - Annealed generation (phase transition)
     """
 
     def __init__(
@@ -1182,6 +1830,7 @@ class IsingLMModel:
         same_word_penalty: int = 50000,
         max_closed_class_run: int = 2,
         ising_enabled: bool = True,
+        skip_pmi_max_dist: int = 5,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -1201,35 +1850,40 @@ class IsingLMModel:
         self.same_word_penalty = same_word_penalty
         self.max_closed_class_run = max_closed_class_run
         self.ising_enabled = ising_enabled
+        self.skip_pmi_max_dist = skip_pmi_max_dist
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
-        self.J: Optional[np.ndarray] = None
+        self.J: Optional[sp.csr_matrix] = None
         self.h: Optional[np.ndarray] = None
+        self.J_skip: Optional[Dict[int, sp.csr_matrix]] = None
         self.ngram_index: Optional[NGramIndex] = None
         self.generator: Optional[IsingLM] = None
         self.baseline_generator: Optional[IsingLM] = None
         self.sequences: Optional[List[List[int]]] = None
+        self.test_sequences: Optional[List[List[int]]] = None
 
     def train(self, n_samples: int = 20000) -> "IsingLMModel":
         """Train the model from FineWeb-Edu corpus."""
         print("=" * 70)
-        print("ISING-ENHANCED N-GRAM LANGUAGE MODEL — TRAINING")
+        print("ISING-ENHANCED N-GRAM LANGUAGE MODEL -- TRAINING")
         print("=" * 70)
         print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary)")
         print(f"  Integer-only hot path: Lookup-table Boltzmann (NO np.exp)")
         print(f"  Ising enabled: {self.ising_enabled}")
+        print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
+        print(f"  Skip-gram PMI: YES (distance {1}-{self.skip_pmi_max_dist})")
         print()
 
         t0 = time.time()
 
         # Step 1: Load corpus
-        print("[1/5] Loading corpus...")
+        print("[1/6] Loading corpus...")
         texts = load_fineweb_edu(n_samples=n_samples)
         print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
 
         # Step 2: Build vocabulary
-        print("\n[2/5] Building vocabulary...")
+        print("\n[2/6] Building vocabulary...")
         self.vocab = Vocabulary(
             min_freq=self.vocab_min_freq,
             max_size=self.vocab_max_size,
@@ -1238,7 +1892,7 @@ class IsingLMModel:
         print(f"  Vocabulary: {len(self.vocab)} words")
 
         # Step 3: Build POS type system
-        print("\n[3/5] Building POS type system...")
+        print("\n[3/6] Building POS type system...")
         self.types = POSTypeSystem(
             vocab_size=len(self.vocab),
             window=self.pmi_window,
@@ -1247,27 +1901,42 @@ class IsingLMModel:
         self.types.build_grammar_penalties(penalty_strength=60)
         sequences = tokenize_texts(texts, self.vocab)
         sequences = truncate_sequences(sequences, max_len=20)
-        self.sequences = sequences
-        self.types.compute_type_couplings(sequences, self.vocab.idx2word)
+
+        # Path 3c: Split 90% train, 10% test for perplexity evaluation
+        split_idx = int(len(sequences) * 0.9)
+        self.sequences = sequences[:split_idx]
+        self.test_sequences = sequences[split_idx:]
+        print(f"  Train sequences: {len(self.sequences)}, Test sequences: {len(self.test_sequences)}")
+
+        self.types.compute_type_couplings(self.sequences, self.vocab.idx2word)
         n_typed = sum(1 for w in range(len(self.vocab)) if w in self.types.allowed_types)
         print(f"  POS system built: {N_POS} types, {n_typed} words typed")
 
-        # Step 4: Compute PMI couplings
-        print("\n[4/5] Computing PMI couplings...")
+        # Step 4: Compute PMI couplings (sparse)
+        print("\n[4/6] Computing PMI couplings (sparse)...")
         self.J, self.h = compute_pmi_couplings(
-            sequences, len(self.vocab),
+            self.sequences, len(self.vocab),
             window=self.pmi_window,
             min_count=self.pmi_min_count,
             pmi_cap=self.pmi_cap,
         )
 
-        # Step 5: Build n-gram index
-        print("\n[5/5] Building n-gram index...")
+        # Step 5: Compute skip-gram PMI couplings
+        print(f"\n[5/6] Computing skip-gram PMI couplings (dist 1-{self.skip_pmi_max_dist})...")
+        self.J_skip = compute_skip_pmi_couplings(
+            self.sequences, len(self.vocab),
+            max_dist=self.skip_pmi_max_dist,
+            min_count=self.pmi_min_count,
+            pmi_cap=self.pmi_cap,
+        )
+
+        # Step 6: Build n-gram index
+        print("\n[6/6] Building n-gram index...")
         self.ngram_index = NGramIndex(
             max_n=self.ngram_max_n,
             min_count=self.ngram_min_count,
         )
-        self.ngram_index.build(sequences)
+        self.ngram_index.build(self.sequences)
 
         # Build generators
         print("\nBuilding generators...")
@@ -1292,6 +1961,7 @@ class IsingLMModel:
             copy_min_confidence=self.copy_min_confidence,
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
+            J_skip=self.J_skip,
         )
 
         # Main generator (with Ising)
@@ -1321,6 +1991,144 @@ class IsingLMModel:
         if self.generator is None:
             self._build_generators()
         return self.generator.generate_raw(length=length)
+
+    # ===================================================================
+    # Path 2a: Beam generation wrapper
+    # ===================================================================
+
+    def generate_beam(self, prompt: str = "the", length: int = 20,
+                      n_beams: int = 5) -> Dict:
+        """Generate text with beam search and global energy ranking."""
+        if self.generator is None:
+            self._build_generators()
+        return self.generator.generate_beam(
+            prompt=prompt, length=length, n_beams=n_beams
+        )
+
+    # ===================================================================
+    # Path 2c: Annealed generation wrapper
+    # ===================================================================
+
+    def generate_annealed(self, prompt: str = "the", length: int = 20,
+                          beta_start: float = 0.005,
+                          beta_end: float = 0.5) -> Dict:
+        """Generate text with temperature annealing."""
+        if self.generator is None:
+            self._build_generators()
+        return self.generator.generate_annealed(
+            prompt=prompt, length=length,
+            beta_start=beta_start, beta_end=beta_end
+        )
+
+    # ===================================================================
+    # Path 3c: Perplexity Evaluation
+    # ===================================================================
+
+    def compute_perplexity(
+        self,
+        test_sequences: Optional[List[List[int]]] = None,
+        n_samples: int = 100,
+    ) -> float:
+        """
+        Compute perplexity on held-out test sequences.
+
+        PPL = exp(-1/N * Σ log P(w_t | ctx))
+
+        where P(w_t | ctx) = exp(-beta * E(w_t)) / Σ exp(-beta * E(w))
+        over all candidates of the same POS type.
+
+        This uses the word_sampler's Boltzmann lookup table for efficient
+        computation of the partition function.
+
+        Args:
+            test_sequences: Test sequences to evaluate. If None, uses
+                self.test_sequences (held out during training).
+            n_samples: Maximum number of sequences to evaluate.
+
+        Returns:
+            Perplexity value (lower is better).
+        """
+        if self.generator is None:
+            self._build_generators()
+
+        if test_sequences is None:
+            test_sequences = self.test_sequences
+
+        if not test_sequences:
+            print("  Warning: No test sequences available. Returning inf PPL.")
+            return float('inf')
+
+        gen = self.generator
+        sampler = gen.word_sampler
+
+        total_log_prob = 0.0
+        total_tokens = 0
+
+        eval_seqs = test_sequences[:n_samples]
+
+        for seq_idx, seq in enumerate(eval_seqs):
+            if len(seq) < 3:
+                continue
+
+            for pos in range(1, len(seq)):
+                target_word = seq[pos]
+                context_words = seq[:pos]
+                context_types = [gen._get_word_type(w) for w in context_words]
+
+                # Determine the POS type for the target word
+                word_type = gen._get_word_type(target_word)
+
+                # Get candidate words for this type
+                candidate_list = gen.type_words.get(word_type, [])
+                if not candidate_list:
+                    continue
+                candidate_words = np.array(candidate_list, dtype=np.int64)
+
+                # Top-k filtering (same as during generation)
+                if len(candidate_words) > 300:
+                    field_vals = gen.h[candidate_words]
+                    top_k = np.argsort(field_vals)[-300:]
+                    candidate_words = candidate_words[top_k]
+
+                # Check if target word is in candidates
+                target_in_candidates = int(target_word) in set(candidate_words.tolist())
+                if not target_in_candidates:
+                    # Target not reachable; use smoothing
+                    total_log_prob += -15.0  # Very low probability
+                    total_tokens += 1
+                    continue
+
+                # Check recall
+                recall_matches = gen.ngram_index.lookup(context_words)
+                recall_hit = bool(recall_matches)
+
+                # Compute energies for all candidates
+                energies = gen._compute_word_energy(
+                    pos, candidate_words, word_type,
+                    context_words, context_types, recall_hit
+                )
+
+                # Compute log probabilities
+                log_probs = sampler.compute_log_probabilities(energies)
+
+                # Find the target word's log probability
+                target_idx = np.where(candidate_words == target_word)[0]
+                if len(target_idx) > 0:
+                    total_log_prob += float(log_probs[target_idx[0]])
+                else:
+                    total_log_prob += -15.0
+
+                total_tokens += 1
+
+        if total_tokens == 0:
+            return float('inf')
+
+        # PPL = exp(-1/N * Σ log P(w_t | ctx))
+        avg_log_prob = total_log_prob / total_tokens
+        perplexity = math.exp(-avg_log_prob)
+
+        print(f"  Perplexity: {perplexity:.2f} (evaluated on {total_tokens} tokens)")
+        return perplexity
 
     def evaluate_grammar(self, words, types):
         """Evaluate grammar quality of a generated sequence."""

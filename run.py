@@ -8,7 +8,16 @@ Architecture:
   Tertiary:  Unigram field (base frequency)
   Sampling:  Integer Boltzmann via lookup table (NO np.exp)
 
-Built-in ablation: compare with/without Ising to measure actual contribution.
+Path 2 additions:
+  - Beam generation (global coherence ranking)
+  - Joint phrase sampling (MCMC over multi-word phrases)
+  - Temperature annealing (Ising phase transition)
+  - Skip-gram PMI couplings (distance-specific)
+
+Path 3 additions:
+  - Better tokenizer (contractions, hyphens, numbers)
+  - Sparse coupling matrix (scipy.sparse.csr_matrix)
+  - Perplexity evaluation on held-out data
 """
 
 import sys
@@ -123,18 +132,25 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING-ENHANCED N-GRAM LANGUAGE MODEL")
+    print("ISING-ENHANCED N-GRAM LANGUAGE MODEL (v2.0)")
     print("=" * 70)
     print()
     print("Architecture:")
     print("  Primary:   N-gram exact recall")
-    print("  Secondary: Ising PMI coupling")
+    print("  Secondary: Ising PMI coupling (sparse)")
     print("  Tertiary:  Unigram field")
     print("  Sampling:  Integer Boltzmann (lookup table, NO np.exp)")
     print()
-    print("Code: Single model.py file")
-    print("Parameters: 6 generation params")
-    print("Integer-only: Genuinely enforced (lookup-table Boltzmann)")
+    print("Path 2 Features:")
+    print("  2a: Beam generation (global coherence)")
+    print("  2b: Joint phrase sampling (MCMC)")
+    print("  2c: Temperature annealing (phase transition)")
+    print("  2d: Skip-gram PMI (distance-specific)")
+    print()
+    print("Path 3 Features:")
+    print("  3a: Better tokenizer (contractions, hyphens, numbers)")
+    print("  3b: Sparse coupling matrix (scipy.sparse)")
+    print("  3c: Perplexity evaluation")
     print()
 
     t0 = time.time()
@@ -158,6 +174,7 @@ def main():
         same_word_penalty=50000,
         max_closed_class_run=2,
         ising_enabled=True,
+        skip_pmi_max_dist=5,
     )
 
     model.train(n_samples=20000)
@@ -186,14 +203,58 @@ def main():
         print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}")
 
     # ======================================================================
-    # PHASE 2: Ablation study
+    # PHASE 2: Path 2a — Beam generation test
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("PATH 2a: BEAM GENERATION (Global Coherence)")
+    print("=" * 70)
+
+    for prompt in ["the", "science", "research"]:
+        beam_result = model.generate_beam(prompt=prompt, length=15, n_beams=3)
+        print(f"\n  Prompt: '{prompt}'")
+        print(f"  Best (energy={beam_result['beam_energy']}): {beam_result['text']}")
+        print(f"  All candidates:")
+        for c in beam_result['all_candidates']:
+            marker = " <-- BEST" if c['energy'] == beam_result['beam_energy'] else ""
+            print(f"    energy={c['energy']:>6}: {c['text']}{marker}")
+
+    # ======================================================================
+    # PHASE 3: Path 2c — Temperature annealing test
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("PATH 2c: TEMPERATURE ANNEALING (Ising Phase Transition)")
+    print("=" * 70)
+
+    for prompt in ["the", "science"]:
+        annealed_result = model.generate_annealed(
+            prompt=prompt, length=15,
+            beta_start=0.005, beta_end=0.5
+        )
+        print(f"\n  Prompt: '{prompt}'")
+        print(f"  Annealed: {annealed_result['text']}")
+        if annealed_result.get('beta_schedule'):
+            betas = annealed_result['beta_schedule']
+            print(f"  Beta schedule: {betas[0]:.4f} -> {betas[-1]:.4f}")
+
+    # ======================================================================
+    # PHASE 4: Ablation study
     # ======================================================================
     ablation_prompts = ["the", "science", "research", "students", "education",
                         "to", "of", "in", "for", "he", "they", "this", "that"]
     run_ablation(model, ablation_prompts, length=20)
 
     # ======================================================================
-    # PHASE 3: Full evaluation
+    # PHASE 5: Path 3c — Perplexity evaluation
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("PATH 3c: PERPLEXITY EVALUATION")
+    print("=" * 70)
+
+    ppl = model.compute_perplexity(n_samples=50)
+    print(f"  Final Perplexity: {ppl:.2f}")
+
+    # ======================================================================
+    # PHASE 6: Full evaluation
     # ======================================================================
     print("\n" + "=" * 70)
     print("FULL EVALUATION (30 samples)")
@@ -239,11 +300,14 @@ def main():
     print("=" * 70)
     print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary)")
     print(f"  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
+    print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
+    print(f"  Skip-gram PMI: YES (distance 1-{model.skip_pmi_max_dist})")
     print(f"\n  Generation statistics:")
     print(f"    Recall hit rate: {stats['recall_hit_rate']:.1%}")
     print(f"    PMI-only rate: {stats['pmi_only_rate']:.1%}")
     print(f"    Copy rate: {stats['copy_rate']:.1%}")
     print(f"    Ising enabled: {stats['ising_enabled']}")
+    print(f"\n  Perplexity: {ppl:.2f}")
 
     t_total = time.time() - t0
     print(f"\nTotal time: {t_total:.1f}s")

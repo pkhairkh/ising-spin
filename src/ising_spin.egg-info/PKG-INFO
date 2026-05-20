@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: ising-spin
+Version: 2.0.0
+Summary: Ising-Enhanced N-Gram Language Model — Integer-only text generation using PMI couplings and Boltzmann sampling
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: datasets>=2.14
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
