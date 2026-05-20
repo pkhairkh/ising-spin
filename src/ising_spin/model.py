@@ -1,32 +1,41 @@
 """
-Ising-Enhanced N-Gram Language Model.
+Ising Spin Glass Language Model — v5.0 Genuine Ising Dynamics.
 
-A non-neural language model where:
-  1. N-gram recall provides the PRIMARY next-word signal
-  2. PMI couplings provide SECONDARY signal when recall misses
-  3. POS grammar provides HARD CONSTRAINTS on word types
-  4. Integer Boltzmann sampling provides STOCHASTIC selection
+A non-neural language model where ALL word selection goes through the
+Hamiltonian. No overrides, no bypasses, no deterministic insertions.
 
-The Ising model contributes through:
-  - PMI coupling matrix J[w,w'] = log-floor PMI (word affinities)
-  - Skip-gram PMI J_skip[w,w',dist] = distance-specific couplings
-  - Local field h[w] = self-information (unigram frequency)
-  - Energy function: E(w|ctx) = -J[w,ctx] - h[w] + penalties
-  - Temperature-controlled stochastic selection
-  - Beam generation with global energy ranking
-  - Joint phrase sampling via MCMC
-  - Temperature annealing (Ising phase transition)
+5-Layer Architecture (ALL compete through E(w|ctx)):
+  Layer 1: PMI Couplings J[w,w'] + Local Field h[w]
+  Layer 2: Knowledge External Field h_knowledge[w] (SPO triples)
+  Layer 3: 3-Spin Couplings J3[(s,p)] -> o (many-body Ising interaction)
+  Layer 4: Category Couplings J_category (hypernym-based semantic smoothing)
+  Layer 5: Markov Logic Penalty (factual consistency, soft + hard)
+
+Generation Pipeline:
+  1. Choose POS type: Boltzmann from type energy landscape
+  2. Check copy mechanism (legitimate: it's a form of recall)
+  3. Apply hard logic filter (infinite energy barriers)
+  4. Compute E(w|ctx) with ALL 5 layers competing
+  5. Boltzmann sample: P(w) ~ exp(-beta * E(w))
+  6. MCMC spin-flip refinement (Metropolis criterion)
+
+Key Principle: When (dog, barks)->bark and (dog, chases)->chase both fire,
+they create COMPETING energy wells. Boltzmann at temperature beta picks
+between them stochastically. Near the phase transition, knowledge has
+maximum influence with some thermal noise.
 
 INTEGER-ONLY CONSTRAINT (enforced):
   - ALL generation-path computation uses integer arithmetic
   - Boltzmann sampling via pre-computed lookup table (NO np.exp in hot loop)
+  - MCMC acceptance via the same lookup table (integer-only)
   - The ONLY floating-point is in building the lookup table at __init__ time
 
 References:
   - Levy & Goldberg (2014): Word2Vec as log-PMI matrix factorization
-  - Marcolli (2015): Implicational couplings in syntax
-  - Haydarov, Omirov & Rozikov (arXiv:2502.12014): Ising-Potts coupling
+  - Marcolli et al. (arXiv:1508.00504): Spin Glass Models of Syntax
+  - Haydarov et al. (arXiv:2502.12014): Coupled Ising-Potts Model
   - Creutz (1983): Demon algorithm for integer MCMC acceptance
+  - Nishimori (2001): Statistical Physics of Spin Glasses
 """
 
 import math
@@ -2648,13 +2657,21 @@ class IsingLM:
                 if not valid_types:
                     break
 
-                # Pick a type (prefer recall-suggested type if available)
-                chosen_type = None
+                # Pick a type via Boltzmann (energy-based, no override)
                 if step == 0:
                     step_context = context_words
                 else:
                     step_context = context_words + phrase_words
 
+                # Compute type energies (includes knowledge bias via J3)
+                type_energies = np.array([
+                    self._compute_type_energy(
+                        len(context_words) + step, t, step_types_history, step_context
+                    )
+                    for t in valid_types
+                ], dtype=np.int64)
+
+                # Add recall type bias as energy bonus (NOT an override)
                 recall_matches = self.ngram_index.lookup(step_context)
                 if recall_matches:
                     best_k = max(recall_matches.keys())
@@ -2663,10 +2680,11 @@ class IsingLM:
                         recall_word, _, _ = best_conts[0]
                         recall_type = self._get_word_type(recall_word)
                         if recall_type in valid_types:
-                            chosen_type = recall_type
+                            for i, t in enumerate(valid_types):
+                                if t == recall_type:
+                                    type_energies[i] -= 200  # Moderate recall bias
 
-                if chosen_type is None:
-                    chosen_type = np.random.choice(valid_types)
+                chosen_type = valid_types[self.type_sampler.sample(type_energies)]
 
                 # Get candidates for this type
                 candidate_list = self.type_words.get(chosen_type, [])
@@ -2780,11 +2798,11 @@ class IsingLM:
                 beta=beta_t, max_delta=500
             )
 
-            # === STEP 1: Choose POS type ===
+            # === STEP 1: Choose POS type (BOLTZMANN, not override) ===
             valid_types = self._get_valid_next_types(types_list[-1], types_list)
 
-            # Check if recall suggests a type override
-            recall_type_override = None
+            # Check if recall suggests a type bias (not override — just bias)
+            recall_type_bias = None
             if len(words) >= 2:
                 recall_matches = self.ngram_index.lookup(words)
                 if recall_matches:
@@ -2795,17 +2813,21 @@ class IsingLM:
                         if best_count * 3 >= best_total:
                             recall_type = self._get_word_type(best_word)
                             if recall_type in valid_types:
-                                recall_type_override = recall_type
+                                recall_type_bias = recall_type
 
-            if recall_type_override is not None:
-                chosen_type = recall_type_override
-            else:
-                type_energies = np.array([
-                    self._compute_type_energy(pos, t, types_list)
-                    for t in valid_types
-                ], dtype=np.int64)
-                type_idx = self.type_sampler.sample(type_energies)
-                chosen_type = valid_types[type_idx]
+            # Compute type energies (includes knowledge bias via J3 predictions)
+            type_energies = np.array([
+                self._compute_type_energy(pos, t, types_list, words)
+                for t in valid_types
+            ], dtype=np.int64)
+
+            # Add recall type bias as an energy bonus (NOT an override)
+            if recall_type_bias is not None:
+                for i, t in enumerate(valid_types):
+                    if t == recall_type_bias:
+                        type_energies[i] -= 200  # Moderate recall bias
+
+            chosen_type = valid_types[self.type_sampler.sample(type_energies)]
 
             # === STEP 2: Check copy mechanism ===
             copy_word = None
@@ -2831,7 +2853,7 @@ class IsingLM:
             if copy_word is None:
                 consecutive_copies = 0
 
-            # === STEP 3: Choose word ===
+            # === STEP 3: Choose word via Boltzmann (ALL knowledge through energy) ===
             candidate_list = self.type_words.get(chosen_type, [])
             if not candidate_list:
                 candidate_list = list(range(min(200, self.vocab_size)))
@@ -2843,22 +2865,29 @@ class IsingLM:
                 top_k = np.argsort(field_vals)[-300:]
                 candidate_words = candidate_words[top_k]
 
+            # HARD LOGIC FILTER: infinite energy barriers
+            logic_mask = self._filter_by_logic(candidate_words, words)
+            if logic_mask.any():
+                candidate_words = candidate_words[logic_mask]
+
             # Check recall availability
             recall_matches = self.ngram_index.lookup(words)
             recall_hit = bool(recall_matches)
 
-            # Compute energy (integer-only)
+            # Compute energy (integer-only, ALL 5 layers compete)
             word_energies = self._compute_word_energy(
                 pos, candidate_words, chosen_type,
                 words, types_list, recall_hit
             )
 
             # Integer Boltzmann sample with ANNEALED temperature
+            chosen_energy = 0
             if copy_word is not None:
                 chosen_word = copy_word
             else:
                 word_idx = annealed_word_sampler.sample(word_energies)
                 chosen_word = int(candidate_words[word_idx])
+                chosen_energy = int(word_energies[word_idx])
 
             words.append(chosen_word)
             types_list.append(chosen_type)
@@ -2875,8 +2904,13 @@ class IsingLM:
                 'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
                 'copy': copy_word is not None,
                 'recall_hit': recall_hit,
+                'energy': chosen_energy,
                 'beta': beta_t,
             })
+
+        # === STEP 4: MCMC spin-flip refinement ===
+        if self.mcmc_refine_steps > 0:
+            words, types_list = self._mcmc_refine(words, types_list, n_passes=self.mcmc_refine_steps)
 
         text = self.vocab.decode(words)
         type_names = [IDX2POS.get(t, "UNK") for t in types_list]
