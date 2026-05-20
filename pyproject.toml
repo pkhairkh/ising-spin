@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ising-spin"
-version = "2.0.0"
+version = "3.0.0"
 description = "Ising-Enhanced N-Gram Language Model — Integer-only text generation using PMI couplings and Boltzmann sampling"
 readme = "README.md"
 license = {text = "MIT"}

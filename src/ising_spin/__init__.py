@@ -36,9 +36,13 @@ from .model import (
     NGramIndex,
     IsingLM,
     IsingLMModel,
+    KnowledgeLayer,
+    CategoryLayer,
+    MarkovLogicLayer,
     compute_log_floor_pmi,
     compute_pmi_couplings,
     compute_skip_pmi_couplings,
+    fetch_conceptnet_triples,
     COARSE_POS_TAGS,
     POS2IDX,
     IDX2POS,
@@ -48,4 +52,4 @@ from .model import (
     truncate_sequences,
 )
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
