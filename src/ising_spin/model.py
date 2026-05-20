@@ -4417,13 +4417,14 @@ class IsingLMModel:
         print(f"  Corpus vocabulary: {len(self.vocab)} words")
         
         # Step 2b: Augment vocabulary with knowledge words
-        # These are words that appear in our knowledge triples and category
-        # definitions but may not appear in the corpus. Without them, our
-        # knowledge layers silently fail because triple words aren't in vocab.
-        knowledge_words = self._collect_knowledge_words()
-        n_added = self.vocab.add_words(knowledge_words)
-        if n_added > 0:
-            print(f"  Added {n_added} knowledge words (total: {len(self.vocab)})")
+        # v8.1: Skip in recall-primary mode (no knowledge layers → no need for knowledge words)
+        if not self.recall_primary_mode or self.knowledge_scale > 0:
+            knowledge_words = self._collect_knowledge_words()
+            n_added = self.vocab.add_words(knowledge_words)
+            if n_added > 0:
+                print(f"  Added {n_added} knowledge words (total: {len(self.vocab)})")
+        else:
+            print(f"  Skipping knowledge word augmentation (recall-primary mode)")
 
         # Step 3: Build POS type system
         print("\n[3/12] Building POS type system...")
@@ -4434,7 +4435,7 @@ class IsingLMModel:
         self.types.build_from_vocabulary(self.vocab.word2idx, self.vocab.idx2word)
         self.types.build_grammar_penalties(penalty_strength=60)
         sequences = tokenize_texts(texts, self.vocab)
-        sequences = truncate_sequences(sequences, max_len=20)
+        sequences = truncate_sequences(sequences, max_len=30)  # v8.1: 20 → 30 for longer contexts
 
         # Path 3c: Split 90% train, 10% test for perplexity evaluation
         split_idx = int(len(sequences) * 0.9)
@@ -4447,25 +4448,51 @@ class IsingLMModel:
         print(f"  POS system built: {N_POS} types, {n_typed} words typed")
 
         # Step 4: Compute PMI couplings (sparse)
-        print("\n[4/12] Computing PMI couplings (sparse)...")
-        self.J, self.h = compute_pmi_couplings(
-            self.sequences, len(self.vocab),
-            window=self.pmi_window,
-            min_count=self.pmi_min_count,
-            pmi_cap=self.pmi_cap,
-        )
+        # v8.1: In recall-primary mode with pmi_weight=0, skip PMI computation
+        if self.recall_primary_mode and self.pmi_weight == 0 and not self.graded_couplings_enabled:
+            print("\n[4/12] Skipping PMI couplings (recall-primary mode, pmi_weight=0)")
+            # Create dummy J and h for compatibility
+            self.J = sp.csr_matrix((len(self.vocab), len(self.vocab)), dtype=np.int64)
+            self.h = np.zeros(len(self.vocab), dtype=np.int64)
+            # Compute h (unigram field) from sequences directly
+            word_counts = np.zeros(len(self.vocab), dtype=np.int64)
+            total_tokens = 0
+            for seq in self.sequences:
+                for w in seq:
+                    if w < len(self.vocab):
+                        word_counts[w] += 1
+                        total_tokens += 1
+            for w in range(len(self.vocab)):
+                if word_counts[w] > 0 and total_tokens > word_counts[w]:
+                    ratio = int(total_tokens // word_counts[w])
+                    if ratio >= 2:
+                        self.h[w] = ratio.bit_length() - 1  # log₂(N/count)
+            print(f"  Computed h (unigram field) from {total_tokens:,} tokens")
+        else:
+            print("\n[4/12] Computing PMI couplings (sparse)...")
+            self.J, self.h = compute_pmi_couplings(
+                self.sequences, len(self.vocab),
+                window=self.pmi_window,
+                min_count=self.pmi_min_count,
+                pmi_cap=self.pmi_cap,
+            )
 
         # Step 5: Compute skip-gram PMI couplings
-        print(f"\n[5/12] Computing skip-gram PMI couplings (dist 1-{self.skip_pmi_max_dist})...")
-        self.J_skip = compute_skip_pmi_couplings(
-            self.sequences, len(self.vocab),
-            max_dist=self.skip_pmi_max_dist,
-            min_count=self.pmi_min_count,
-            pmi_cap=self.pmi_cap,
-        )
+        # v8.1: Skip in recall-primary mode
+        if self.recall_primary_mode and self.pmi_weight == 0:
+            print(f"\n[5/12] Skipping skip-gram PMI (recall-primary mode)")
+            self.J_skip = {}
+        else:
+            print(f"\n[5/12] Computing skip-gram PMI couplings (dist 1-{self.skip_pmi_max_dist})...")
+            self.J_skip = compute_skip_pmi_couplings(
+                self.sequences, len(self.vocab),
+                max_dist=self.skip_pmi_max_dist,
+                min_count=self.pmi_min_count,
+                pmi_cap=self.pmi_cap,
+            )
 
-        # Step 5b: Build Walsh Spectral Layer (v6.0, legacy)
-        if self.walsh_enabled and not self.graded_couplings_enabled:
+        # Step 5b: Build Walsh Spectral Layer (v6.0, legacy — skipped in recall-primary)
+        if self.walsh_enabled and not self.graded_couplings_enabled and not self.recall_primary_mode:
             print("\n[5b/12] Building Walsh Spectral Layer (Householder + HWT)...")
             self.walsh_layer = WalshSpectralLayer(
                 vocab_size=len(self.vocab),
@@ -4513,42 +4540,67 @@ class IsingLMModel:
         self.ngram_index.build(self.sequences)
 
         # Step 7: Build knowledge layer (Layer 2 + Layer 3)
-        print("\n[7/12] Building knowledge layer (Layer 2 + Layer 3)...")
-        self.knowledge_layer = KnowledgeLayer(
-            vocab_size=len(self.vocab),
-            knowledge_scale=self.knowledge_scale,
-            spin3_scale=self.spin3_scale,
-        )
-        # Extract SPO triples from corpus
-        self.knowledge_layer.add_triples_from_corpus(
-            self.sequences, self.vocab.idx2word, self.types, min_count=3
-        )
-        # Add expanded commonsense triples
-        self._add_commonsense_triples()
-        # Add ConceptNet triples (if enabled)
-        if self.use_conceptnet:
-            self._add_conceptnet_triples()
-        # Finalize
-        self.knowledge_layer.build()
+        # v8.1: Skip in recall-primary mode when scales are 0
+        if self.recall_primary_mode and self.knowledge_scale == 0 and self.spin3_scale == 0:
+            print("\n[7/12] Skipping knowledge layer (recall-primary mode, scale=0)")
+            self.knowledge_layer = KnowledgeLayer(
+                vocab_size=len(self.vocab),
+                knowledge_scale=0,
+                spin3_scale=0,
+            )
+            self.knowledge_layer.build()
+        else:
+            print("\n[7/12] Building knowledge layer (Layer 2 + Layer 3)...")
+            self.knowledge_layer = KnowledgeLayer(
+                vocab_size=len(self.vocab),
+                knowledge_scale=self.knowledge_scale,
+                spin3_scale=self.spin3_scale,
+            )
+            self.knowledge_layer.add_triples_from_corpus(
+                self.sequences, self.vocab.idx2word, self.types, min_count=3
+            )
+            self._add_commonsense_triples()
+            if self.use_conceptnet:
+                self._add_conceptnet_triples()
+            self.knowledge_layer.build()
         
         # Step 8: Build category layer (Layer 4)
-        print("\n[8/12] Building category layer (Layer 4)...")
-        self.category_layer = CategoryLayer(
-            vocab_size=len(self.vocab),
-            category_scale=self.category_scale,
-        )
-        self._add_category_ontology()
-        self.category_layer.build()
+        # v8.1: Skip in recall-primary mode when scale is 0
+        if self.recall_primary_mode and self.category_scale == 0:
+            print("\n[8/12] Skipping category layer (recall-primary mode, scale=0)")
+            self.category_layer = CategoryLayer(
+                vocab_size=len(self.vocab),
+                category_scale=0,
+            )
+            self.category_layer.build()
+        else:
+            print("\n[8/12] Building category layer (Layer 4)...")
+            self.category_layer = CategoryLayer(
+                vocab_size=len(self.vocab),
+                category_scale=self.category_scale,
+            )
+            self._add_category_ontology()
+            self.category_layer.build()
         
         # Step 9: Build Markov Logic layer (Layer 5)
-        print("\n[9/12] Building Markov Logic layer (Layer 5)...")
-        self.markov_logic_layer = MarkovLogicLayer(
-            vocab_size=len(self.vocab),
-            rule_scale=self.logic_rule_scale,
-            hard_rule_scale=self.logic_hard_scale,
-        )
-        self._add_logic_rules()
-        self.markov_logic_layer.build()
+        # v8.1: Skip in recall-primary mode when scale is 0
+        if self.recall_primary_mode and self.logic_rule_scale == 0 and self.logic_hard_scale == 0:
+            print("\n[9/12] Skipping Markov Logic layer (recall-primary mode, scale=0)")
+            self.markov_logic_layer = MarkovLogicLayer(
+                vocab_size=len(self.vocab),
+                rule_scale=0,
+                hard_rule_scale=0,
+            )
+            self.markov_logic_layer.build()
+        else:
+            print("\n[9/12] Building Markov Logic layer (Layer 5)...")
+            self.markov_logic_layer = MarkovLogicLayer(
+                vocab_size=len(self.vocab),
+                rule_scale=self.logic_rule_scale,
+                hard_rule_scale=self.logic_hard_scale,
+            )
+            self._add_logic_rules()
+            self.markov_logic_layer.build()
 
         # Step 10: Compute scale diagnostics
         print("\n[10/12] Scale diagnostics...")

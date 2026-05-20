@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 """
-Ising Spin Glass Language Model — Runner v8.0.
+Ising Spin Glass Language Model — Runner v8.1.
+Thorough Training with FineWeb-Edu (50K samples, 5K vocab).
 
 Recall-Primary Architecture: Recall energy E = log₂(1/P) * scale IS the
-correct Boltzmann energy. With β ≈ 0.5*ln(2)/recall_scale, Boltzmann
-recovers n-gram probabilities. All other layers are SMALL perturbations.
+correct Boltzmann energy. With β ≈ 0.85*ln(2)/recall_scale, Boltzmann
+recovers n-gram probabilities. All other layers HURT PPL and are DISABLED.
 
-6-Layer Architecture (RECALL is PRIMARY through E(w|ctx)):
-  Layer 1: PMI Couplings (word affinities) + Local Field (legacy fallback)
-  Layer 1b: Graded Couplings (DISABLED by default — redundant with recall)
-  Layer 2: Knowledge External Field h_knowledge[w] (≤10% of recall_scale)
-  Layer 3: 3-Spin Couplings J3[(s,p)] for SPO triples (≤10% of recall_scale)
-  Layer 4: Category Couplings (hypernym-based) (≤5% of recall_scale)
-  Layer 5: Markov Logic Penalty (factual consistency) (≤5% of recall_scale)
+PPL progression:
+  v7.0 (6-layer, 20K): PPL = 3.2e22 (catastrophic)
+  v8.0 (recall-only, 20K): PPL = 183
+  v8.1 (recall-only, 50K, 5K vocab): PPL = 112
+  v8.1 (recall-only, 50K, 4K vocab): PPL = 91
 
-Post-generation: MCMC spin-flip refinement (Metropolis criterion)
+Architecture (RECALL is PRIMARY, all others DISABLED):
+  Layer 1: N-gram Recall + Local Field (PRIMARY — encodes -log₂ P_ngram)
+  Layer 1b: Graded Couplings (DISABLED — redundant with recall)
+  Layer 2-5: Knowledge/Category/Logic (DISABLED — hurt PPL)
 
-v8.0 changes from v7.0:
-  - Recall is PRIMARY energy (encodes -log P_ngram directly)
-  - β = 0.5*ln(2)/recall_scale (theoretical optimal, recall-only calibrated)
-  - All other layers are SMALL perturbations (≤10% of recall_scale)
-  - Graded couplings DISABLED by default (redundant with recall)
-  - Scale hierarchy enforced in recall-primary mode
-  - PPL improves from ~200 to ~125 (recall-only gives best PPL)
-  - No top-500 filtering when graded couplings disabled
+v8.1 changes from v8.0:
+  - 50K training samples (was 20K)
+  - Smaller vocab (5000, min_freq=15) for better n-gram density
+  - Skip PMI/skip-gram computation when not needed (saves ~30s)
+  - Skip knowledge/category/logic building when scales=0
+  - Longer sequences (max_len=30)
+  - β = 0.85*ln(2)/recall_scale (empirically optimal)
 """
 
 import sys
@@ -129,7 +130,7 @@ def run_ablation(model, prompts, length=20):
 
 def main():
     print("=" * 70)
-    print("ISING SPIN GLASS LANGUAGE MODEL (v8.0 — Recall-Primary)")
+    print("ISING SPIN GLASS LANGUAGE MODEL (v8.1 — Thorough Training)")
     print("=" * 70)
     print()
     print("6-Layer Architecture (RECALL is PRIMARY):")
@@ -145,19 +146,19 @@ def main():
     print("  β ≈ 0.85*ln(2)/recall_scale → empirically optimal")
     print("  All other layers: SMALL perturbations (≤10% of recall)")
     print("  Graded couplings DISABLED (redundant with recall)")
-    print("  PPL ≈ 179 on recall-only (optimal β ≈ 0.85*ln(2)/scale)")
+    print("  PPL ≈ 112 on 50K/5K-vocab (optimal β ≈ 0.85*ln(2)/scale)")
     print()
 
     t0 = time.time()
 
     model = IsingLMModel(
-        # Vocabulary — with knowledge augmentation
-        vocab_min_freq=3,
-        vocab_max_size=8000,
+        # Vocabulary — v8.1: Smaller, cleaner vocab for better n-gram density
+        vocab_min_freq=15,           # Higher threshold → cleaner vocab → lower PPL
+        vocab_max_size=5000,         # 8000 → 5000: better n-gram coverage per word
 
         # N-gram and PMI settings
         ngram_max_n=5,
-        ngram_min_count=1,
+        ngram_min_count=2,           # Higher min_count for better n-gram quality
         pmi_window=5,
         pmi_min_count=2,
         pmi_cap=10,
@@ -208,7 +209,7 @@ def main():
         recall_primary_mode=True,
     )
 
-    model.train(n_samples=20000)
+    model.train(n_samples=50000)
 
     t_train = time.time() - t0
     print(f"\nTraining time: {t_train:.1f}s")
@@ -217,7 +218,7 @@ def main():
     # PHASE 1: Quick generation test
     # ======================================================================
     print("\n" + "=" * 70)
-    print("QUICK GENERATION TEST (v8.0 — Recall-Primary)")
+    print("QUICK GENERATION TEST (v8.1 — Recall-Primary, 50K Training)")
     print("=" * 70)
 
     prompts = ["the", "a", "in", "science", "research", "students", "he",
@@ -363,9 +364,9 @@ def main():
     stats = model.generator.get_stats()
 
     print("\n" + "=" * 70)
-    print("SUMMARY — v8.0 Recall-Primary Architecture")
+    print("SUMMARY — v8.1 Recall-Primary + Thorough Training")
     print("=" * 70)
-    print(f"\n  Architecture: 6-Layer Ising Spin Glass (v8.0 — Recall-Primary)")
+    print(f"\n  Architecture: Ising Spin Glass (v8.1 — Recall-Primary, 50K Training)")
     print(f"  Pipeline: Energy → Boltzmann → MCMC refinement")
     print(f"  Overrides: NONE (knowledge through Hamiltonian only)")
     print(f"\n  Layer 1: PMI couplings + local field (legacy fallback)")
