@@ -1,51 +1,496 @@
 """
-V14: Ising-Enhanced N-Gram Language Model.
+Ising-Enhanced N-Gram Language Model.
 
-HONEST ARCHITECTURE:
-  This is an autoregressive language model where:
-    1. N-gram recall provides the PRIMARY next-word signal
-    2. PMI couplings provide SECONDARY signal when recall misses
-    3. POS grammar provides HARD CONSTRAINTS on word types
-    4. Integer Boltzmann sampling provides STOCHASTIC selection
+A non-neural language model where:
+  1. N-gram recall provides the PRIMARY next-word signal
+  2. PMI couplings provide SECONDARY signal when recall misses
+  3. POS grammar provides HARD CONSTRAINTS on word types
+  4. Integer Boltzmann sampling provides STOCHASTIC selection
 
-  The Ising model contributes through:
-    - PMI coupling matrix J[w,w'] = log-floor PMI (word affinities)
-    - Local field h[w] = self-information (unigram frequency)
-    - Energy function: E(w|ctx) = -J[w,ctx] - h[w] + penalties
-    - Temperature-controlled stochastic selection
+The Ising model contributes through:
+  - PMI coupling matrix J[w,w'] = log-floor PMI (word affinities)
+  - Local field h[w] = self-information (unigram frequency)
+  - Energy function: E(w|ctx) = -J[w,ctx] - h[w] + penalties
+  - Temperature-controlled stochastic selection
 
-  This is NOT "just an n-gram model" because:
-    - PMI captures word-word affinity INDEPENDENT of exact n-gram context
-    - The energy landscape creates global consistency constraints
-    - Temperature controls the explore/exploit tradeoff physically
-
-  But honestly: n-gram recall does the heavy lifting. The Ising model
-  is a supplementary signal that helps when recall misses and provides
-  principled temperature-based randomness control.
-
-INTEGER-ONLY CONSTRAINT (ACTUALLY ENFORCED):
+INTEGER-ONLY CONSTRAINT (enforced):
   - ALL generation-path computation uses integer arithmetic
   - Boltzmann sampling via pre-computed lookup table (NO np.exp in hot loop)
   - The ONLY floating-point is in building the lookup table at __init__ time
-  - This is a one-time cost, not in the generation hot path
 
-  Previous versions (V10-V13) violated this by calling np.exp() in
-  _boltzmann_sample(), which runs at EVERY generation position. V14
-  replaces this with integer lookup table sampling.
-
-REFERENCES:
+References:
   - Levy & Goldberg (2014): Word2Vec as log-PMI matrix factorization
   - Marcolli (2015): Implicational couplings in syntax
   - Haydarov, Omirov & Rozikov (arXiv:2502.12014): Ising-Potts coupling
   - Creutz (1983): Demon algorithm for integer MCMC acceptance
 """
 
+import math
+import json
+import time
 import numpy as np
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple, Set
 
-from .vocabulary import Vocabulary
-from .type_system import POSTypeSystem, N_POS, IDX2POS, POS2IDX
+
+# ===========================================================================
+# COARSE POS TAGS
+# ===========================================================================
+
+COARSE_POS_TAGS = [
+    "NOUN",     # nouns (NN, NNS, NNP, NNPS)
+    "VERB",     # verbs (VB, VBD, VBG, VBN, VBP, VBZ)
+    "ADJ",      # adjectives (JJ, JJR, JJS)
+    "ADV",      # adverbs (RB, RBR, RBS)
+    "DET",      # determiners (DT, WDT)
+    "PREP",     # prepositions (IN)
+    "PRON",     # pronouns (PRP, PRP$, WP, WP$)
+    "AUX",      # auxiliaries / modals (MD)
+    "CONJ",     # conjunctions (CC)
+    "PART",     # particles (RP, TO)
+    "NUM",      # numbers (CD)
+    "PUNCT",    # punctuation
+    "X",        # other / unknown
+]
+
+POS2IDX = {tag: i for i, tag in enumerate(COARSE_POS_TAGS)}
+IDX2POS = {i: tag for i, tag in enumerate(COARSE_POS_TAGS)}
+N_POS = len(COARSE_POS_TAGS)
+
+NOUN_LIKE = {"NOUN", "PRON", "NUM"}
+VERB_LIKE = {"VERB", "AUX"}
+OPEN_CLASS = {"NOUN", "VERB", "ADJ", "ADV"}
+CLOSED_CLASS = {"DET", "PREP", "PRON", "AUX", "CONJ", "PART"}
+
+
+# ===========================================================================
+# VOCABULARY
+# ===========================================================================
+
+class Vocabulary:
+    """
+    Integer-only vocabulary mapping between words and indices.
+
+    Special tokens:
+        <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3
+    """
+
+    UNK = "<UNK>"
+    BOS = "<BOS>"
+    EOS = "<EOS>"
+    PAD = "<PAD>"
+    SPECIALS = [UNK, BOS, EOS, PAD]
+
+    def __init__(self, min_freq: int = 5, max_size: Optional[int] = None):
+        self.min_freq = min_freq
+        self.max_size = max_size
+        self.word2idx: Dict[str, int] = {}
+        self.idx2word: Dict[int, str] = {}
+        self.word_counts: Counter = Counter()
+        self._built = False
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple whitespace + punctuation tokenizer. Pure string manipulation."""
+        tokens = []
+        for word in text.split():
+            stripped = word.strip()
+            if not stripped:
+                continue
+            # Split off leading punctuation
+            while stripped and not stripped[0].isalnum():
+                tokens.append(stripped[0])
+                stripped = stripped[1:]
+            # Split off trailing punctuation
+            tail = []
+            while stripped and not stripped[-1].isalnum():
+                tail.append(stripped[-1])
+                stripped = stripped[:-1]
+            if stripped:
+                tokens.append(stripped.lower())
+            tokens.extend(reversed(tail))
+        return tokens
+
+    def build(self, texts: List[str]) -> "Vocabulary":
+        """Build vocabulary from a list of text strings. Pure integer counting."""
+        for text in texts:
+            tokens = self._tokenize(text)
+            self.word_counts.update(tokens)
+
+        idx = 0
+        for special in self.SPECIALS:
+            self.word2idx[special] = idx
+            self.idx2word[idx] = special
+            idx += 1
+
+        filtered = [
+            (word, count)
+            for word, count in self.word_counts.most_common()
+            if count >= self.min_freq and word not in self.SPECIALS
+        ]
+        if self.max_size is not None:
+            filtered = filtered[:self.max_size]
+
+        for word, count in filtered:
+            self.word2idx[word] = idx
+            self.idx2word[idx] = word
+            idx += 1
+
+        self._built = True
+        return self
+
+    def encode(self, text: str) -> List[int]:
+        """Encode a text string to a list of integer token indices."""
+        tokens = self._tokenize(text)
+        unk_idx = self.word2idx[self.UNK]
+        return [self.word2idx.get(t, unk_idx) for t in tokens]
+
+    def decode(self, indices: List[int]) -> str:
+        """Decode a list of integer token indices to a text string."""
+        words = []
+        for idx in indices:
+            word = self.idx2word.get(idx, self.UNK)
+            if word in (self.BOS, self.EOS, self.PAD):
+                continue
+            words.append(word)
+        return " ".join(words)
+
+    def __len__(self) -> int:
+        return len(self.word2idx)
+
+
+# ===========================================================================
+# POS TYPE SYSTEM
+# ===========================================================================
+
+class POSTypeSystem:
+    """
+    Integer-only POS type system for the coupled Ising-Potts model.
+
+    Components:
+      - I_emit[w, t]: emission weight (count of word w tagged as type t)
+      - allowed_types[w]: set of types word w can have
+      - grammar_penalties: list of (condition, penalty) pairs for hard constraints
+      - J_type[t1, t2]: type-type coupling (POS bigram counts)
+    """
+
+    def __init__(self, vocab_size: int, n_types: int = N_POS, window: int = 5):
+        self.vocab_size = vocab_size
+        self.n_types = n_types
+        self.window = window
+        self.J_type = np.zeros((n_types, n_types), dtype=np.int64)
+        self.J_type_by_dist: Dict[int, Dict[Tuple[int, int], int]] = {}
+        self.I_emit = np.zeros((vocab_size, n_types), dtype=np.int64)
+        self.allowed_types: Dict[int, Set[int]] = {}
+        self.grammar_penalties: List[Dict] = []
+
+    def assign_pos_rules(self, word: str, word_idx: int) -> List[int]:
+        """Rule-based POS assignment for English words. No FP, no ML model."""
+        w = word.lower()
+        tags = []
+
+        # Punctuation
+        if not any(c.isalnum() for c in w):
+            tags.append(POS2IDX["PUNCT"])
+            return tags if tags else [POS2IDX["X"]]
+
+        # Numbers
+        if w.replace(".", "").replace(",", "").replace("-", "").isdigit():
+            tags.append(POS2IDX["NUM"])
+
+        # Determiners
+        if w in {"the", "a", "an", "this", "that", "these", "those",
+                 "some", "any", "all", "each", "every", "no", "both",
+                 "either", "neither", "my", "your", "his", "her", "its",
+                 "our", "their"}:
+            tags.append(POS2IDX["DET"])
+
+        # Pronouns
+        if w in {"i", "me", "you", "he", "him", "she", "her", "it",
+                 "we", "us", "they", "them", "myself", "yourself",
+                 "himself", "herself", "itself", "ourselves",
+                 "themselves", "who", "whom", "which", "what", "that"}:
+            tags.append(POS2IDX["PRON"])
+
+        # Auxiliaries / Modals
+        if w in {"is", "am", "are", "was", "were", "be", "been", "being",
+                 "have", "has", "had", "having", "do", "does", "did",
+                 "can", "could", "will", "would", "shall", "should",
+                 "may", "might", "must"}:
+            tags.append(POS2IDX["AUX"])
+
+        # Conjunctions
+        if w in {"and", "or", "but", "nor", "for", "yet", "so",
+                 "although", "because", "since", "unless", "while",
+                 "if", "then", "when", "where", "whether"}:
+            tags.append(POS2IDX["CONJ"])
+
+        # Particles
+        if w in {"to", "not", "up", "down", "out", "off", "on",
+                 "in", "away", "over"}:
+            tags.append(POS2IDX["PART"])
+
+        # Prepositions
+        if w in {"of", "in", "to", "for", "with", "on", "at", "from",
+                 "by", "about", "as", "into", "through", "during",
+                 "before", "after", "above", "below", "between",
+                 "under", "over", "against", "within", "without",
+                 "among", "upon", "toward", "towards"}:
+            tags.append(POS2IDX["PREP"])
+
+        # Adjectives (morphological)
+        if (w.endswith("ful") or w.endswith("less") or w.endswith("ous") or
+            w.endswith("ive") or w.endswith("able") or w.endswith("ible") or
+            w.endswith("al") or w.endswith("ial") or w.endswith("ent") or
+            w.endswith("ant") or w.endswith("ic") or w.endswith("ical")):
+            tags.append(POS2IDX["ADJ"])
+
+        # Adverbs (morphological: -ly)
+        if w.endswith("ly"):
+            tags.append(POS2IDX["ADV"])
+
+        # Verbs (morphological)
+        if (w.endswith("ing") or w.endswith("ed") or w.endswith("ize") or
+            w.endswith("ify") or w.endswith("ate") or w.endswith("en") or
+            w.endswith("es") or w.endswith("ied")):
+            tags.append(POS2IDX["VERB"])
+
+        # Nouns (morphological)
+        if (w.endswith("tion") or w.endswith("sion") or w.endswith("ment") or
+            w.endswith("ness") or w.endswith("ity") or w.endswith("ism") or
+            w.endswith("ist") or w.endswith("ence") or w.endswith("ance") or
+            w.endswith("er") or w.endswith("or") or w.endswith("dom") or
+            w.endswith("ship") or w.endswith("hood")):
+            tags.append(POS2IDX["NOUN"])
+
+        # Most English words can function as nouns
+        if len(w) >= 2 and w[0].isalpha():
+            if POS2IDX["NOUN"] not in tags:
+                tags.append(POS2IDX["NOUN"])
+
+        # Many English words can also function as verbs
+        if len(w) >= 3 and w[0].isalpha() and POS2IDX["VERB"] not in tags and POS2IDX["AUX"] not in tags:
+            tags.append(POS2IDX["VERB"])
+
+        if not tags:
+            tags = [POS2IDX["NOUN"]]
+
+        return tags
+
+    def build_from_vocabulary(
+        self, word2idx: Dict[str, int], idx2word: Dict[int, str]
+    ) -> "POSTypeSystem":
+        """Build emission weights from vocabulary using rule-based POS assignment."""
+        for idx, word in idx2word.items():
+            if idx >= self.vocab_size:
+                continue
+            if word.startswith("<") and word.endswith(">"):
+                self.I_emit[idx, POS2IDX["X"]] = 1
+                self.allowed_types[idx] = {POS2IDX["X"]}
+                continue
+            tags = self.assign_pos_rules(word, idx)
+            self.allowed_types[idx] = set(tags)
+            for t in tags:
+                self.I_emit[idx, t] = 1
+        return self
+
+    def compute_type_couplings(
+        self, sequences: List[List[int]], idx2word: Dict[int, str],
+        min_count: int = 1, scaling: int = 10
+    ) -> "POSTypeSystem":
+        """Compute type-type couplings from sequences. Pure integer counting."""
+        TAG_PRIORITY = {
+            POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
+            POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
+            POS2IDX["PREP"]: 6, POS2IDX["NUM"]: 7, POS2IDX["ADV"]: 8,
+            POS2IDX["ADJ"]: 9, POS2IDX["NOUN"]: 10, POS2IDX["VERB"]: 11,
+            POS2IDX["X"]: 12,
+        }
+        type_bigram = Counter()
+        type_bigram_by_dist: Dict[int, Counter] = defaultdict(Counter)
+
+        for seq in sequences:
+            seq_tags = []
+            for w in seq:
+                if w in self.allowed_types and self.allowed_types[w]:
+                    tags = list(self.allowed_types[w])
+                    best_t = min(tags, key=lambda t: TAG_PRIORITY.get(t, 99))
+                    seq_tags.append(best_t)
+                else:
+                    seq_tags.append(POS2IDX["X"])
+
+            for i, t1 in enumerate(seq_tags):
+                for j_offset in range(1, self.window + 1):
+                    j = i + j_offset
+                    if j < len(seq_tags):
+                        t2 = seq_tags[j]
+                        type_bigram[(t1, t2)] += 1
+                        type_bigram_by_dist[j_offset][(t1, t2)] += 1
+
+        for (t1, t2), count in type_bigram.items():
+            self.J_type[t1, t2] = count * scaling
+
+        self.J_type_by_dist = {}
+        for dist, counts in type_bigram_by_dist.items():
+            self.J_type_by_dist[dist] = {}
+            for (t1, t2), count in counts.items():
+                if count * scaling > 0:
+                    self.J_type_by_dist[dist][(t1, t2)] = count * scaling
+        return self
+
+    def build_grammar_penalties(self, penalty_strength: int = 50) -> "POSTypeSystem":
+        """Define grammar penalty constraints as integer quadratic penalties."""
+        P = penalty_strength
+
+        self.grammar_penalties = [
+            {"name": "DET_NOUN", "type1": POS2IDX["DET"],
+             "type2_set": [POS2IDX[t] for t in NOUN_LIKE],
+             "max_dist": 2, "penalty": P, "direction": "forward"},
+            {"name": "AUX_VERB", "type1": POS2IDX["AUX"],
+             "type2_set": [POS2IDX[t] for t in VERB_LIKE],
+             "max_dist": 2, "penalty": P, "direction": "forward"},
+            {"name": "PREP_NOUN", "type1": POS2IDX["PREP"],
+             "type2_set": [POS2IDX[t] for t in NOUN_LIKE] + [POS2IDX["DET"]],
+             "max_dist": 3, "penalty": P, "direction": "forward"},
+            {"name": "NO_DOUBLE_DET", "type1": POS2IDX["DET"],
+             "type2_set": [POS2IDX["DET"]],
+             "max_dist": 1, "penalty": P * 2, "direction": "both", "forbid": True},
+            {"name": "NO_DOUBLE_PREP", "type1": POS2IDX["PREP"],
+             "type2_set": [POS2IDX["PREP"]],
+             "max_dist": 1, "penalty": P * 2, "direction": "both", "forbid": True},
+            {"name": "ADJ_NOUN", "type1": POS2IDX["ADJ"],
+             "type2_set": [POS2IDX["NOUN"]],
+             "max_dist": 2, "penalty": P // 2, "direction": "forward"},
+            {"name": "CONJ_COMPAT", "type1": POS2IDX["CONJ"],
+             "type2_set": list(range(self.n_types)),
+             "max_dist": 2, "penalty": P // 3, "direction": "both"},
+        ]
+        return self
+
+    def compute_grammar_penalty(
+        self, types: List[int], pos: int, proposed_type: int
+    ) -> int:
+        """Compute grammar penalty for having proposed_type at position pos. Pure integer."""
+        total_penalty = 0
+
+        for constraint in self.grammar_penalties:
+            type1 = constraint["type1"]
+            type2_set = set(constraint["type2_set"])
+            max_dist = constraint["max_dist"]
+            penalty = constraint["penalty"]
+            direction = constraint["direction"]
+            forbid = constraint.get("forbid", False)
+
+            if proposed_type == type1:
+                for d in range(1, max_dist + 1):
+                    if direction in ("forward", "both"):
+                        j = pos + d
+                        if j < len(types):
+                            neighbor_type = types[j]
+                            if forbid:
+                                if neighbor_type in type2_set:
+                                    total_penalty += penalty
+                            else:
+                                if neighbor_type not in type2_set:
+                                    total_penalty += penalty // d
+                    if direction in ("backward", "both"):
+                        j = pos - d
+                        if j >= 0:
+                            neighbor_type = types[j]
+                            if forbid:
+                                if neighbor_type in type2_set:
+                                    total_penalty += penalty
+                            else:
+                                if neighbor_type not in type2_set:
+                                    total_penalty += penalty // d
+
+            if not forbid:
+                for d in range(1, max_dist + 1):
+                    if direction in ("forward", "both"):
+                        j = pos - d
+                        if j >= 0 and types[j] == type1:
+                            if proposed_type not in type2_set:
+                                total_penalty += penalty // d
+                    if direction in ("backward", "both"):
+                        j = pos + d
+                        if j < len(types) and types[j] == type1:
+                            if proposed_type not in type2_set:
+                                total_penalty += penalty // d
+
+        return total_penalty
+
+
+# ===========================================================================
+# DATA LOADING
+# ===========================================================================
+
+def load_fineweb_edu(
+    n_samples: int = 50000,
+    split: str = "train",
+    subset: str = "sample-10BT",
+    min_length: int = 20,
+    max_length: int = 2000,
+) -> List[str]:
+    """Load text samples from the fineweb-edu dataset on HuggingFace."""
+    from datasets import load_dataset
+
+    print(f"Loading fineweb-edu ({subset}, split={split})...")
+
+    dataset = None
+    for name in ["HuggingFaceFW/fineweb-edu", "HuggingFW/fineweb-edu"]:
+        try:
+            dataset = load_dataset(name, name=subset, split=split, streaming=True)
+            print(f"  Loaded from '{name}' with subset '{subset}'")
+            break
+        except Exception:
+            continue
+
+    if dataset is None:
+        for name in ["HuggingFaceFW/fineweb-edu", "HuggingFW/fineweb-edu"]:
+            try:
+                dataset = load_dataset(name, split=split, streaming=True)
+                print(f"  Loaded from '{name}' without subset")
+                break
+            except Exception:
+                continue
+
+    if dataset is None:
+        raise RuntimeError(
+            "Could not load fineweb-edu. Please check internet and HuggingFace access."
+        )
+
+    texts = []
+    scanned = 0
+    for example in dataset:
+        scanned += 1
+        if len(texts) >= n_samples:
+            break
+        text = example.get("text", "").strip()
+        if min_length <= len(text) <= max_length:
+            texts.append(text)
+        if scanned % 10000 == 0:
+            print(f"  Scanned {scanned} examples, collected {len(texts)} texts...")
+        if scanned > n_samples * 5:
+            break
+
+    print(f"Loaded {len(texts)} texts from fineweb-edu (scanned {scanned}).")
+    return texts
+
+
+def tokenize_texts(texts: List[str], vocab: Vocabulary) -> List[List[int]]:
+    """Tokenize a list of texts using the vocabulary. Pure integer encoding."""
+    sequences = []
+    for text in texts:
+        tokens = vocab.encode(text)
+        if len(tokens) > 0:
+            sequences.append(tokens)
+    return sequences
+
+
+def truncate_sequences(
+    sequences: List[List[int]], max_len: int = 50
+) -> List[List[int]]:
+    """Truncate sequences to max_len and filter empty ones. Pure integer operation."""
+    return [seq[:max_len] for seq in sequences if len(seq) > 3]
 
 
 # ===========================================================================
@@ -56,53 +501,20 @@ class IntegerBoltzmannSampler:
     """
     Boltzmann sampling using ONLY integer arithmetic in the hot path.
 
-    Instead of computing exp(-beta * E) at generation time (which requires
-    floating-point), we pre-compute a lookup table at initialization:
-
+    Pre-computes a lookup table at initialization:
         table[delta] = round(SCALE * exp(-beta * delta))
 
-    At generation time, sampling is:
-        1. Compute energies (integers)
-        2. deltas = energies - E_min (non-negative integers)
-        3. weights = table[deltas] (integer array lookup)
-        4. Cumulative sum (integer addition)
-        5. Binary search (integer comparison)
-
-    This is genuinely integer-only in the hot loop. The only FP is in
-    building the table, which happens once at initialization.
-
-    Inspired by V8's precomputed threshold tables for MCMC acceptance,
-    but applied to the autoregressive Boltzmann sampling that V10-V13
-    incorrectly implemented with np.exp().
+    At generation time, sampling is pure integer:
+        1. deltas = energies - E_min (non-negative integers)
+        2. weights = table[deltas] (integer array lookup)
+        3. Cumulative sum (integer addition)
+        4. Binary search (integer comparison)
     """
 
     def __init__(self, beta: float = 0.1, max_delta: int = 5000, scale: int = 1 << 30):
-        """
-        Args:
-            beta: Inverse temperature for Boltzmann distribution.
-                  Higher = more deterministic, lower = more random.
-            max_delta: Maximum energy difference to pre-compute.
-                       Any delta > max_delta gets weight = 0.
-                       Must be large enough to cover the full energy range
-                       (recall bonuses can be thousands, penalties up to 50000).
-            scale: Fixed-point scale for integer weights.
-                   2^30 gives ~9 decimal digits of precision.
-        """
         self.beta = beta
-        self.max_delta = max_delta
         self.scale = scale
-
-        # Build lookup table: table[d] = round(scale * exp(-beta * d))
-        # This is the ONLY place where floating-point is used.
-        # After this, all generation is integer-only.
-        #
-        # For large max_delta (5000+), building the full table would use too
-        # much memory. Instead, we use a two-level approach:
-        #   - Fine table: for delta in [0, FINE_MAX], exact lookup
-        #   - Coarse: for delta > FINE_MAX, weight is effectively 0
-        # This works because exp(-beta * 5000) at beta=0.05 ≈ exp(-250) ≈ 0
-        import math
-        fine_max = min(max_delta, 1000)  # Beyond this, weight is ~0 at any reasonable beta
+        fine_max = min(max_delta, 1000)
         self.table = np.zeros(fine_max + 1, dtype=np.int64)
         for d in range(fine_max + 1):
             raw = math.exp(-beta * d)
@@ -110,40 +522,19 @@ class IntegerBoltzmannSampler:
         self.max_delta = fine_max
 
     def sample(self, energies: np.ndarray) -> int:
-        """
-        Sample from Boltzmann distribution P(i) ~ exp(-beta * E_i)
-        using ONLY integer arithmetic.
-
-        Steps (all integer):
-          1. Find E_min
-          2. Compute deltas = E - E_min (non-negative)
-          3. Clamp deltas to [0, max_delta]
-          4. Look up weights from table
-          5. Compute cumulative sum
-          6. Generate random integer, binary search
-
-        Returns index of sampled element.
-        """
-        if len(energies) == 0:
-            return 0
-        if len(energies) == 1:
+        """Sample from Boltzmann distribution P(i) ~ exp(-beta * E_i). Integer-only."""
+        if len(energies) <= 1:
             return 0
 
-        # Step 1-3: Integer energy normalization
         e_min = int(energies.min())
         deltas = (energies - e_min).astype(np.int64)
         deltas = np.clip(deltas, 0, self.max_delta)
 
-        # Step 4: Lookup table weights (NO np.exp!)
         weights = self.table[deltas]
-
-        # Step 5: Cumulative sum (integer)
         total = int(weights.sum())
         if total <= 0:
-            # All weights zero — uniform random
             return np.random.randint(len(energies))
 
-        # Step 6: Random integer selection + binary search
         r = np.random.randint(0, total)
         cumsum = np.cumsum(weights)
         idx = int(np.searchsorted(cumsum, r, side='right'))
@@ -158,25 +549,13 @@ class NGramIndex:
     """
     Multi-level n-gram index for exact token recall.
 
-    Stores n-gram contexts and their continuations with integer counts.
-    Supports:
-      - Lookup: find all continuations for a given context
-      - Recall bonus: compute energy bonus for n-gram matches
-      - Copy: find the best candidate for direct copying
-
     This is the PRIMARY generation mechanism. When it hits, it produces
     coherent text. When it misses, the Ising PMI model takes over.
-
-    Simplified from V11's NGramIndex:
-      - Removed Kneser-Ney (was weakening bonuses in V12)
-      - Removed longest_only (always use all matching levels)
-      - Cleaner interface
     """
 
     def __init__(self, max_n: int = 5, min_count: int = 1):
         self.max_n = max_n
         self.min_count = min_count
-        # index[k][context_tuple] = Counter({continuation_word: count})
         self.index: Dict[int, Dict[Tuple, Counter]] = {
             k: {} for k in range(1, max_n + 1)
         }
@@ -188,10 +567,9 @@ class NGramIndex:
     def build(self, sequences: List[List[int]]) -> "NGramIndex":
         """Build n-gram index from tokenized sequences. Integer counting only."""
         for seq in sequences:
-            # Skip special tokens at the start
             start = 0
             for i, w in enumerate(seq):
-                if w >= 4:  # Skip <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3
+                if w >= 4:
                     start = i
                     break
 
@@ -211,7 +589,6 @@ class NGramIndex:
                     )
 
         # Prune low-count continuations
-        pruned = 0
         for k in range(1, self.max_n + 1):
             for context in list(self.index[k].keys()):
                 low_count = [
@@ -221,29 +598,19 @@ class NGramIndex:
                 for w in low_count:
                     del self.index[k][context][w]
                     self.context_totals[k][context] -= 1
-                    pruned += 1
                 if not self.index[k][context]:
                     del self.index[k][context]
                     del self.context_totals[k][context]
 
         self._built = True
-
-        # Print stats
         for k in range(1, self.max_n + 1):
             n_ctx = len(self.index[k])
             n_cont = sum(len(v) for v in self.index[k].values())
             print(f"    {k}-gram: {n_ctx:,} contexts, {n_cont:,} continuations")
-        if pruned > 0:
-            print(f"    Pruned {pruned} low-count entries")
-
         return self
 
     def lookup(self, context_words: List[int]) -> Dict[int, List[Tuple[int, int, int]]]:
-        """
-        Look up n-gram continuations for the given context.
-
-        Returns: {k: [(word, count, total), ...]} for each matching k-gram level.
-        """
+        """Look up n-gram continuations. Returns {k: [(word, count, total), ...]}."""
         results = {}
         for k in range(min(self.max_n, len(context_words)), 0, -1):
             context = tuple(context_words[-k:])
@@ -264,17 +631,8 @@ class NGramIndex:
         """
         Compute recall bonus for candidate words based on n-gram matches.
 
-        KEY FIX: By default, use ONLY the longest matching context.
-        Accumulating bonuses from multiple k levels inflates common words
-        (like "the") that match at k=1, k=2, AND k=3.
-
-        For the longest matching k-gram context:
-          bonus = count * recall_scale * context_weight_factor^(k-1)
-
-        For k >= 3: use raw bonus (strong signal, high confidence)
-        For k < 3: normalize by total (weaker signal, lower confidence)
-
-        Returns integer bonus array.
+        Uses ONLY the longest matching context by default — prevents common-word inflation.
+        For k >= 3: raw bonus (strong signal). For k < 3: normalized by total.
         """
         n_candidates = len(candidate_words)
         bonuses = np.zeros(n_candidates, dtype=np.int64)
@@ -284,7 +642,6 @@ class NGramIndex:
             return bonuses
 
         if longest_only and matches:
-            # Only use the LONGEST matching context — prevents common-word inflation
             best_k = max(matches.keys())
             matches = {best_k: matches[best_k]}
 
@@ -296,14 +653,12 @@ class NGramIndex:
                     bonus = count * recall_scale * context_weight
                 else:
                     bonus = (count * recall_scale * context_weight) // max(1, total)
-                # Keep the BEST bonus for each word
                 if word not in cont_lookup or bonus > cont_lookup[word]:
                     cont_lookup[word] = int(bonus)
 
             for i, w in enumerate(candidate_words):
-                w_int = int(w)
-                if w_int in cont_lookup:
-                    bonuses[i] += cont_lookup[w_int]
+                if int(w) in cont_lookup:
+                    bonuses[i] += cont_lookup[int(w)]
 
         return bonuses
 
@@ -313,11 +668,7 @@ class NGramIndex:
         min_context_length: int = 3,
         min_confidence: float = 0.3,
     ) -> Optional[Tuple[int, int, int]]:
-        """
-        Find the best word for direct copying (highest-confidence n-gram match).
-
-        Returns (word_idx, count, total) or None if no confident match.
-        """
+        """Find best word for direct copying (highest-confidence n-gram match)."""
         matches = self.lookup(context_words)
         for k in sorted(matches.keys(), reverse=True):
             if k < min_context_length:
@@ -326,7 +677,6 @@ class NGramIndex:
             if not continuations:
                 continue
             best_word, best_count, total = continuations[0]
-            # Confidence check: best_count / total >= min_confidence
             if best_count * 10 >= total * int(min_confidence * 10):
                 return (best_word, best_count, total)
         return None
@@ -336,15 +686,15 @@ class NGramIndex:
 # PMI COUPLING COMPUTATION
 # ===========================================================================
 
-def compute_log_floor_pmi(cooc: int, marginal_i: int, marginal_j: int,
-                          total: int, cap: int = 15) -> int:
+def compute_log_floor_pmi(
+    cooc: int, marginal_i: int, marginal_j: int, total: int, cap: int = 15
+) -> int:
     """
     Compute log-floor PMI using ONLY integer arithmetic and bit operations.
 
     PMI(i,j) = log2(C(i,j)*N / (C(i)*C(j)))
-             = bit_length(ratio) - 1  where ratio = max(num,denom)/min(num,denom)
+             = sign * (bit_length(ratio) - 1)
 
-    This is the "log-floor PMI" — purely integer, preserves sign and ordering.
     Novel: bit_length() as floor(log2()) for integer PMI.
     """
     if cooc == 0 or marginal_i == 0 or marginal_j == 0 or total == 0:
@@ -385,7 +735,6 @@ def compute_pmi_couplings(
     for seq in sequences:
         for w in seq:
             unigram[w] += 1
-
     total_tokens = int(unigram.sum())
 
     # Count windowed co-occurrences
@@ -423,39 +772,30 @@ def compute_pmi_couplings(
 
 
 # ===========================================================================
-# V14 ISING-ENHANCED N-GRAM LANGUAGE MODEL
+# ISING-ENHANCED N-GRAM LANGUAGE MODEL
 # ===========================================================================
 
 class IsingLM:
     """
-    V14: Ising-Enhanced N-Gram Language Model.
+    Ising-Enhanced N-Gram Language Model.
 
-    Architecture (honest description):
+    Architecture (honest):
       1. POS type selection: Grammar-driven with hard constraints
       2. N-gram recall: Primary next-word signal (when available)
       3. PMI coupling: Secondary signal (when recall misses)
       4. Integer Boltzmann: Temperature-controlled stochastic selection
 
-    The Ising model contributes:
-      - PMI coupling matrix: word-word affinities beyond n-gram context
-      - Energy function: principled scoring of candidate words
-      - Temperature: physical parameter controlling randomness
-      - Integer-only sampling: genuinely integer Boltzmann selection
-
-    Parameters (far fewer than V12/V13's 30+):
-      - recall_scale: How strongly n-gram matches bias selection
-      - pmi_weight: How strongly PMI couplings bias selection
-      - beta_type: Temperature for POS type selection
-      - beta_word: Temperature for word selection
+    Parameters (6 generation params, not 30+):
+      - recall_scale, pmi_weight, field_weight
+      - beta_type, beta_word
+      - ising_enabled (ablation switch)
     """
 
-    # Closed-class POS types (for anti-loop constraints)
     CLOSED_CLASS = {POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
                     POS2IDX["PRON"], POS2IDX["AUX"], POS2IDX["CONJ"]}
 
-    # Hard type constraints (linguistically motivated)
     HARD_TYPE_CONSTRAINTS = {
-        POS2IDX["PART"]: [POS2IDX["VERB"]],  # "to" must be followed by VERB
+        POS2IDX["PART"]: [POS2IDX["VERB"]],
         POS2IDX["AUX"]: [POS2IDX["VERB"], POS2IDX["ADV"]],
     }
 
@@ -466,50 +806,41 @@ class IsingLM:
         J: np.ndarray,
         h: np.ndarray,
         types: POSTypeSystem,
-        # Generation parameters (only 6, not 30+)
         recall_scale: int = 1000,
         pmi_weight: int = 3,
         field_weight: int = 1,
         beta_type: float = 0.01,
         beta_word: float = 0.15,
-        # Copy mechanism
         copy_enabled: bool = True,
         copy_min_context: int = 2,
         copy_min_confidence: float = 0.25,
-        # Anti-repetition
         same_word_penalty: int = 50000,
         max_closed_class_run: int = 2,
-        # Ablation: disable Ising model to measure its contribution
         ising_enabled: bool = True,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
-        self.J = J  # PMI coupling matrix (V x V, int64)
-        self.h = h  # Local field (V, int64)
+        self.J = J
+        self.h = h
         self.types = types
         self.vocab_size = len(vocab)
-        self.window = 5  # PMI coupling window
+        self.window = 5
 
-        # Generation parameters
         self.recall_scale = recall_scale
         self.pmi_weight = pmi_weight
         self.field_weight = field_weight
         self.ising_enabled = ising_enabled
 
-        # Integer Boltzmann samplers (lookup-table, no np.exp in hot loop)
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=500)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=500)
 
-        # Copy mechanism
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
         self.copy_min_confidence = copy_min_confidence
-
-        # Anti-repetition
         self.same_word_penalty = same_word_penalty
         self.max_closed_class_run = max_closed_class_run
 
-        # Build type-word index: type_idx -> list of word indices
+        # Build type-word index
         self.type_words: Dict[int, List[int]] = {}
         for t in range(N_POS):
             col = types.I_emit[:, t]
@@ -520,17 +851,13 @@ class IsingLM:
         for t1 in range(N_POS):
             for t2 in range(N_POS):
                 penalty = types.compute_grammar_penalty([t1], 0, t2)
-                if penalty < 500:  # Not a hard constraint violation
+                if penalty < 500:
                     self.allowed_transitions.add((t1, t2))
 
         # Diagnostics
         self._stats = {
-            'total_positions': 0,
-            'recall_hit': 0,
-            'copy_used': 0,
-            'pmi_only': 0,
-            'same_word_blocked': 0,
-            'closed_loop_blocked': 0,
+            'total_positions': 0, 'recall_hit': 0, 'copy_used': 0,
+            'pmi_only': 0, 'same_word_blocked': 0, 'closed_loop_blocked': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -543,19 +870,12 @@ class IsingLM:
         return POS2IDX["X"]
 
     def _get_valid_next_types(self, prev_type: int, types_history: List[int]) -> List[int]:
-        """
-        Get valid next POS types with hard constraints + anti-loop.
-
-        This replaces V12/V13's ad-hoc layering with a clean, principled approach:
-          1. Start with grammar-allowed transitions
-          2. Apply hard linguistic constraints (PART -> VERB, etc.)
-          3. Break closed-class loops (max 2 in a row)
-        """
+        """Get valid next POS types with hard constraints + anti-loop."""
         valid = [t for t in range(N_POS) if (prev_type, t) in self.allowed_transitions]
         if not valid:
             valid = list(range(N_POS))
 
-        # Hard type constraints
+        # Hard type constraints (e.g. PART -> VERB)
         if prev_type in self.HARD_TYPE_CONSTRAINTS:
             constrained = self.HARD_TYPE_CONSTRAINTS[prev_type]
             constrained_valid = [t for t in valid if t in constrained]
@@ -577,8 +897,7 @@ class IsingLM:
 
         return valid
 
-    def _compute_type_energy(self, pos: int, type_idx: int,
-                             types_history: List[int]) -> int:
+    def _compute_type_energy(self, pos: int, type_idx: int, types_history: List[int]) -> int:
         """Compute energy for a POS type at position pos. Pure integer."""
         energy = 0
         types_for_check = list(types_history) + [type_idx]
@@ -586,35 +905,22 @@ class IsingLM:
             types_for_check, len(types_history), type_idx
         )
         energy += penalty
-
-        # Same-type penalty (mild — prevents VERB VERB VERB chains)
         if len(types_history) > 0 and type_idx == types_history[-1]:
             if type_idx not in (POS2IDX['NOUN'], POS2IDX['X']):
                 energy += 50
-
         return energy
 
     def _compute_word_energy(
-        self,
-        pos: int,
-        candidate_words: np.ndarray,
-        word_type: int,
-        context_words: List[int],
-        context_types: List[int],
-        recall_hit: bool,
+        self, pos: int, candidate_words: np.ndarray, word_type: int,
+        context_words: List[int], context_types: List[int], recall_hit: bool,
     ) -> np.ndarray:
         """
-        Compute energy for candidate words at position pos.
+        Compute energy for candidate words.
 
-        Architecture (honest):
-          E(w) = -recall_bonus(w)          [PRIMARY: n-gram match signal]
-               - pmi_coupling(w, ctx)       [SECONDARY: Ising PMI signal]
-               - field(w)                   [TERTIARY: unigram frequency]
-               + penalties                  [HARD: grammar, anti-repetition]
-
-        When recall hits: recall dominates (PMI is supplementary)
-        When recall misses: PMI is primary (provides structured fallback)
-        When Ising disabled: only recall + field (ablation baseline)
+        E(w) = -recall_bonus(w)          [PRIMARY: n-gram match signal]
+             - pmi_coupling(w, ctx)       [SECONDARY: Ising PMI signal]
+             - field(w)                   [TERTIARY: unigram frequency]
+             + penalties                  [HARD: grammar, anti-repetition]
 
         All integer arithmetic.
         """
@@ -626,8 +932,8 @@ class IsingLM:
             context_words=context_words,
             candidate_words=candidate_words,
             recall_scale=self.recall_scale,
-            context_weight_factor=4,  # 4^(k-1): exponential boost for longer matches
-            longest_only=True,  # Only use longest matching context (prevents common-word inflation)
+            context_weight_factor=4,
+            longest_only=True,
         )
         energies -= recall_bonuses
 
@@ -637,12 +943,8 @@ class IsingLM:
             ctx = context_words[context_start:]
             if ctx:
                 ctx_arr = np.array(ctx, dtype=np.int64)
-                # Vectorized coupling: J[candidates, ctx_words] -> sum over ctx
                 coupling_block = self.J[np.ix_(candidate_words, ctx_arr)]
                 coupling_sums = coupling_block.sum(axis=1)
-
-                # When recall hits: PMI is supplementary (divide by 10)
-                # When recall misses: PMI is primary (full weight)
                 if recall_hit and recall_bonuses.max() > 0:
                     energies -= (coupling_sums * self.pmi_weight) // 10
                 else:
@@ -651,33 +953,29 @@ class IsingLM:
         # === LOCAL FIELD (unigram — tertiary signal) ===
         field_vals = self.h[candidate_words] * self.field_weight
         if recall_hit and recall_bonuses.max() > 0:
-            energies -= (field_vals * 1) // 10  # Small supplement
+            energies -= (field_vals * 1) // 10
         else:
-            energies -= field_vals  # More important when recall misses
+            energies -= field_vals
 
         # === TYPE COMPATIBILITY (hard constraint) ===
         for i, w in enumerate(candidate_words):
             w_int = int(w)
             if w_int < self.types.I_emit.shape[0]:
-                emit_val = int(self.types.I_emit[w_int, word_type])
-                if emit_val <= 0:
-                    energies[i] += 500  # Strong penalty for type incompatibility
+                if int(self.types.I_emit[w_int, word_type]) <= 0:
+                    energies[i] += 500
 
-        # === SAME-WORD PENALTY (absolute — must always work) ===
+        # === SAME-WORD PENALTY ===
         if len(context_words) >= 1:
             prev_word = context_words[-1]
             for i, w in enumerate(candidate_words):
                 if int(w) == prev_word:
                     energies[i] += self.same_word_penalty
-                    self._stats['same_word_blocked'] += 1
 
         # === CLOSED-CLASS DOUBLE PENALTY ===
         if word_type in self.CLOSED_CLASS and len(context_types) >= 1:
             prev_type = context_types[-1]
-            # DET after DET: "the the", "a the"
             if word_type == POS2IDX["DET"] and prev_type == POS2IDX["DET"]:
                 energies += 50000
-            # PREP after PREP: "of in", "in of"
             elif word_type == POS2IDX["PREP"] and prev_type == POS2IDX["PREP"]:
                 energies += 50000
 
@@ -754,13 +1052,10 @@ class IsingLM:
                 )
                 if copy_candidate is not None:
                     copy_word_idx, _, _ = copy_candidate
-                    # Type compatibility check
                     if copy_word_idx < self.types.I_emit.shape[0]:
                         if int(self.types.I_emit[copy_word_idx, chosen_type]) > 0:
-                            # Same-word block
                             if len(words) >= 1 and copy_word_idx == words[-1]:
                                 copy_word_idx = None
-                            # Consecutive copy cap (allow longer chains for coherence)
                             elif consecutive_copies >= 6:
                                 copy_word_idx = None
                             else:
@@ -777,7 +1072,7 @@ class IsingLM:
                 candidate_list = list(range(min(200, self.vocab_size)))
             candidate_words = np.array(candidate_list, dtype=np.int64)
 
-            # Top-k filtering by field strength (for efficiency)
+            # Top-k filtering by field strength
             if len(candidate_words) > 300:
                 field_vals = self.h[candidate_words]
                 top_k = np.argsort(field_vals)[-300:]
@@ -803,7 +1098,6 @@ class IsingLM:
             words.append(chosen_word)
             types.append(chosen_type)
 
-            # Diagnostics
             self._stats['total_positions'] += 1
             if recall_hit:
                 self._stats['recall_hit'] += 1
@@ -853,7 +1147,7 @@ class IsingLM:
 
 class IsingLMModel:
     """
-    Complete V14 model: training pipeline + generation.
+    Complete model: training pipeline + generation.
 
     Training:
       1. Load corpus
@@ -870,17 +1164,13 @@ class IsingLMModel:
 
     def __init__(
         self,
-        # Vocabulary
         vocab_min_freq: int = 5,
         vocab_max_size: int = 3000,
-        # N-gram index
         ngram_max_n: int = 5,
         ngram_min_count: int = 1,
-        # PMI
         pmi_window: int = 5,
         pmi_min_count: int = 2,
         pmi_cap: int = 10,
-        # Generation
         recall_scale: int = 300,
         pmi_weight: int = 5,
         field_weight: int = 1,
@@ -891,7 +1181,6 @@ class IsingLMModel:
         copy_min_confidence: float = 0.4,
         same_word_penalty: int = 50000,
         max_closed_class_run: int = 2,
-        # Ablation
         ising_enabled: bool = True,
     ):
         self.vocab_min_freq = vocab_min_freq
@@ -919,28 +1208,25 @@ class IsingLMModel:
         self.h: Optional[np.ndarray] = None
         self.ngram_index: Optional[NGramIndex] = None
         self.generator: Optional[IsingLM] = None
-        self.baseline_generator: Optional[IsingLM] = None  # Ablation
+        self.baseline_generator: Optional[IsingLM] = None
         self.sequences: Optional[List[List[int]]] = None
 
     def train(self, n_samples: int = 20000) -> "IsingLMModel":
         """Train the model from FineWeb-Edu corpus."""
-        import time as _time
-        from .data_loader import load_fineweb_edu, tokenize_texts, truncate_sequences
-
         print("=" * 70)
-        print("V14 ISING-ENHANCED N-GRAM LANGUAGE MODEL — TRAINING")
+        print("ISING-ENHANCED N-GRAM LANGUAGE MODEL — TRAINING")
         print("=" * 70)
-        print(f"\n  Honest architecture: N-gram (primary) + Ising PMI (secondary)")
+        print(f"\n  Architecture: N-gram (primary) + Ising PMI (secondary)")
         print(f"  Integer-only hot path: Lookup-table Boltzmann (NO np.exp)")
         print(f"  Ising enabled: {self.ising_enabled}")
         print()
 
-        t0 = _time.time()
+        t0 = time.time()
 
         # Step 1: Load corpus
         print("[1/5] Loading corpus...")
         texts = load_fineweb_edu(n_samples=n_samples)
-        print(f"  Loaded {len(texts)} texts ({_time.time()-t0:.1f}s)")
+        print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
 
         # Step 2: Build vocabulary
         print("\n[2/5] Building vocabulary...")
@@ -987,22 +1273,17 @@ class IsingLMModel:
         print("\nBuilding generators...")
         self._build_generators()
 
-        t_total = _time.time() - t0
+        t_total = time.time() - t0
         print(f"\nTraining complete: {t_total:.1f}s")
-
         return self
 
     def _build_generators(self):
         """Build Ising and ablation generators."""
-        # Main generator (with Ising)
-        self.generator = IsingLM(
+        gen_kwargs = dict(
             vocab=self.vocab,
             ngram_index=self.ngram_index,
-            J=self.J,
-            h=self.h,
-            types=self.types,
+            J=self.J, h=self.h, types=self.types,
             recall_scale=self.recall_scale,
-            pmi_weight=self.pmi_weight,
             field_weight=self.field_weight,
             beta_type=self.beta_type,
             beta_word=self.beta_word,
@@ -1011,27 +1292,20 @@ class IsingLMModel:
             copy_min_confidence=self.copy_min_confidence,
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
+        )
+
+        # Main generator (with Ising)
+        self.generator = IsingLM(
+            **gen_kwargs,
+            pmi_weight=self.pmi_weight,
             ising_enabled=self.ising_enabled,
         )
 
         # Ablation baseline (without Ising)
         self.baseline_generator = IsingLM(
-            vocab=self.vocab,
-            ngram_index=self.ngram_index,
-            J=self.J,
-            h=self.h,
-            types=self.types,
-            recall_scale=self.recall_scale,
-            pmi_weight=0,  # No PMI
-            field_weight=self.field_weight,
-            beta_type=self.beta_type,
-            beta_word=self.beta_word,
-            copy_enabled=self.copy_enabled,
-            copy_min_context=self.copy_min_context,
-            copy_min_confidence=self.copy_min_confidence,
-            same_word_penalty=self.same_word_penalty,
-            max_closed_class_run=self.max_closed_class_run,
-            ising_enabled=False,  # No Ising at all
+            **gen_kwargs,
+            pmi_weight=0,
+            ising_enabled=False,
         )
 
     def generate_with_trace(self, prompt: str = "the", length: int = 20) -> Dict:
