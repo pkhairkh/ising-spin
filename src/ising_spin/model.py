@@ -4998,8 +4998,8 @@ class IsingLMModel:
         self.sequences: Optional[List[List[int]]] = None
         self.test_sequences: Optional[List[List[int]]] = None
 
-    def train(self, n_samples: int = 20000) -> "IsingLMModel":
-        """Train the model from FineWeb-Edu corpus."""
+    def train(self, n_samples: int = 20000, texts=None) -> "IsingLMModel":
+        """Train the model from FineWeb-Edu corpus or provided texts."""
         print("=" * 70)
         print("ISING-ENHANCED N-GRAM LANGUAGE MODEL -- TRAINING")
         print("=" * 70)
@@ -5057,9 +5057,12 @@ class IsingLMModel:
         t0 = time.time()
 
         # Step 1: Load corpus
-        print("[1/13] Loading corpus...")
-        texts = load_fineweb_edu(n_samples=n_samples)
-        print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
+        if texts is None:
+            print("[1/13] Loading corpus...")
+            texts = load_fineweb_edu(n_samples=n_samples)
+            print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
+        else:
+            print(f"[1/13] Using provided texts ({len(texts)} texts)")
 
         # Step 2: Build vocabulary (with knowledge augmentation)
         print("\n[2/13] Building vocabulary...")
@@ -5089,7 +5092,7 @@ class IsingLMModel:
         self.types.build_from_vocabulary(self.vocab.word2idx, self.vocab.idx2word)
         self.types.build_grammar_penalties(penalty_strength=60)
         sequences = tokenize_texts(texts, self.vocab)
-        sequences = truncate_sequences(sequences, max_len=30)  # v8.1: 20 → 30 for longer contexts
+        sequences = truncate_sequences(sequences, max_len=80)  # v11.4: 30 → 80 for much longer n-gram contexts
 
         # Path 3c: Split 90% train, 10% test for perplexity evaluation
         split_idx = int(len(sequences) * 0.9)
