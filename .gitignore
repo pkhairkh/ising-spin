@@ -1,3 +1,5 @@
 *.npy
 data/
 *.pyc
+cached_fineweb_200k.json
+cached_fineweb_50k.json
