@@ -233,6 +233,9 @@ class Vocabulary:
             (word, count)
             for word, count in self.word_counts.most_common()
             if count >= self.min_freq and word not in self.SPECIALS
+            # v12: Filter out pure number tokens — they hurt coherence
+            # Numbers like "2012", "3", "27" add noise without helping fluency
+            and not word.replace(".", "").replace(",", "").replace("-", "").isdigit()
         ]
         if self.max_size is not None:
             filtered = filtered[:self.max_size]
@@ -1004,7 +1007,120 @@ class NGramIndex:
                     del self.context_totals[k][context]
 
         self._built = True
-        
+        self._finalize_index()
+        return self
+
+    def build_batched(self, sequences: List[List[int]], batch_size: int = 200000,
+                      prune_interval: int = 1, adaptive_min_count: bool = True) -> "NGramIndex":
+        """
+        Memory-efficient n-gram index building with batched processing and
+        incremental pruning. Designed for large corpora (>500K sequences)
+        where the standard build() would exhaust memory.
+
+        Key optimizations vs build():
+          1. Processes sequences in batches — limits peak n-gram dict size
+          2. Prunes low-count entries after each batch — frees memory early
+          3. Auto-scales min_count with corpus size — fewer entries for larger corpora
+          4. Uses gc.collect() after each batch — returns memory to OS
+          5. Prunes higher-order n-grams more aggressively (count < 2 for 4/5-gram)
+
+        Args:
+            sequences: List of tokenized sequences
+            batch_size: Number of sequences per batch (default 200K)
+            prune_interval: Prune every N batches (default 1 = every batch)
+            adaptive_min_count: Auto-scale min_count based on corpus size
+        """
+        import gc
+
+        total_seqs = len(sequences)
+        # Auto-scale min_count for large corpora
+        # With 1M texts, min_count=2 is fine. With 3M+, min_count=3-4 keeps index manageable.
+        # The scaling is conservative: log2(N/500K) + 1, capped at 5.
+        # This means: 500K → 2, 1M → 2, 2M → 3, 4M → 4, 8M+ → 5
+        effective_min_count = self.min_count
+        if adaptive_min_count and total_seqs > 500000:
+            import math
+            scale = max(self.min_count, min(5, int(math.log2(total_seqs / 500000)) + self.min_count))
+            effective_min_count = scale
+            # Also prune higher-order n-grams more aggressively
+            self._higher_order_min = effective_min_count + 1
+        else:
+            self._higher_order_min = effective_min_count
+
+        if effective_min_count != self.min_count:
+            print(f"    Auto-scaled min_count: {self.min_count} -> {effective_min_count} "
+                  f"(corpus: {total_seqs:,} seqs, higher-order: {self._higher_order_min})")
+
+        n_batches = (total_seqs + batch_size - 1) // batch_size
+        processed = 0
+
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, total_seqs)
+            batch = sequences[start:end]
+
+            # Count n-grams for this batch
+            for seq in batch:
+                s_start = 0
+                for i, w in enumerate(seq):
+                    if w >= 4:
+                        s_start = i
+                        break
+
+                for t in range(s_start, len(seq)):
+                    for k in range(1, self.max_n + 1):
+                        if t - k < s_start:
+                            break
+                        context = tuple(seq[t-k:t])
+                        continuation = seq[t]
+                        if any(w < 4 for w in context) or continuation < 4:
+                            continue
+                        if context not in self.index[k]:
+                            self.index[k][context] = Counter()
+                        self.index[k][context][continuation] += 1
+                        self.context_totals[k][context] = (
+                            self.context_totals[k].get(context, 0) + 1
+                        )
+
+            processed += len(batch)
+
+            # Prune after each batch (or every prune_interval batches)
+            if (batch_idx + 1) % prune_interval == 0:
+                self._prune_index(effective_min_count)
+                gc.collect()
+
+            # Progress reporting
+            n_ctx = sum(len(self.index[k]) for k in range(1, self.max_n + 1))
+            n_cont = sum(sum(len(v) for v in self.index[k].values()) for k in range(1, self.max_n + 1))
+            print(f"    Batch {batch_idx+1}/{n_batches}: {processed:,} seqs, "
+                  f"{n_ctx:,} contexts, {n_cont:,} continuations")
+
+        # Final prune with the base min_count
+        self._prune_index(self.min_count)
+
+        self._built = True
+        self._finalize_index()
+        return self
+
+    def _prune_index(self, min_count: int):
+        """Prune low-count n-gram entries from the index."""
+        for k in range(1, self.max_n + 1):
+            # Higher-order n-grams use stricter min_count
+            mc = getattr(self, '_higher_order_min', min_count) if k >= 4 else min_count
+            for context in list(self.index[k].keys()):
+                low_count = [
+                    w for w, c in self.index[k][context].items()
+                    if c < mc
+                ]
+                for w in low_count:
+                    del self.index[k][context][w]
+                    self.context_totals[k][context] -= 1
+                if not self.index[k][context]:
+                    del self.index[k][context]
+                    del self.context_totals[k][context]
+
+    def _finalize_index(self):
+        """Build unigram totals and KN continuation counts after index is built."""
         # Build unigram totals for backoff (Katz backoff to unigram)
         # _unigram_totals[w] = (count(w), total_tokens)
         self._unigram_totals = {}
@@ -1123,8 +1239,9 @@ class NGramIndex:
         if self._built:
             if kn_backoff and hasattr(self, '_kn_continuation') and self._kn_continuation:
                 # v10.0: Kneser-Ney backoff using continuation counts
-                # Use the highest available continuation level (most informative)
-                best_kn_level = max(self._kn_continuation.keys())
+                # v12: Use the LOWEST level (bigram) for best coverage
+                # Higher levels are too sparse — many words have zero continuation counts
+                best_kn_level = min(self._kn_continuation.keys())
                 kn_cont = self._kn_continuation[best_kn_level]
                 kn_total = self._kn_totals[best_kn_level]
                 if kn_total > 0:
@@ -1186,9 +1303,13 @@ class NGramIndex:
                 if int(w) in cont_lookup:
                     w_int = int(w)
                     if interpolated:
-                        # Product of experts: ADD energies from each level
-                        # P(w) ∝ Π_k P_k(w) → E(w) = Σ_k E_k(w)
-                        recall_energies[i] += cont_lookup[w_int]
+                        # v12: Interpolated smoothing — take BEST (lowest) energy
+                        # across all levels. This is equivalent to Jelinek-Mercer
+                        # interpolation where the most informative context wins.
+                        # Previous ADD-based PoE was buggy: it made matched words
+                        # HIGHER energy than unmatched (inverted ranking).
+                        if cont_lookup[w_int] < recall_energies[i]:
+                            recall_energies[i] = cont_lookup[w_int]
                     else:
                         # Replace with best match (longest or shortest energy)
                         recall_energies[i] = cont_lookup[w_int]
@@ -4023,13 +4144,19 @@ class IsingLM:
         energies -= field_vals
 
         # === TYPE COMPATIBILITY (hard constraint) ===
+        # v12: Scale penalty to be meaningful vs recall energy (~24000)
+        # Was 500 (=2% of recall), now 5000 (~20%)
+        type_penalty = max(500, self.recall_scale * 3)
         for i, w in enumerate(candidate_words):
             w_int = int(w)
             if w_int < self.types.I_emit.shape[0]:
                 if int(self.types.I_emit[w_int, word_type]) <= 0:
-                    energies[i] += 500
+                    energies[i] += type_penalty
 
         # === SAME-WORD PENALTY ===
+        # v12: Scale penalty to be meaningful vs recall energy (~24000)
+        # Was 200 (=0.8% of recall), now use same_word_penalty directly
+        # which defaults to 200 in v12 config but should be ~5000
         if len(context_words) >= 1:
             prev_word = context_words[-1]
             for i, w in enumerate(candidate_words):
@@ -4045,11 +4172,14 @@ class IsingLM:
                 energies += 50000
 
         # === REPETITION PENALTY (recent context) ===
+        # v12: Scale to be meaningful vs recall energy
+        # Was 200, now proportional to recall_scale
+        rep_penalty = max(200, self.recall_scale // 2)
         if len(context_words) > 0:
             recent = set(context_words[-5:])
             for i, w in enumerate(candidate_words):
                 if int(w) in recent:
-                    energies[i] += 200
+                    energies[i] += rep_penalty
 
         return energies
 
@@ -5192,12 +5322,17 @@ class IsingLMModel:
             self.graded_couplings = None
 
         # Step 6: Build n-gram index
+        # v12: Use batched build for large corpora to avoid OOM
         print("\n[6/13] Building n-gram index...")
         self.ngram_index = NGramIndex(
             max_n=self.ngram_max_n,
             min_count=self.ngram_min_count,
         )
-        self.ngram_index.build(self.sequences)
+        if len(self.sequences) > 500000:
+            print(f"    Large corpus ({len(self.sequences):,} seqs) — using batched build")
+            self.ngram_index.build_batched(self.sequences, batch_size=200000)
+        else:
+            self.ngram_index.build(self.sequences)
 
         # Step 7: Build knowledge layer (Layer 2 + Layer 3)
         # v8.1: Skip in recall-primary mode when scales are 0
