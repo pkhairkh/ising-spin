@@ -691,10 +691,17 @@ class IntegerBoltzmannSampler:
         self.scale = scale
         # For accurate PPL computation, max_delta must cover the full energy
         # range. With recall_scale=1600 and 5K vocab, max delta ≈ 32K.
-        # Memory: 35001 × 8 bytes ≈ 280KB — very affordable.
-        # v12.2: Removed the 25000 cap — it was clipping energies above 25K,
-        # which destroyed discrimination for high-energy (unmatched) words.
-        fine_max = min(max_delta, 50000)
+        # Memory: 25001 × 8 bytes ≈ 200KB — very affordable.
+        #
+        # v12.3: Keeping 25K cap. Tested 50K cap and PPL REGRESSED from 50→53.
+        # The 25K cap acts as implicit regularization: words with delta > 25K
+        # all get the same weight (table[25000]), which inflates Z and prevents
+        # the distribution from becoming too peaked at high β. This is similar
+        # to label smoothing / temperature scaling. Removing the cap makes the
+        # Boltzmann distribution too sharp at high β, hurting PPL on uncertain
+        # positions. A principled smoothing mechanism could replace this, but
+        # for now the 25K cap is battle-tested and works.
+        fine_max = min(max_delta, 25000)
         self.table = np.zeros(fine_max + 1, dtype=np.int64)
 
         # INTEGER-ONLY TABLE CONSTRUCTION
@@ -5893,29 +5900,29 @@ class IsingLMModel:
             print(f"      ΔE spread: p10={p10_delta_e}, p90={p90_delta_e}")
             print(f"      Discrimination at median ΔE: {theoretical_discrimination:.4f}")
 
-            # v12.2: Use empirical β from median ΔE instead of theoretical.
-            # The theoretical β = 0.55*ln(2)/recall_scale was "optimal" for
-            # older models without KN backoff and with recall_scale=800.
-            # With recall_scale=1600 + KN backoff, the energy distribution is
-            # different, and the beta sweep consistently shows that HIGHER β
-            # (up to 2-5x theoretical) gives better PPL.
+            # v12.3: Improved empirical β calibration.
+            # The theoretical β = 0.55*ln(2)/recall_scale gives too-low β.
+            # The beta sweep shows the optimal is typically 1.5-2x theoretical.
             #
-            # Empirical formula: β = ln(2) * C / median_ΔE where C is chosen
-            # so that exp(-β * median_ΔE) ≈ target_probability.
-            # For good discrimination, we want P(median) ~ 0.01-0.05:
-            #   -ln(0.02) ≈ 3.9, so β = 3.9 / median_ΔE
-            #   -ln(0.01) ≈ 4.6, so β = 4.6 / median_ΔE
-            # We use C = ln(2) * 4.0 / ln(2) = 4.0 → β = 4.0 / median_ΔE
-            # This gives exp(-β*median_ΔE) = exp(-4) ≈ 0.018 — strong discrimination.
-            empirical_beta = 4.0 / max(1, median_delta_e)
+            # Key insight: median ΔE is too high because many positions have
+            # strong n-gram matches (large energy gap). The "decision boundary"
+            # where β matters most is at LOWER ΔE values (p10-p25 range).
+            # Using p10 gives a β much closer to the sweep optimum.
+            #
+            # With p10_ΔE ≈ 12532: β = 3.5 / 12532 ≈ 0.000279
+            # Theoretical: 0.000238. Sweep optimum: 0.000401 (f=1.85).
+            # The empirical p10-based β is closer but still low. We also boost
+            # by a factor of 1.5 to account for POS-type restriction effects
+            # (only same-type candidates compete, so effective V is smaller).
+            empirical_beta = (3.5 * 1.5) / max(1, p10_delta_e)
             empirical_beta = max(0.00001, min(1.0, empirical_beta))
 
-            # Use whichever is LARGER (both ensure discrimination, but
-            # empirical adapts to the actual energy distribution)
+            # Use whichever is LARGER — empirical adapts to actual energy
+            # distribution, theoretical provides a floor for edge cases
             chosen_beta = max(theoretical_beta, empirical_beta)
 
             print(f"      Theoretical β = {theoretical_beta:.6f}")
-            print(f"      Empirical β = {empirical_beta:.6f} (from median ΔE={median_delta_e})")
+            print(f"      Empirical β = {empirical_beta:.6f} (from p10 ΔE={p10_delta_e})")
             print(f"      Using β = {chosen_beta:.6f} (max of theoretical & empirical)")
             return chosen_beta
         else:

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-v12.2 Training Script — Extended Beta Sweep + Empirical Calibration
+v12.3 Training Script — Extended Beta Sweep + Fixed Calibration
 
-Key improvements over v12.1:
-  1. Extended beta sweep range (f=0.5 to 5.0) — previous sweep only went to 1.5,
-     but PPL was still dropping at that point. Two-phase sweep finds the true optimum.
-  2. Empirical β calibration from median ΔE — theoretical β was too low for
-     v12 configs (recall_scale=1600 + KN backoff). Now uses max(theoretical, empirical).
-  3. Boltzmann table max_delta increased to 50K (was capped at 25K, losing discrimination)
-  4. All previous fixes: OOM cap, unbuffered output, memory monitoring, etc.
+Key improvements over v12.2:
+  1. REVERTED 50K table cap back to 25K — it caused PPL regression 50→53.
+     The 25K cap acts as implicit regularization (like label smoothing).
+  2. Fixed empirical β calibration: uses p10 ΔE instead of median ΔE.
+     Median gives too-low β; p10 is closer to the sweep optimum.
+     With boost factor 1.5 for POS-type restriction effects.
+  3. Kept: extended beta sweep (f=0.5→5.0, two-phase)
+
+Key improvements over v12.1 (carried forward):
+  - Extended beta sweep (was only f=0.5→1.5, now 0.5→5.0)
+  - Two-phase sweep: coarse then fine around optimum
+  - All v12.1 fixes: recall=0 fix, beta sweep fix, KN scaling, etc.
 
 Previous fixes (v12.1):
   - CRITICAL FIX: Multi-word prompt tokenization (was causing recalls=0)
@@ -237,7 +242,7 @@ def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v12.2 Training — Extended Beta Sweep + Empirical Calibration")
+    parser = argparse.ArgumentParser(description="v12.3 Training — Extended Beta Sweep + Fixed Calibration")
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
                         help="Number of training samples (default: 500K)")
     parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB,
@@ -268,7 +273,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v12.2 TRAINING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v12.3 TRAINING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()} (CPU count: {os.cpu_count()})", flush=True)
@@ -291,7 +296,7 @@ def main():
     interpolated = not args.no_interpolated
     
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v12.2")
+    print(f"CONFIG: v12.3")
     print(f"  vocab_max_size={args.vocab}")
     print(f"  kn_backoff={kn_backoff}")
     print(f"  interpolated={interpolated}")
@@ -466,7 +471,7 @@ def main():
     print(f"{'=' * 70}")
     
     results = {
-        "version": "v12.2",
+        "version": "v12.3",
         "timestamp": timestamp,
         "config": {
             "vocab_max_size": args.vocab,
