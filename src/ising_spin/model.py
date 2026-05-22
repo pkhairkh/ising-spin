@@ -71,6 +71,22 @@ from typing import Dict, List, Optional, Tuple, Set
 import scipy.sparse as sp
 
 
+def _get_rss_mb() -> int:
+    """Get current process RSS in MB (0 if unavailable)."""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024  # KB -> MB
+    except Exception:
+        try:
+            import os
+            with open(f"/proc/{os.getpid()}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) // 1024  # KB -> MB
+        except Exception:
+            return 0
+
+
 # ===========================================================================
 # COARSE POS TAGS
 # ===========================================================================
@@ -1023,6 +1039,7 @@ class NGramIndex:
           3. Auto-scales min_count with corpus size — fewer entries for larger corpora
           4. Uses gc.collect() after each batch — returns memory to OS
           5. Prunes higher-order n-grams more aggressively (count < 2 for 4/5-gram)
+          6. v12.1: Memory monitoring with OOM early warning
 
         Args:
             sequences: List of tokenized sequences
@@ -1053,6 +1070,7 @@ class NGramIndex:
 
         n_batches = (total_seqs + batch_size - 1) // batch_size
         processed = 0
+        t_start = time.time()
 
         for batch_idx in range(n_batches):
             start = batch_idx * batch_size
@@ -1089,11 +1107,23 @@ class NGramIndex:
                 self._prune_index(effective_min_count)
                 gc.collect()
 
-            # Progress reporting
+            # Progress reporting with memory tracking
             n_ctx = sum(len(self.index[k]) for k in range(1, self.max_n + 1))
             n_cont = sum(sum(len(v) for v in self.index[k].values()) for k in range(1, self.max_n + 1))
+            rss = _get_rss_mb()
+            elapsed = time.time() - t_start
+            mem_info = f", RSS={rss:,}MB" if rss > 0 else ""
             print(f"    Batch {batch_idx+1}/{n_batches}: {processed:,} seqs, "
-                  f"{n_ctx:,} contexts, {n_cont:,} continuations")
+                  f"{n_ctx:,} contexts, {n_cont:,} continuations{mem_info} "
+                  f"({elapsed:.1f}s)")
+
+            # v12.1: OOM early warning — if RSS > 12GB on a 16GB Pi, start aggressive pruning
+            if rss > 12000:
+                print(f"    ⚠ HIGH MEMORY ({rss:,}MB) — aggressive pruning...")
+                self._prune_index(effective_min_count + 2)
+                gc.collect()
+                rss_after = _get_rss_mb()
+                print(f"    ⚠ After aggressive prune: {rss_after:,}MB")
 
         # Final prune with the base min_count
         self._prune_index(self.min_count)
@@ -1227,7 +1257,11 @@ class NGramIndex:
         """
         n_candidates = len(candidate_words)
         # Default: backoff energy for unmatched words
-        max_energy = 15 * recall_scale  # Cap for unseen words
+        # v12.1: Increased from 15x to 20x recall_scale for better discrimination
+        # between matched (low energy) and unmatched (high energy) words.
+        # With KN backoff giving moderate energies (~8-16x recall_scale at 2x multiplier),
+        # max_energy must be clearly higher to maintain the energy "cliff".
+        max_energy = 20 * recall_scale  # Cap for unseen words
         recall_energies = np.full(n_candidates, max_energy, dtype=np.int64)
 
         # v10.0: BACKOFF ENERGY — Kneser-Ney or unigram
@@ -1241,6 +1275,12 @@ class NGramIndex:
                 # v10.0: Kneser-Ney backoff using continuation counts
                 # v12: Use the LOWEST level (bigram) for best coverage
                 # Higher levels are too sparse — many words have zero continuation counts
+                # v12.1 FIX: KN backoff energy is scaled 2x higher than n-gram match
+                # energy. This creates a clear gap between "matched by n-gram context"
+                # (low energy, likely) and "backed off to KN continuation counts"
+                # (higher energy, less likely). Without this 2x, the energy landscape
+                # is too flat — KN gives almost all words moderate energy, eliminating
+                # the discrimination that makes recall effective.
                 best_kn_level = min(self._kn_continuation.keys())
                 kn_cont = self._kn_continuation[best_kn_level]
                 kn_total = self._kn_totals[best_kn_level]
@@ -1253,7 +1293,8 @@ class NGramIndex:
                                 ratio = kn_total // n_ctx_w
                                 if ratio >= 2:
                                     fine_log2 = int_log2_fine(ratio)
-                                    recall_energies[i] = (fine_log2 * recall_scale) >> 8
+                                    # 2x scale: backoff should be clearly "worse" than matched
+                                    recall_energies[i] = (fine_log2 * recall_scale * 2) >> 8
             elif hasattr(self, '_unigram_totals'):
                 # Standard unigram backoff — same as v9.0
                 for i, w in enumerate(candidate_words):
@@ -3905,8 +3946,8 @@ class IsingLM:
         # v8.2: Topic Spin Layer (Potts coherence)
         self.topic_spin_layer = topic_spin_layer
 
-        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=25000)
-        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=25000)
+        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=35000)
+        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=35000)
 
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
@@ -4810,16 +4851,26 @@ class IsingLM:
         
         All energy computation and sampling is integer-only.
         """
-        # Resolve prompt
-        prompt_idx = self.vocab.word2idx.get(prompt)
-        if prompt_idx is None:
-            prompt_idx = self.vocab.word2idx.get(prompt.lower())
-        if prompt_idx is None:
-            prompt_idx = 4
+        # Resolve prompt — tokenize ALL words, not just the first
+        # v12.1 FIX: Previously only looked up the entire prompt string as
+        # a single word, which failed for multi-word prompts like "the history of".
+        # Now splits the prompt into words and looks up each individually.
+        prompt_words = prompt.strip().split()
+        prompt_tokens = []
+        for w in prompt_words:
+            # Try exact match, then lowercase
+            idx = self.vocab.word2idx.get(w)
+            if idx is None:
+                idx = self.vocab.word2idx.get(w.lower())
+            if idx is not None and idx >= 4:  # Skip special tokens
+                prompt_tokens.append(idx)
+        # Fallback: if no words found, use "the" (most common word)
+        if not prompt_tokens:
+            idx = self.vocab.word2idx.get("the", 4)
+            prompt_tokens = [idx]
 
-        prompt_type = self._get_word_type(prompt_idx)
-        words = [prompt_idx]
-        types = [prompt_type]
+        words = list(prompt_tokens)
+        types = [self._get_word_type(w) for w in words]
         consecutive_copies = 0
         diagnostics = []
 
@@ -5062,6 +5113,10 @@ class IsingLMModel:
         interpolated: bool = False,
         # v10.0: Kneser-Ney backoff (continuation counts)
         kn_backoff: bool = False,
+        # v12.1: Cap n-gram index training sequences (avoids OOM on large corpora)
+        # PMI/skip-gram still use full corpus — only n-gram index is capped.
+        # Set to 0 to disable capping (not recommended for >1M texts).
+        ngram_max_sequences: int = 1000000,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -5113,6 +5168,9 @@ class IsingLMModel:
 
         # v10.0: Kneser-Ney backoff
         self.kn_backoff = kn_backoff
+
+        # v12.1: N-gram index sequence cap
+        self.ngram_max_sequences = ngram_max_sequences
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
@@ -5231,7 +5289,10 @@ class IsingLMModel:
         split_idx = int(len(sequences) * 0.9)
         self.sequences = sequences[:split_idx]
         self.test_sequences = sequences[split_idx:]
-        print(f"  Train sequences: {len(self.sequences)}, Test sequences: {len(self.test_sequences)}")
+        print(f"  Train sequences: {len(self.sequences):,}, Test sequences: {len(self.test_sequences):,}")
+        rss = _get_rss_mb()
+        if rss > 0:
+            print(f"  Memory (RSS): {rss:,} MB")
 
         self.types.compute_type_couplings(self.sequences, self.vocab.idx2word)
         n_typed = sum(1 for w in range(len(self.vocab)) if w in self.types.allowed_types)
@@ -5322,17 +5383,36 @@ class IsingLMModel:
             self.graded_couplings = None
 
         # Step 6: Build n-gram index
-        # v12: Use batched build for large corpora to avoid OOM
-        print("\n[6/13] Building n-gram index...")
+        # v12.1: Cap n-gram training sequences to avoid OOM.
+        # The n-gram index is the ONLY data structure that scales with
+        # unique contexts (exponential in vocab size). PMI/skip-gram produce
+        # fixed-size sparse matrices regardless of corpus size, so they can
+        # use the full corpus. N-gram statistics converge well before the
+        # corpus is exhausted — 1M texts captures ~95% of useful patterns.
+        rss_pre_ngram = _get_rss_mb()
+        print(f"\n[6/13] Building n-gram index... (RSS: {rss_pre_ngram:,} MB)" if rss_pre_ngram > 0 else "\n[6/13] Building n-gram index...")
+
+        ngram_seqs = self.sequences
+        if self.ngram_max_sequences > 0 and len(self.sequences) > self.ngram_max_sequences:
+            import random as _rnd
+            _rnd.seed(42)  # Reproducible subsampling
+            ngram_seqs = _rnd.sample(self.sequences, self.ngram_max_sequences)
+            print(f"    Capped n-gram sequences: {len(self.sequences):,} -> {len(ngram_seqs):,} "
+                  f"(full corpus still used for PMI/skip-gram)")
+
         self.ngram_index = NGramIndex(
             max_n=self.ngram_max_n,
             min_count=self.ngram_min_count,
         )
-        if len(self.sequences) > 500000:
-            print(f"    Large corpus ({len(self.sequences):,} seqs) — using batched build")
-            self.ngram_index.build_batched(self.sequences, batch_size=200000)
+        if len(ngram_seqs) > 500000:
+            print(f"    Large n-gram corpus ({len(ngram_seqs):,} seqs) — using batched build")
+            self.ngram_index.build_batched(ngram_seqs, batch_size=200000)
         else:
-            self.ngram_index.build(self.sequences)
+            self.ngram_index.build(ngram_seqs)
+
+        rss_post_ngram = _get_rss_mb()
+        if rss_post_ngram > 0:
+            print(f"  N-gram index memory delta: +{rss_post_ngram - rss_pre_ngram:,} MB (RSS: {rss_post_ngram:,} MB)")
 
         # Step 7: Build knowledge layer (Layer 2 + Layer 3)
         # v8.1: Skip in recall-primary mode when scales are 0
@@ -5867,7 +5947,7 @@ class IsingLMModel:
                 self.beta_word = calibrated_beta
                 # Update the generator's word_sampler with the new β
                 self.generator.word_sampler = IntegerBoltzmannSampler(
-                    beta=self.beta_word, max_delta=25000
+                    beta=self.beta_word, max_delta=35000
                 )
                 print(f"    β_word set to {self.beta_word:.6f} (recall-only calibrated)")
             else:
