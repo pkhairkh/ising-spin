@@ -418,56 +418,53 @@ class FlagState:
         
         total_bigrams = max(1, int(self.cluster_bigram_fwd.sum()))
         
-        # Marginals
-        c1_marginal = self.cluster_bigram_fwd.sum(axis=1)  # shape (C,)
-        c2_marginal = self.cluster_bigram_fwd.sum(axis=0)  # shape (C,)
+        # Marginals (computed ONCE, outside loop)
+        fwd_c1_marginal = self.cluster_bigram_fwd.sum(axis=1)  # shape (C,)
+        fwd_c2_marginal = self.cluster_bigram_fwd.sum(axis=0)  # shape (C,)
+        bwd_c1_marginal = self.cluster_bigram_bwd.sum(axis=1)  # shape (C,)
+        bwd_c2_marginal = self.cluster_bigram_bwd.sum(axis=0)  # shape (C,)
         
         # Compute PMI-like coupling in integer log scale
-        scale = 256  # Q8 fixed point
+        # Using finer quantization: Q4 = 16 steps per power of 2
+        # log2q4(x) = floor(4 * log2(x)) gives 4x finer than bit_length-1
+        scale = 256  # Q8 fixed point for ratio computation
+        
+        fwd_pmi = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int16)
+        bwd_pmi = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int16)
         
         for c1 in range(self.n_clusters):
-            if c1_marginal[c1] == 0:
+            if fwd_c1_marginal[c1] == 0:
                 continue
             for c2 in range(self.n_clusters):
-                if c2_marginal[c2] == 0:
+                if fwd_c2_marginal[c2] == 0:
                     continue
                 
                 # Forward PMI
                 fwd_count = int(self.cluster_bigram_fwd[c1, c2])
                 if fwd_count > 0:
-                    expected_fwd = int(c1_marginal[c1] * c2_marginal[c2]) // total_bigrams
+                    expected_fwd = int(fwd_c1_marginal[c1] * fwd_c2_marginal[c2]) // total_bigrams
                     if expected_fwd > 0:
-                        # log2(observed/expected) * scale
-                        ratio = int(fwd_count * scale) // expected_fwd
-                        if ratio > 0:
-                            # Approximate log2 using bit_length
-                            log_val = ratio.bit_length() - 1  # floor(log2(ratio))
-                            self.cluster_bigram_fwd[c1, c2] = log_val
-                        else:
-                            self.cluster_bigram_fwd[c1, c2] = 0
-                    else:
-                        self.cluster_bigram_fwd[c1, c2] = 0
-                else:
-                    self.cluster_bigram_fwd[c1, c2] = 0
+                        ratio = fwd_count * scale // expected_fwd
+                        if ratio > 1:
+                            # Fine-grained integer log2: floor(4 * log2(ratio/256))
+                            # = floor(4 * (log2(ratio) - 8))
+                            # Gives ~4x more resolution than bit_length-1
+                            log_val = (int(ratio).bit_length() - 1 - 8) * 4
+                            fwd_pmi[c1, c2] = max(0, min(63, log_val))  # Cap at 6 bits
                 
                 # Backward PMI
                 bwd_count = int(self.cluster_bigram_bwd[c1, c2])
-                if bwd_count > 0:
-                    # Note: bwd marginals are swapped
-                    bwd_c1_marginal = self.cluster_bigram_bwd.sum(axis=1)
-                    bwd_c2_marginal = self.cluster_bigram_bwd.sum(axis=0)
+                if bwd_count > 0 and bwd_c1_marginal[c1] > 0 and bwd_c2_marginal[c2] > 0:
                     expected_bwd = int(bwd_c1_marginal[c1] * bwd_c2_marginal[c2]) // total_bigrams
                     if expected_bwd > 0:
-                        ratio = int(bwd_count * scale) // expected_bwd
-                        if ratio > 0:
-                            log_val = ratio.bit_length() - 1
-                            self.cluster_bigram_bwd[c1, c2] = log_val
-                        else:
-                            self.cluster_bigram_bwd[c1, c2] = 0
-                    else:
-                        self.cluster_bigram_bwd[c1, c2] = 0
-                else:
-                    self.cluster_bigram_bwd[c1, c2] = 0
+                        ratio = bwd_count * scale // expected_bwd
+                        if ratio > 1:
+                            log_val = (int(ratio).bit_length() - 1 - 8) * 4
+                            bwd_pmi[c1, c2] = max(0, min(63, log_val))
+        
+        # Replace raw counts with PMI values
+        self.cluster_bigram_fwd = fwd_pmi
+        self.cluster_bigram_bwd = bwd_pmi
     
     def compute_flag_energy(
         self,
@@ -657,36 +654,38 @@ class WedgeCoupling:
             
             # Convert to PMI-like integer coupling
             total = max(1, int(fwd_counts.sum()))
-            c1_marginal = fwd_counts.sum(axis=1)
-            c2_marginal = fwd_counts.sum(axis=0)
+            fwd_c1_marginal = fwd_counts.sum(axis=1)
+            fwd_c2_marginal = fwd_counts.sum(axis=0)
+            bwd_c1_marginal = bwd_counts.sum(axis=1)  # Compute ONCE outside inner loop
+            bwd_c2_marginal = bwd_counts.sum(axis=0)
             
             fwd_pmi = np.zeros((C, C), dtype=np.int16)
             bwd_pmi = np.zeros((C, C), dtype=np.int16)
             
             for c1 in range(C):
-                if c1_marginal[c1] == 0:
+                if fwd_c1_marginal[c1] == 0:
                     continue
                 for c2 in range(C):
-                    if c2_marginal[c2] == 0:
+                    if fwd_c2_marginal[c2] == 0:
                         continue
                     
-                    # Forward PMI
+                    # Forward PMI — fine-grained quantization
                     if fwd_counts[c1, c2] > 0:
-                        expected = int(c1_marginal[c1] * c2_marginal[c2]) // int(total)
+                        expected = int(fwd_c1_marginal[c1] * fwd_c2_marginal[c2]) // int(total)
                         if expected > 0:
-                            ratio = int(fwd_counts[c1, c2] * 256) // expected
+                            ratio = int(fwd_counts[c1, c2]) * 256 // expected
                             if ratio > 1:
-                                fwd_pmi[c1, c2] = min(15, ratio.bit_length() - 1)
+                                log_val = (int(ratio).bit_length() - 1 - 8) * 4
+                                fwd_pmi[c1, c2] = max(0, min(63, log_val))
                     
-                    # Backward PMI
-                    if bwd_counts[c1, c2] > 0:
-                        bwd_c1_marginal = bwd_counts.sum(axis=1)
-                        bwd_c2_marginal = bwd_counts.sum(axis=0)
+                    # Backward PMI — fine-grained quantization
+                    if bwd_counts[c1, c2] > 0 and bwd_c1_marginal[c1] > 0 and bwd_c2_marginal[c2] > 0:
                         expected = int(bwd_c1_marginal[c1] * bwd_c2_marginal[c2]) // int(total)
                         if expected > 0:
-                            ratio = int(bwd_counts[c1, c2] * 256) // expected
+                            ratio = int(bwd_counts[c1, c2]) * 256 // expected
                             if ratio > 1:
-                                bwd_pmi[c1, c2] = min(15, ratio.bit_length() - 1)
+                                log_val = (int(ratio).bit_length() - 1 - 8) * 4
+                                bwd_pmi[c1, c2] = max(0, min(63, log_val))
             
             self.J_fwd_dist[d] = fwd_pmi
             self.J_bwd_dist[d] = bwd_pmi
@@ -714,12 +713,13 @@ class WedgeCoupling:
         """
         Compute wedge coupling energy for candidate words.
         
-        E_wedge(w) = Σ_d Σ_{ctx_w} J_wedge[d][c_ctx, c_w] × dist_weight(d) × sign
+        E_wedge(w) = Σ_d Σ_{ctx_w} J_wedge[d][c_ctx, c_w] × dist_weight(d)
         
-        The key insight: J_wedge is ANTISYMMETRIC, so the coupling
-        depends on DIRECTION. This captures:
-        - "the dog" gets BONUS (DET→NOUN is forward-likely)
-        - "dog the" gets PENALTY (NOUN→DET is forward-unlikely)
+        The key insight: J_wedge = fwd - bwd^T is ANTISYMMETRIC, so:
+        - J_wedge[DET, NOUN] > 0 → "the dog" gets BONUS (forward-likely)
+        - J_wedge[NOUN, DET] < 0 → "dog the" gets PENALTY (backward-likely)
+        
+        This is the actual Grassmann wedge product: a∧b = -b∧a
         
         All integer arithmetic. Returns shape (n_candidates,) int64.
         """
@@ -743,7 +743,7 @@ class WedgeCoupling:
         if not ctx_info:
             return energies
         
-        # Compute wedge energy for each candidate
+        # Compute wedge energy for each candidate using ANTISYMMETRIC coupling
         for i, w in enumerate(candidate_words):
             w_int = int(w)
             if w_int >= vocab_size:
@@ -757,13 +757,23 @@ class WedgeCoupling:
                 # Get distance weight
                 dw = self.DISTANCE_WEIGHTS.get(d, self.DEFAULT_DISTANCE_WEIGHT)
                 
-                # Forward coupling: context → candidate (the "natural" direction)
-                fwd_val = int(self.J_fwd_dist.get(d, self.J_fwd_dist.get(1, np.zeros((self.n_clusters, self.n_clusters), dtype=np.int16)))[cc, c_w])
+                # Use ANTISYMMETRIC J_wedge (not just fwd!)
+                # J_wedge[d][cc, c_w] > 0 means cc→c_w is forward-likely (bonus)
+                # J_wedge[d][cc, c_w] < 0 means cc→c_w is backward-likely (penalty)
+                if d in self.J_wedge:
+                    wedge_val = int(self.J_wedge[d][cc, c_w])
+                else:
+                    # Fallback: use fwd-only if wedge not precomputed
+                    if d in self.J_fwd_dist:
+                        wedge_val = int(self.J_fwd_dist[d][cc, c_w])
+                    else:
+                        wedge_val = 0
                 
                 # Weight by distance
-                total_wedge += fwd_val * dw
+                total_wedge += wedge_val * dw
             
-            # Negative energy = bonus for well-coupled pairs
+            # Negative energy for positive wedge (forward-likely) = bonus
+            # Positive energy for negative wedge (backward-likely) = penalty
             energies[i] -= (total_wedge * self.wedge_weight) >> 8  # Q8 → integer
         
         return energies
@@ -983,10 +993,11 @@ class BlockMemory:
             if count > 0:
                 # E = -memory_weight * log2(count/total)
                 # = memory_weight * log2(total/count)
-                # Use integer log2 approximation
-                ratio = int(total << 8) // max(1, count)  # Q8
+                # Use integer log2 approximation: floor(4 * log2(total/count))
+                ratio = total * 256 // max(1, count)  # Q8 ratio
                 if ratio > 1:
-                    log_val = ratio.bit_length() - 1  # floor(log2(ratio))
+                    log_val = (int(ratio).bit_length() - 1 - 8) * 4  # 4x finer
+                    log_val = max(0, log_val)
                     # Subtract: lower energy = better
                     energies[i] -= self.memory_weight * log_val
             # else: no memory signal, energy stays 0
