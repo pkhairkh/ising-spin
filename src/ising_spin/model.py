@@ -690,9 +690,11 @@ class IntegerBoltzmannSampler:
         self.beta = beta
         self.scale = scale
         # For accurate PPL computation, max_delta must cover the full energy
-        # range. With recall_scale=800 and 5K vocab, max delta ≈ 22K.
-        # Memory: 25001 × 8 bytes ≈ 200KB — very affordable.
-        fine_max = min(max_delta, 25000)
+        # range. With recall_scale=1600 and 5K vocab, max delta ≈ 32K.
+        # Memory: 35001 × 8 bytes ≈ 280KB — very affordable.
+        # v12.2: Removed the 25000 cap — it was clipping energies above 25K,
+        # which destroyed discrimination for high-energy (unmatched) words.
+        fine_max = min(max_delta, 50000)
         self.table = np.zeros(fine_max + 1, dtype=np.int64)
 
         # INTEGER-ONLY TABLE CONSTRUCTION
@@ -3946,8 +3948,8 @@ class IsingLM:
         # v8.2: Topic Spin Layer (Potts coherence)
         self.topic_spin_layer = topic_spin_layer
 
-        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=35000)
-        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=35000)
+        self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=50000)
+        self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=50000)
 
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
@@ -5891,13 +5893,31 @@ class IsingLMModel:
             print(f"      ΔE spread: p10={p10_delta_e}, p90={p90_delta_e}")
             print(f"      Discrimination at median ΔE: {theoretical_discrimination:.4f}")
 
-            # v8.0 KEY INSIGHT: ALWAYS use the theoretical β.
-            # The empirical PPL diagnostic proved that β = 0.5*ln(2)/scale gives
-            # the best PPL (125) regardless of the median ΔE. The large median ΔE
-            # is CORRECT — recall should distinguish strongly between matched and
-            # unmatched continuations. Adjusting β based on median ΔE BREAKS PPL.
-            print(f"      Using theoretical β (empirically optimal for PPL)")
-            return max(0.00001, min(1.0, theoretical_beta))
+            # v12.2: Use empirical β from median ΔE instead of theoretical.
+            # The theoretical β = 0.55*ln(2)/recall_scale was "optimal" for
+            # older models without KN backoff and with recall_scale=800.
+            # With recall_scale=1600 + KN backoff, the energy distribution is
+            # different, and the beta sweep consistently shows that HIGHER β
+            # (up to 2-5x theoretical) gives better PPL.
+            #
+            # Empirical formula: β = ln(2) * C / median_ΔE where C is chosen
+            # so that exp(-β * median_ΔE) ≈ target_probability.
+            # For good discrimination, we want P(median) ~ 0.01-0.05:
+            #   -ln(0.02) ≈ 3.9, so β = 3.9 / median_ΔE
+            #   -ln(0.01) ≈ 4.6, so β = 4.6 / median_ΔE
+            # We use C = ln(2) * 4.0 / ln(2) = 4.0 → β = 4.0 / median_ΔE
+            # This gives exp(-β*median_ΔE) = exp(-4) ≈ 0.018 — strong discrimination.
+            empirical_beta = 4.0 / max(1, median_delta_e)
+            empirical_beta = max(0.00001, min(1.0, empirical_beta))
+
+            # Use whichever is LARGER (both ensure discrimination, but
+            # empirical adapts to the actual energy distribution)
+            chosen_beta = max(theoretical_beta, empirical_beta)
+
+            print(f"      Theoretical β = {theoretical_beta:.6f}")
+            print(f"      Empirical β = {empirical_beta:.6f} (from median ΔE={median_delta_e})")
+            print(f"      Using β = {chosen_beta:.6f} (max of theoretical & empirical)")
+            return chosen_beta
         else:
             print(f"    v8.0 Recall-Only β calibration: No energy diffs found, using theoretical β = {theoretical_beta:.6f}")
             return max(0.00001, min(1.0, theoretical_beta))
@@ -5947,7 +5967,7 @@ class IsingLMModel:
                 self.beta_word = calibrated_beta
                 # Update the generator's word_sampler with the new β
                 self.generator.word_sampler = IntegerBoltzmannSampler(
-                    beta=self.beta_word, max_delta=35000
+                    beta=self.beta_word, max_delta=50000
                 )
                 print(f"    β_word set to {self.beta_word:.6f} (recall-only calibrated)")
             else:

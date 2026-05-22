@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-v12.1 Training Script — Memory-Safe + PPL-Optimized
+v12.2 Training Script — Extended Beta Sweep + Empirical Calibration
 
-Key improvements over v12:
-  1. CRITICAL FIX: N-gram index capped at 1M sequences (avoids OOM on 3M+ texts)
-     PMI/skip-gram still use full corpus — n-gram stats converge by 1M texts.
-  2. Unbuffered output (PYTHONUNBUFFERED=1) — no more silent nohup hangs
-  3. Memory monitoring (RSS tracking after each training step)
-  4. Proper cache file handling (picks correct cache for requested sample count)
-  5. Topic Spin coherence engine enabled
-  6. Kneser-Ney backoff enabled
-  7. Interpolated n-gram smoothing enabled
-  8. Larger vocab (4000) for better coverage
+Key improvements over v12.1:
+  1. Extended beta sweep range (f=0.5 to 5.0) — previous sweep only went to 1.5,
+     but PPL was still dropping at that point. Two-phase sweep finds the true optimum.
+  2. Empirical β calibration from median ΔE — theoretical β was too low for
+     v12 configs (recall_scale=1600 + KN backoff). Now uses max(theoretical, empirical).
+  3. Boltzmann table max_delta increased to 50K (was capped at 25K, losing discrimination)
+  4. All previous fixes: OOM cap, unbuffered output, memory monitoring, etc.
+
+Previous fixes (v12.1):
+  - CRITICAL FIX: Multi-word prompt tokenization (was causing recalls=0)
+  - CRITICAL FIX: Beta sweep creates NEW sampler per beta (table was cached)
+  - CRITICAL FIX: KN backoff energy scaled 2x for energy discrimination
+  - CRITICAL FIX: Stats key names (recall_hit, copy_used)
+  - N-gram index capped at 1M sequences (avoids OOM on 3M+ texts)
+  - Unbuffered output (PYTHONUNBUFFERED=1) — no more silent nohup hangs
 
 Target: PPL ~20 on Pi (16GB RAM, 4 cores)
 
@@ -161,53 +166,78 @@ def load_data(n_samples: int) -> list:
 
 def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
     """
-    Sweep beta_factor to find optimal PPL.
-    """
-    if beta_factors is None:
-        beta_factors = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.10, 1.20, 1.50]
+    Two-phase beta sweep to find optimal PPL.
     
+    Phase 1: Coarse sweep over wide range (f=0.5 to 5.0)
+    Phase 2: Fine sweep around the best coarse result
+    
+    v12.2: Extended range because previous sweeps showed PPL still
+    dropping at f=1.5 — the optimal beta is much higher than theoretical.
+    """
     import numpy as np
-    from ising_spin.model import LN2_NUM, LN2_DEN
+    from ising_spin.model import LN2_NUM, LN2_DEN, IntegerBoltzmannSampler
     
     recall_scale = model.recall_scale
     base_beta = 0.5 * float(LN2_NUM) / float(LN2_DEN) / recall_scale
     
+    # Phase 1: Coarse sweep over wide range
+    if beta_factors is None:
+        beta_factors = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00, 4.00, 5.00]
+    
     best_ppl = float('inf')
     best_f = 1.0
-    original_beta = model.generator.word_sampler.beta
     
-    print("\nBeta sweep:")
+    print("\nBeta sweep (Phase 1 — coarse):")
     for f in beta_factors:
-        # v12.1 FIX: Must create a NEW IntegerBoltzmannSampler because the
-        # lookup table is built at construction time from beta. Just changing
-        # .beta doesn't rebuild the table — that's why the old sweep was flat.
         new_beta = base_beta * f
-        from ising_spin.model import IntegerBoltzmannSampler
         model.generator.word_sampler = IntegerBoltzmannSampler(
-            beta=new_beta, max_delta=35000
+            beta=new_beta, max_delta=50000
         )
         try:
             ppl = model.compute_perplexity(n_samples=n_seqs)
             marker = " <-- BEST" if ppl < best_ppl else ""
-            print(f"    f={f:.2f}: PPL={ppl:.1f}{marker}")
+            print(f"    f={f:.2f} (β={new_beta:.6f}): PPL={ppl:.1f}{marker}")
             if ppl < best_ppl:
                 best_ppl = ppl
                 best_f = f
         except Exception as e:
             print(f"    f={f:.2f}: Error: {e}")
     
+    # Phase 2: Fine sweep around best coarse result
+    fine_lo = max(0.5, best_f - 0.5)
+    fine_hi = best_f + 0.5
+    fine_factors = np.arange(fine_lo, fine_hi + 0.1, 0.1).tolist()
+    # Remove duplicates with phase 1
+    fine_factors = [f for f in fine_factors if abs(f - best_f) > 0.05 or f == best_f]
+    
+    if len(fine_factors) > 1:
+        print(f"\nBeta sweep (Phase 2 — fine around f={best_f:.2f}):")
+        for f in fine_factors:
+            new_beta = base_beta * f
+            model.generator.word_sampler = IntegerBoltzmannSampler(
+                beta=new_beta, max_delta=50000
+            )
+            try:
+                ppl = model.compute_perplexity(n_samples=n_seqs)
+                marker = " <-- BEST" if ppl < best_ppl else ""
+                print(f"    f={f:.2f} (β={new_beta:.6f}): PPL={ppl:.1f}{marker}")
+                if ppl < best_ppl:
+                    best_ppl = ppl
+                    best_f = f
+            except Exception as e:
+                print(f"    f={f:.2f}: Error: {e}")
+    
     # Restore best beta with a FRESH sampler (table must be rebuilt)
-    from ising_spin.model import IntegerBoltzmannSampler
     model.generator.word_sampler = IntegerBoltzmannSampler(
-        beta=base_beta * best_f, max_delta=35000
+        beta=base_beta * best_f, max_delta=50000
     )
-    print(f"\nBest: f={best_f:.2f}, PPL={best_ppl:.1f}")
+    print(f"\nBest: f={best_f:.2f} (β={base_beta * best_f:.6f}), PPL={best_ppl:.1f}")
     
     return best_f, best_ppl
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v12.1 Training — Memory-Safe + PPL-Optimized")
+    parser = argparse.ArgumentParser(description="v12.2 Training — Extended Beta Sweep + Empirical Calibration")
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
                         help="Number of training samples (default: 500K)")
     parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB,
@@ -238,7 +268,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v12.1 TRAINING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v12.2 TRAINING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()} (CPU count: {os.cpu_count()})", flush=True)
@@ -261,7 +291,7 @@ def main():
     interpolated = not args.no_interpolated
     
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v12.1")
+    print(f"CONFIG: v12.2")
     print(f"  vocab_max_size={args.vocab}")
     print(f"  kn_backoff={kn_backoff}")
     print(f"  interpolated={interpolated}")
@@ -436,7 +466,7 @@ def main():
     print(f"{'=' * 70}")
     
     results = {
-        "version": "v12.1",
+        "version": "v12.2",
         "timestamp": timestamp,
         "config": {
             "vocab_max_size": args.vocab,
