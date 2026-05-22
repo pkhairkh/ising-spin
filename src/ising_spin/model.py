@@ -3933,11 +3933,14 @@ class IsingLM:
         # E_recall(w) = log₂(total/count) * scale for matched words
         # E_recall(w) = max_energy for unmatched words
         # LOWER energy = more likely. This matches the Boltzmann distribution.
+        # v12: For interpolated mode, use context_weight_factor=1 (equal weighting)
+        # Product of experts should weight each level equally, not exponentially
+        _ctx_weight = 1 if self.interpolated else 2
         recall_energies = self.ngram_index.get_recall_bonus(
             context_words=context_words,
             candidate_words=candidate_words,
             recall_scale=self.recall_scale,
-            context_weight_factor=2,
+            context_weight_factor=_ctx_weight,
             longest_only=True,
             interpolated=self.interpolated,
             kn_backoff=self.kn_backoff,
@@ -5623,12 +5626,14 @@ class IsingLMModel:
                 candidate_words = sample_indices.astype(np.int64)
 
                 # Compute RECALL-ONLY energies (no graded, no knowledge, no category)
+                _ctx_weight_ppl = 1 if self.interpolated else 2
                 recall_energies = gen.ngram_index.get_recall_bonus(
                     context_words=context_words,
                     candidate_words=candidate_words,
                     recall_scale=recall_scale,
-                    context_weight_factor=2,
+                    context_weight_factor=_ctx_weight_ppl,
                     longest_only=True,
+                    interpolated=self.interpolated,
                     kn_backoff=self.kn_backoff,
                 )
                 # Add field contribution (always active)
