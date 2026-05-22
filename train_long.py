@@ -425,7 +425,7 @@ Examples:
     t_train = time.time() - t_total_start
     print(f"\nTraining complete: {t_train:.1f}s ({t_train/60:.1f}min)")
     print(f"  Throughput: {n_use/t_train:.0f} samples/sec")
-    print(f"  Vocab size: {len(model.vocabulary)}")
+    print(f"  Vocab size: {len(model.vocab)}")
 
     # Save checkpoint
     save_checkpoint(model, n_use, config, {}, output_dir)
@@ -495,7 +495,7 @@ Examples:
         'training_time_sec': t_train,
         'training_time_min': t_train / 60,
         'throughput_samples_per_sec': n_use / t_train,
-        'vocab_size': len(model.vocabulary),
+        'vocab_size': len(model.vocab),
         'ppl_quick': ppl_quick,
         'ppl_full': ppl_full,
         'best_beta_factor': best_factor,
