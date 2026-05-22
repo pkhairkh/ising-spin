@@ -547,26 +547,54 @@ def main():
     print(f"Samples: {args.n_samples}")
     print(f"Vocab: {args.vocab_size}")
 
-    # Load data
+    # Load data — pick the largest cache file that exists
     cache_path = args.cache
     if cache_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        for candidate in [
-            os.path.join(script_dir, "cached_fineweb_200k.json"),
-            os.path.join(script_dir, "cached_fineweb_50k.json"),
-            os.path.join(script_dir, "cached_fineweb_10k.json"),
-        ]:
-            if os.path.exists(candidate):
-                cache_path = candidate
+        # Find all cached files and pick the largest one
+        cache_candidates = []
+        for fname in os.listdir(script_dir):
+            if fname.startswith("cached_fineweb_") and fname.endswith(".json"):
+                fpath = os.path.join(script_dir, fname)
+                # Extract count from filename like cached_fineweb_200k.json
+                try:
+                    count_str = fname.split("_")[-1].replace(".json", "")
+                    count = int(count_str.replace("k", "000"))
+                    cache_candidates.append((count, fpath))
+                except (ValueError, IndexError):
+                    pass
+
+        # Sort by count descending — prefer largest cache
+        cache_candidates.sort(reverse=True)
+
+        # Use the largest cache that has >= n_samples, or the largest available
+        for count, fpath in cache_candidates:
+            if count >= args.n_samples:
+                cache_path = fpath
                 break
+        if cache_path is None and cache_candidates:
+            cache_path = cache_candidates[0][1]  # Use largest available
 
     if cache_path and os.path.exists(cache_path):
         print(f"Loading: {cache_path}")
         with open(cache_path) as f:
             texts = json.load(f)
         print(f"  {len(texts)} texts loaded")
+
+        # If cache is too small, download more
+        if len(texts) < args.n_samples:
+            print(f"  Cache has {len(texts)} texts but need {args.n_samples}")
+            print(f"  Downloading {args.n_samples} texts from FineWeb-Edu...")
+            texts = load_fineweb_edu(n_samples=args.n_samples)
+            cache_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                f"cached_fineweb_{len(texts)//1000}k.json"
+            )
+            with open(cache_path, 'w') as f:
+                json.dump(texts, f)
+            print(f"  Cached {len(texts)} texts to {cache_path}")
     else:
-        print("Downloading FineWeb-Edu...")
+        print("No cache found. Downloading FineWeb-Edu...")
         texts = load_fineweb_edu(n_samples=args.n_samples)
         cache_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -574,7 +602,7 @@ def main():
         )
         with open(cache_path, 'w') as f:
             json.dump(texts, f)
-        print(f"  Cached to {cache_path}")
+        print(f"  Cached {len(texts)} texts to {cache_path}")
 
     n_use = min(args.n_samples, len(texts))
 

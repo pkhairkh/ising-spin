@@ -363,18 +363,30 @@ Examples:
             print(f"  {k}: {v}")
     print(f"  n_samples: {args.n_samples}")
 
-    # Load data
+    # Load data — pick the largest cache file that exists
     cache_path = args.cache
     if cache_path is None:
-        # Try to find cached data
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        for candidate in [
-            os.path.join(script_dir, "cached_fineweb_200k.json"),
-            os.path.join(script_dir, "cached_fineweb_50k.json"),
-        ]:
-            if os.path.exists(candidate):
-                cache_path = candidate
+        # Find all cached files and pick the largest one
+        cache_candidates = []
+        for fname in os.listdir(script_dir):
+            if fname.startswith("cached_fineweb_") and fname.endswith(".json"):
+                fpath = os.path.join(script_dir, fname)
+                try:
+                    count_str = fname.split("_")[-1].replace(".json", "")
+                    count = int(count_str.replace("k", "000"))
+                    cache_candidates.append((count, fpath))
+                except (ValueError, IndexError):
+                    pass
+        cache_candidates.sort(reverse=True)
+
+        # Use the largest cache that has >= n_samples, or the largest available
+        for count, fpath in cache_candidates:
+            if count >= args.n_samples:
+                cache_path = fpath
                 break
+        if cache_path is None and cache_candidates:
+            cache_path = cache_candidates[0][1]
 
     if cache_path and os.path.exists(cache_path):
         print(f"\nLoading cached data from: {cache_path}")
@@ -382,6 +394,22 @@ Examples:
         with open(cache_path) as f:
             texts = json.load(f)
         print(f"  Loaded {len(texts)} texts in {time.time()-t0:.1f}s")
+
+        # If cache is too small, download more
+        if len(texts) < args.n_samples:
+            print(f"  Cache has {len(texts)} texts but need {args.n_samples}")
+            print(f"  Downloading {args.n_samples} texts from HuggingFace...")
+            from ising_spin.model import load_fineweb_edu
+            t0 = time.time()
+            texts = load_fineweb_edu(n_samples=args.n_samples)
+            print(f"  Downloaded {len(texts)} texts in {time.time()-t0:.1f}s")
+            cache_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                f"cached_fineweb_{len(texts)//1000}k.json"
+            )
+            print(f"  Saving cache to: {cache_path}")
+            with open(cache_path, 'w') as f:
+                json.dump(texts, f)
     else:
         print("\nNo cached data found. Downloading from HuggingFace...")
         print("(This may take a while on first run)")
@@ -390,7 +418,6 @@ Examples:
         texts = load_fineweb_edu(n_samples=args.n_samples)
         print(f"  Downloaded {len(texts)} texts in {time.time()-t0:.1f}s")
 
-        # Cache for future use
         cache_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             f"cached_fineweb_{len(texts)//1000}k.json"
