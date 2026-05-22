@@ -70,6 +70,8 @@ from typing import Dict, List, Optional, Tuple, Set
 
 import scipy.sparse as sp
 
+from .grassmann_flag import GrassmannFlagLayer
+
 
 def _get_rss_mb() -> int:
     """Get current process RSS in MB (0 if unavailable)."""
@@ -3912,6 +3914,7 @@ class IsingLM:
         topic_spin_layer: Optional["TopicSpinLayer"] = None,
         interpolated: bool = False,
         kn_backoff: bool = False,
+        grassmann_flag_layer: Optional[GrassmannFlagLayer] = None,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -3955,6 +3958,9 @@ class IsingLM:
         # v8.2: Topic Spin Layer (Potts coherence)
         self.topic_spin_layer = topic_spin_layer
 
+        # v14.0: Grassmann Flag Layer (flag states + wedge couplings + block memory)
+        self.grassmann_flag_layer = grassmann_flag_layer
+
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=50000)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=50000)
 
@@ -3988,6 +3994,8 @@ class IsingLM:
             'graded_hits': 0,
             'topic_spin_flips': 0, 'topic_coherence_penalties': 0,
             'mcmc_flips_accepted': 0, 'mcmc_flips_proposed': 0,
+            'grassmann_flag_hits': 0, 'grassmann_wedge_hits': 0,
+            'grassmann_memory_hits': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -4187,6 +4195,25 @@ class IsingLM:
             energies += coherence_energy
             if int(np.abs(coherence_energy).max()) > 0:
                 self._stats['topic_coherence_penalties'] += 1
+
+        # === GRASSMANN FLAG ENERGY (v14.0: flag states + wedge + block memory) ===
+        # Three structurally novel energy terms that PMI cannot capture:
+        # 1. Flag state: hierarchical cluster+topic consistency
+        # 2. Wedge coupling: antisymmetric direction-dependent interaction
+        # 3. Block memory: long-range retrieval beyond n-gram window
+        if self.grassmann_flag_layer is not None and self.grassmann_flag_layer.enabled:
+            grassmann_energy = self.grassmann_flag_layer.compute_energy(
+                candidate_words, context_words
+            )
+            energies += grassmann_energy
+            # Track diagnostics
+            gf_stats = self.grassmann_flag_layer.get_diagnostics()
+            if gf_stats.get('flag_cluster_hits', 0) > 0:
+                self._stats['grassmann_flag_hits'] = self._stats.get('grassmann_flag_hits', 0) + 1
+            if gf_stats.get('wedge_coupling_hits', 0) > 0:
+                self._stats['grassmann_wedge_hits'] = self._stats.get('grassmann_wedge_hits', 0) + 1
+            if gf_stats.get('memory_readout_hits', 0) > 0:
+                self._stats['grassmann_memory_hits'] = self._stats.get('grassmann_memory_hits', 0) + 1
 
         # === LOCAL FIELD (unigram frequency) ===
         # v5.0: Field always contributes fully, no damping
@@ -4888,6 +4915,10 @@ class IsingLM:
             self.topic_spin_layer.init_spin(words)
             self.topic_spin_layer.reset_stats()
 
+        # v14.0: Initialize Grassmann flag topic from prompt
+        if self.grassmann_flag_layer is not None and self.grassmann_flag_layer.enabled:
+            self.grassmann_flag_layer.update_topic(words)
+
         for pos in range(1, length):
             # v8.2: Periodic Potts spin-flip for topic coherence
             if (self.topic_spin_layer is not None
@@ -4993,6 +5024,10 @@ class IsingLM:
 
             words.append(chosen_word)
             types.append(chosen_type)
+
+            # v14.0: Update Grassmann flag topic state
+            if self.grassmann_flag_layer is not None and self.grassmann_flag_layer.enabled:
+                self.grassmann_flag_layer.update_topic(words)
 
             self._stats['total_positions'] += 1
             if recall_hit:
@@ -5126,6 +5161,17 @@ class IsingLMModel:
         # PMI/skip-gram still use full corpus — only n-gram index is capped.
         # Set to 0 to disable capping (not recommended for >1M texts).
         ngram_max_sequences: int = 1000000,
+        # v14.0: Grassmann Flag Layer (fundamental new architecture)
+        grassmann_flag_enabled: bool = False,
+        grassmann_n_clusters: int = 64,
+        grassmann_n_topics: int = 16,
+        grassmann_cluster_weight: int = 200,
+        grassmann_topic_weight: int = 300,
+        grassmann_wedge_weight: int = 150,
+        grassmann_max_wedge_distance: int = 5,
+        grassmann_block_size: int = 32,
+        grassmann_max_blocks: int = 500000,
+        grassmann_memory_weight: int = 100,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -5181,6 +5227,18 @@ class IsingLMModel:
         # v12.1: N-gram index sequence cap
         self.ngram_max_sequences = ngram_max_sequences
 
+        # v14.0: Grassmann Flag Layer parameters
+        self.grassmann_flag_enabled = grassmann_flag_enabled
+        self.grassmann_n_clusters = grassmann_n_clusters
+        self.grassmann_n_topics = grassmann_n_topics
+        self.grassmann_cluster_weight = grassmann_cluster_weight
+        self.grassmann_topic_weight = grassmann_topic_weight
+        self.grassmann_wedge_weight = grassmann_wedge_weight
+        self.grassmann_max_wedge_distance = grassmann_max_wedge_distance
+        self.grassmann_block_size = grassmann_block_size
+        self.grassmann_max_blocks = grassmann_max_blocks
+        self.grassmann_memory_weight = grassmann_memory_weight
+
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
         self.J: Optional[sp.csr_matrix] = None
@@ -5193,6 +5251,7 @@ class IsingLMModel:
         self.walsh_layer: Optional[WalshSpectralLayer] = None
         self.graded_couplings: Optional[GradedCouplings] = None
         self.topic_spin_layer: Optional[TopicSpinLayer] = None
+        self.grassmann_flag_layer: Optional[GrassmannFlagLayer] = None
         self.generator: Optional[IsingLM] = None
         self.baseline_generator: Optional[IsingLM] = None
         self.sequences: Optional[List[List[int]]] = None
@@ -5504,6 +5563,34 @@ class IsingLMModel:
         else:
             print("\n[11/13] Skipping Topic Spin Layer (disabled)")
             self.topic_spin_layer = None
+
+        # Step 11b: Build Grassmann Flag Layer (v14.0: fundamental new architecture)
+        if self.grassmann_flag_enabled:
+            print("\n[11b/13] Building Grassmann Flag Layer...")
+            self.grassmann_flag_layer = GrassmannFlagLayer(
+                n_clusters=self.grassmann_n_clusters,
+                n_topics=self.grassmann_n_topics,
+                cluster_weight=self.grassmann_cluster_weight,
+                topic_weight=self.grassmann_topic_weight,
+                wedge_weight=self.grassmann_wedge_weight,
+                max_wedge_distance=self.grassmann_max_wedge_distance,
+                block_size=self.grassmann_block_size,
+                max_blocks=self.grassmann_max_blocks,
+                memory_weight=self.grassmann_memory_weight,
+                enabled=True,
+            )
+            # Build from training sequences
+            word_freq = np.zeros(len(self.vocab), dtype=np.int64)
+            for seq in self.sequences:
+                for w in seq:
+                    if w < len(self.vocab):
+                        word_freq[w] += 1
+            self.grassmann_flag_layer.build(
+                self.sequences, len(self.vocab), word_freq
+            )
+        else:
+            print("\n[11b/13] Skipping Grassmann Flag Layer (disabled)")
+            self.grassmann_flag_layer = None
 
         # Step 12: Build generators
         print("\n[12/13] Building generators...")
@@ -5952,6 +6039,7 @@ class IsingLMModel:
             walsh_weight=self.walsh_weight,
             graded_couplings=self.graded_couplings,
             topic_spin_layer=self.topic_spin_layer,
+            grassmann_flag_layer=self.grassmann_flag_layer,
             interpolated=self.interpolated,
             kn_backoff=self.kn_backoff,
         )
