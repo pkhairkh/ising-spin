@@ -1,5 +1,21 @@
+# Data caches (too large for git)
+cached_fineweb_*.json
 *.npy
 data/
+
+# Python bytecode
 *.pyc
-cached_fineweb_200k.json
-cached_fineweb_50k.json
+__pycache__/
+*.pyo
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

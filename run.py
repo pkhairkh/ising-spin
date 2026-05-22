@@ -1,416 +1,258 @@
 #!/usr/bin/env python3
 """
-Ising Spin Glass Language Model — Runner v8.1.
-Thorough Training with FineWeb-Edu (50K samples, 5K vocab).
+Ising Spin Glass Language Model — Main Runner
+==============================================
 
-Recall-Primary Architecture: Recall energy E = log₂(1/P) * scale IS the
-correct Boltzmann energy. With β ≈ 0.85*ln(2)/recall_scale, Boltzmann
-recovers n-gram probabilities. All other layers HURT PPL and are DISABLED.
+Best known configuration (v11.7): PPL=51.54
 
-PPL progression:
-  v7.0 (6-layer, 20K): PPL = 3.2e22 (catastrophic)
-  v8.0 (recall-only, 20K): PPL = 183
-  v8.1 (recall-only, 50K, 5K vocab): PPL = 112
-  v8.1 (recall-only, 50K, 4K vocab): PPL = 91
+Architecture:
+  - 200K FineWeb-Edu training samples
+  - 2K vocabulary (min_freq=25)
+  - 5-gram recall index (min_count=2)
+  - PMI backoff (weight=5)
+  - Recall-primary energy: E = log2(1/P) * recall_scale
+  - scale=1600, same_word_penalty=200
+  - β calibrated via sweep (typically ~0.9 * ln2/scale)
+  - Integer-only Boltzmann sampling (ZERO float ops in inference)
 
-Architecture (RECALL is PRIMARY, all others DISABLED):
-  Layer 1: N-gram Recall + Local Field (PRIMARY — encodes -log₂ P_ngram)
-  Layer 1b: Graded Couplings (DISABLED — redundant with recall)
-  Layer 2-5: Knowledge/Category/Logic (DISABLED — hurt PPL)
-
-v8.1 changes from v8.0:
-  - 50K training samples (was 20K)
-  - Smaller vocab (5000, min_freq=15) for better n-gram density
-  - Skip PMI/skip-gram computation when not needed (saves ~30s)
-  - Skip knowledge/category/logic building when scales=0
-  - Longer sequences (max_len=30)
-  - β = 0.85*ln(2)/recall_scale (empirically optimal)
+Usage:
+  python run.py                    # Full train + eval + generate
+  python run.py --eval-only        # Skip training (requires cache)
+  python run.py --generate-only    # Only generate text
 """
 
 import sys
 import os
 import time
+import json
+import argparse
+
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-
 from ising_spin.model import (
-    IsingLMModel, IsingLM, KnowledgeLayer, CategoryLayer, MarkovLogicLayer,
-    WalshSpectralLayer, GradedCouplings, POS2IDX, IDX2POS
+    IsingLMModel, IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 )
 
 
-def evaluate_quality(texts, n_eval):
-    """Evaluate text quality metrics."""
-    metrics = {
-        'n_of_the_loops': 0,
-        'n_double_dets': 0,
-        'n_same_word_reps': 0,
-        'total_words': 0,
-        'unique_words': set(),
-    }
+# ============================================================================
+# Best Configuration (v11.7 — PPL=51.54)
+# ============================================================================
 
-    for text in texts:
-        words = text.split()
-        metrics['total_words'] += len(words)
-        metrics['unique_words'].update(words)
+BEST_CONFIG = dict(
+    # Vocabulary
+    vocab_min_freq=25,
+    vocab_max_size=2000,
 
-        if "of the of the" in text:
-            metrics['n_of_the_loops'] += 1
+    # N-gram index
+    ngram_max_n=5,
+    ngram_min_count=2,
 
-        for i in range(len(words) - 1):
-            if words[i] in {"the", "a", "an"} and words[i+1] in {"the", "a", "an"}:
-                metrics['n_double_dets'] += 1
+    # Energy scales
+    recall_scale=1600,
+    pmi_weight=5,
+    field_weight=1,
+    knowledge_scale=0,
+    spin3_scale=0,
+    category_scale=0,
+    logic_rule_scale=0,
+    logic_hard_scale=0,
 
-        for i in range(len(words) - 1):
-            if words[i] == words[i+1] and len(words[i]) > 2:
-                metrics['n_same_word_reps'] += 1
+    # Sampling
+    beta_type=0.001,
+    beta_word=0.001,
+    copy_enabled=True,
+    copy_min_context=2,
+    copy_min_confidence=0.25,
+    same_word_penalty=200,
+    max_closed_class_run=2,
 
-    metrics['unique_words'] = len(metrics['unique_words'])
-    metrics['type_token_ratio'] = metrics['unique_words'] / max(1, metrics['total_words'])
-    return metrics
+    # Ising
+    ising_enabled=True,
+    skip_pmi_max_dist=5,
+    mcmc_refine_steps=0,
+
+    # Disabled features
+    use_conceptnet=False,
+    walsh_enabled=False,
+    graded_couplings_enabled=False,
+    auto_calibrate_beta=False,
+    recall_primary_mode=True,
+    interpolated=False,
+    kn_backoff=False,
+    topic_spin_enabled=False,
+)
+
+BEST_N_SAMPLES = 200000
+CACHE_PATH = os.path.join(os.path.dirname(__file__), "cached_fineweb_200k.json")
 
 
-def run_ablation(model, prompts, length=20):
-    """Run ablation study: Ising ON vs Ising OFF."""
+# ============================================================================
+# Utilities
+# ============================================================================
+
+def load_training_data(path=CACHE_PATH):
+    """Load cached FineWeb-Edu training data."""
+    if not os.path.exists(path):
+        print(f"Cache not found at {path}")
+        print("Run: python cache_200k.py   to download and cache data")
+        sys.exit(1)
+    with open(path) as f:
+        texts = json.load(f)
+    print(f"Loaded {len(texts)} texts from {path}")
+    return texts
+
+
+def beta_sweep(model, n_seqs=20, factors=None):
+    """Sweep β factor to find optimal PPL."""
+    if factors is None:
+        factors = [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.1, 1.2, 1.5]
+
+    gen = model.generator
+    recall_scale = model.recall_scale
+    best_ppl = float('inf')
+    best_factor = 0.9
+    results = {}
+
+    for factor in factors:
+        beta_val = factor * LN2_NUM / (recall_scale * LN2_DEN)
+        sampler = IntegerBoltzmannSampler(beta=beta_val, max_delta=25000)
+        total_log2_prob = 0
+        total_tokens = 0
+        for seq in model.test_sequences[:n_seqs]:
+            if len(seq) < 3:
+                continue
+            for pos in range(1, len(seq)):
+                target_word = seq[pos]
+                context_words = seq[:pos]
+                context_types = [gen._get_word_type(w) for w in context_words]
+                word_type = gen._get_word_type(target_word)
+                candidate_list = gen.type_words.get(word_type, [])
+                if not candidate_list:
+                    continue
+                candidate_words = np.array(candidate_list, dtype=np.int64)
+                if int(target_word) not in set(candidate_words.tolist()):
+                    total_log2_prob += -15 * LOG2_SCALE
+                    total_tokens += 1
+                    continue
+                recall_matches = gen.ngram_index.lookup(context_words)
+                recall_hit = bool(recall_matches)
+                energies = gen._compute_word_energy(
+                    pos, candidate_words, word_type,
+                    context_words, context_types, recall_hit
+                )
+                log_probs = sampler.compute_log_probabilities(energies)
+                target_idx = np.where(candidate_words == target_word)[0]
+                if len(target_idx) > 0:
+                    total_log2_prob += int(log_probs[target_idx[0]])
+                else:
+                    total_log2_prob += -15 * LOG2_SCALE
+                total_tokens += 1
+        if total_tokens > 0:
+            avg_log2 = total_log2_prob / (total_tokens * LOG2_SCALE)
+            ppl_val = 2.0 ** (-avg_log2)
+            results[factor] = ppl_val
+            marker = " <-- BEST" if ppl_val < best_ppl else ""
+            print(f"  f={factor:.2f}: PPL={ppl_val:.1f}{marker}")
+            if ppl_val < best_ppl:
+                best_ppl = ppl_val
+                best_factor = factor
+
+    return best_ppl, best_factor, results
+
+
+def apply_best_beta(model, factor):
+    """Apply the best β factor found by sweep."""
+    recall_scale = model.recall_scale
+    beta_val = factor * LN2_NUM / (recall_scale * LN2_DEN)
+    model.generator.word_sampler = IntegerBoltzmannSampler(beta=beta_val, max_delta=25000)
+    model.generator.beta_word = beta_val
+    model.beta_word = beta_val
+
+
+def generate_and_save(model, ppl_val, best_factor, results):
+    """Generate 400-token texts and save to download directory."""
     print("\n" + "=" * 70)
-    print("ABLATION STUDY: Ising ON vs Ising OFF")
+    print(f"GENERATING 400 TOKENS (PPL={ppl_val:.2f})")
     print("=" * 70)
-    print("\n  v8.0: Both use energy-only pipeline (no overrides).")
-    print("  Ising OFF: PMI=0 + graded OFF, but knowledge + category + logic still active (as perturbations).\n")
 
-    ising_texts = []
-    baseline_texts = []
-    ising_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0, 'knowledge_hits': 0}
-    baseline_stats = {'recall_hit': 0, 'pmi_only': 0, 'total': 0, 'knowledge_hits': 0}
+    prompts = ["the history of", "science and technology", "research shows that"]
+    gen_results = {}
 
     for prompt in prompts:
-        result_ising = model.generator.generate(prompt=prompt, length=length)
-        ising_texts.append(result_ising['text'])
-        for d in result_ising['diagnostics']:
-            ising_stats['total'] += 1
-            if d['recall_hit']:
-                ising_stats['recall_hit'] += 1
-            else:
-                ising_stats['pmi_only'] += 1
+        result = model.generator.generate(prompt=prompt, length=400)
+        text = result['text']
+        words = text.split()
+        n_recalls = sum(1 for d in result['diagnostics'] if d['recall_hit'])
+        n_copies = sum(1 for d in result['diagnostics'] if d['copy'])
+        print(f"\n--- '{prompt}' ({len(words)} words) ---")
+        print(text)
+        print(f"  recalls={n_recalls} copies={n_copies}")
+        gen_results[prompt] = result
 
-        result_baseline = model.baseline_generator.generate(prompt=prompt, length=length)
-        baseline_texts.append(result_baseline['text'])
-        for d in result_baseline['diagnostics']:
-            baseline_stats['total'] += 1
-            if d['recall_hit']:
-                baseline_stats['recall_hit'] += 1
-            else:
-                baseline_stats['pmi_only'] += 1
+    # Save primary output
+    result = gen_results[prompts[0]]
+    text = result['text']
+    words = text.split()
+    output_path = "/home/z/my-project/download/ising_v11_400tokens.txt"
+    with open(output_path, 'w') as f:
+        f.write(f"Ising Spin Glass Language Model v11.7 — 400-Token Generation\n")
+        f.write(f"Config: 200K data + 2K vocab + PMI=5 + scale=1600 + max_len=30\n")
+        f.write(f"PPL: {ppl_val:.2f}\n")
+        f.write(f"Prompt: {prompts[0]}\n")
+        f.write(f"Training: 200K FineWeb-Edu samples\n")
+        f.write(f"Integer-only: YES (ZERO float operations in inference)\n")
+        f.write(f"beta factor: {best_factor:.2f}\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(text)
+        f.write(f"\n\n--- beta Sweep ---\n")
+        for factor in sorted(results.keys()):
+            f.write(f"  f={factor:.2f}: PPL={results[factor]:.1f}\n")
+    print(f"\nSaved to: {output_path}")
+    return gen_results
 
-        print(f"  Prompt: '{prompt}'")
-        print(f"  Ising ON:  {result_ising['text']}")
-        print(f"  Ising OFF: {result_baseline['text']}")
 
-    # Quality metrics
-    ising_quality = evaluate_quality(ising_texts, len(prompts))
-    baseline_quality = evaluate_quality(baseline_texts, len(prompts))
-
-    print("\n" + "-" * 50)
-    print("ABLATION RESULTS:")
-    print("-" * 50)
-    print(f"\n  {'Metric':<30} {'Ising ON':>12} {'Ising OFF':>12}")
-    print(f"  {'-'*30} {'-'*12} {'-'*12}")
-    print(f"  {'Recall hit rate':<30} {ising_stats['recall_hit']/max(1,ising_stats['total']):>11.1%} "
-          f"{baseline_stats['recall_hit']/max(1,baseline_stats['total']):>11.1%}")
-    print(f"  {'PMI-only rate':<30} {ising_stats['pmi_only']/max(1,ising_stats['total']):>11.1%} "
-          f"{baseline_stats['pmi_only']/max(1,baseline_stats['total']):>11.1%}")
-    print(f"  {'Unique words':<30} {ising_quality['unique_words']:>12} {baseline_quality['unique_words']:>12}")
-    print(f"  {'Type-token ratio':<30} {ising_quality['type_token_ratio']:>12.3f} "
-          f"{baseline_quality['type_token_ratio']:>12.3f}")
-    print(f"  {'Same-word reps':<30} {ising_quality['n_same_word_reps']:>12} {baseline_quality['n_same_word_reps']:>12}")
-
-    return ising_texts, baseline_texts
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    print("=" * 70)
-    print("ISING SPIN GLASS LANGUAGE MODEL (v8.1 — Thorough Training)")
-    print("=" * 70)
-    print()
-    print("6-Layer Architecture (RECALL is PRIMARY):")
-    print("  Layer 1: PMI Couplings + Local Field (legacy fallback)")
-    print("  Layer 1b: Graded Couplings (DISABLED — redundant with recall)")
-    print("  Layer 2: Knowledge External Field h_knowledge[w] (≤10% recall)")
-    print("  Layer 3: 3-Spin Couplings J3[(s,p)] (≤10% recall)")
-    print("  Layer 4: Category Couplings (≤5% recall)")
-    print("  Layer 5: Markov Logic Penalty (≤5% recall)")
-    print()
-    print("v8.0: Recall-Primary Architecture")
-    print("  E_recall = log₂(1/P) * scale → correct Boltzmann energy")
-    print("  β ≈ 0.85*ln(2)/recall_scale → empirically optimal")
-    print("  All other layers: SMALL perturbations (≤10% of recall)")
-    print("  Graded couplings DISABLED (redundant with recall)")
-    print("  PPL ≈ 112 on 50K/5K-vocab (optimal β ≈ 0.85*ln(2)/scale)")
-    print()
+    parser = argparse.ArgumentParser(description="Ising Spin Language Model")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training")
+    parser.add_argument("--generate-only", action="store_true", help="Only generate text")
+    parser.add_argument("--n-samples", type=int, default=BEST_N_SAMPLES, help="Training samples")
+    parser.add_argument("--n-eval", type=int, default=100, help="Eval sequences")
+    parser.add_argument("--n-sweep", type=int, default=20, help="Sweep eval sequences")
+    args = parser.parse_args()
 
     t0 = time.time()
 
-    model = IsingLMModel(
-        # Vocabulary — v8.1: Smaller, cleaner vocab for better n-gram density
-        vocab_min_freq=15,           # Higher threshold → cleaner vocab → lower PPL
-        vocab_max_size=5000,         # 8000 → 5000: better n-gram coverage per word
+    # Train
+    model = IsingLMModel(**BEST_CONFIG)
 
-        # N-gram and PMI settings
-        ngram_max_n=5,
-        ngram_min_count=2,           # Higher min_count for better n-gram quality
-        pmi_window=5,
-        pmi_min_count=2,
-        pmi_cap=10,
+    if not args.generate_only:
+        texts = load_training_data()
+        print(f"\nTraining on {args.n_samples} samples...")
+        model.train(n_samples=args.n_samples, texts=texts)
+        print(f"\nTraining: {time.time()-t0:.1f}s")
 
-        # Energy scales — v8.0: Recall is PRIMARY, all others are perturbations
-        # Recall encodes -log₂ P_ngram directly — the CORRECT Boltzmann energy
-        # Knowledge/Spin3/Category/Logic are SMALL perturbations
-        recall_scale=800,            # PRIMARY: encodes -log₂ P_ngram
-        pmi_weight=0,                # v8.0: PMI disabled (redundant with recall)
-        field_weight=1,              # Unigram field
-        knowledge_scale=0,           # v8.0: DISABLED (hurts PPL — recall is enough)
-        spin3_scale=0,               # v8.0: DISABLED (hurts PPL — recall is enough)
-        category_scale=0,            # v8.0: DISABLED (hurts PPL — recall is enough)
-        logic_rule_scale=0,          # v8.0: DISABLED (hurts PPL — recall is enough)
-        logic_hard_scale=0,          # v8.0: DISABLED (hurts PPL — recall is enough)
+    # β sweep
+    print("\nβ sweep:")
+    best_ppl, best_factor, results = beta_sweep(model, n_seqs=args.n_sweep)
+    print(f"\nBEST: f={best_factor:.2f}, PPL={best_ppl:.1f}")
 
-        # Sampling parameters — β will be recall-only calibrated
-        beta_type=0.001,
-        beta_word=0.001,             # Will be overridden by recall-only calibration
-        copy_enabled=True,
-        copy_min_context=2,
-        copy_min_confidence=0.25,
-        same_word_penalty=500,            # v8.0: Reduced from 50000 (huge penalty hurt PPL by +93)
-        max_closed_class_run=2,
-        ising_enabled=False,         # v8.0: PMI redundant with recall
-        skip_pmi_max_dist=5,
+    # Apply best β
+    apply_best_beta(model, best_factor)
 
-        # v8.0: MCMC refinement DISABLED (hurts PPL — adds noise to recall distribution)
-        mcmc_refine_steps=0,
+    # Full PPL
+    ppl_full = model.compute_perplexity(n_samples=args.n_eval)
+    print(f"\nPPL (full, {args.n_eval} seqs): {ppl_full:.2f}")
 
-        # ConceptNet
-        use_conceptnet=False,        # v8.0: DISABLED (knowledge hurts PPL)
+    # Generate
+    generate_and_save(model, ppl_full, best_factor, results)
 
-        # v6.0: Walsh-Hadamard spectral couplings (DISABLED)
-        walsh_enabled=False,
-        walsh_subspace_rank=64,
-        walsh_max_order=2,
-        walsh_weight=1,
-        walsh_min_coeff=3,
-
-        # v7.0: Graded Couplings — DISABLED in v8.0 (redundant with recall)
-        graded_couplings_enabled=False,
-        coupling_scale=1000,
-        trigram_scale=2000,
-        auto_calibrate_beta=True,
-
-        # v8.0: Recall-primary mode — enforces scale hierarchy
-        recall_primary_mode=True,
-    )
-
-    model.train(n_samples=50000)
-
-    t_train = time.time() - t0
-    print(f"\nTraining time: {t_train:.1f}s")
-
-    # ======================================================================
-    # PHASE 1: Quick generation test
-    # ======================================================================
-    print("\n" + "=" * 70)
-    print("QUICK GENERATION TEST (v8.1 — Recall-Primary, 50K Training)")
-    print("=" * 70)
-
-    prompts = ["the", "a", "in", "science", "research", "students", "he",
-               "to", "of", "for", "education", "we", "this", "dog",
-               "water", "fire", "school", "city", "animal", "food"]
-
-    for prompt in prompts:
-        result = model.generator.generate(prompt=prompt, length=15)
-        text = result['text']
-        n_copies = sum(1 for d in result['diagnostics'] if d['copy'])
-        n_recalls = sum(1 for d in result['diagnostics'] if d['recall_hit'])
-        n_pmi = sum(1 for d in result['diagnostics'] if not d['recall_hit'])
-        flag = " LOOP" if "of the of the" in text else ""
-        print(f"  '{prompt}' -> {text}{flag}")
-        print(f"           recalls={n_recalls} pmi_only={n_pmi} copies={n_copies}")
-
-    # ======================================================================
-    # PHASE 2: 5-Layer Knowledge Test
-    # ======================================================================
-    print("\n" + "=" * 70)
-    print("6-LAYER KNOWLEDGE TEST (Recall-Primary, Small Perturbations)")
-    print("=" * 70)
-    print("\n  v8.0: All 6 Layers ON vs Knowledge Layers OFF")
-    print("  Knowledge = small perturbation (≤10% of recall_scale).\n")
-
-    # Knowledge layer diagnostics
-    kl = model.knowledge_layer
-    cl = model.category_layer
-    ml = model.markov_logic_layer
-
-    print(f"  Layer 2+3 (Knowledge):")
-    print(f"    Total triples: {kl.n_triples}")
-    print(f"    Unique subjects: {kl.n_unique_subjects}")
-    print(f"    J3 entries: {len(kl.J3)}")
-    print(f"    h_knowledge non-zero: {int(np.count_nonzero(kl.h_knowledge))}")
-    print(f"    h_knowledge max: {int(kl.h_knowledge.max())}")
-    
-    print(f"\n  Layer 4 (Category):")
-    print(f"    Categories: {cl.n_categories}")
-    print(f"    Categorized words: {cl.n_categorized_words}")
-    
-    print(f"\n  Layer 5 (Markov Logic):")
-    print(f"    Total rules: {ml.n_rules} ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
-
-    # Graded couplings diagnostics
-    if model.graded_couplings is not None:
-        gc = model.graded_couplings
-        print(f"\n  Layer 1b (Graded Couplings):")
-        print(f"    J₂ non-zero: {gc.J2.nnz:,}")
-        if gc.J2.nnz > 0:
-            print(f"    J₂ range: [{int(gc.J2.data.min())}, {int(gc.J2.data.max())}]")
-            print(f"    J₂ mean (non-zero): {int(gc.J2.data.mean())}")
-        n_j3 = sum(len(v) for v in gc.J3.values())
-        print(f"    J₃ entries: {n_j3:,} in {len(gc.J3):,} contexts")
-        print(f"    IDF range: [{int(gc.idf.min())}, {int(gc.idf.max())}]")
-    else:
-        print(f"\n  Layer 1b (Graded Couplings): DISABLED (redundant with recall)")
-
-    # Test with knowledge-triggering prompts
-    knowledge_prompts = [
-        "the dog", "water can", "the sun", "paris is",
-        "the bird", "fish in", "the teacher", "the student",
-        "science is", "fire and", "ice is", "the book",
-        "education is", "research is", "school is",
-        "the doctor", "the cat", "the horse", "mountain is",
-        "ocean is", "the forest", "the library", "the kitchen",
-    ]
-
-    print(f"\n  {'Prompt':<20} {'6-Layers ON':<55} {'Knowledge OFF':<55}")
-    print(f"  {'-'*20} {'-'*55} {'-'*55}")
-
-    knowledge_on_texts = []
-    knowledge_off_texts = []
-
-    for prompt in knowledge_prompts:
-        # All 6 Layers ON
-        result_on = model.generator.generate(prompt=prompt, length=15)
-        text_on = result_on['text']
-        knowledge_on_texts.append(text_on)
-
-        # Knowledge Layers OFF
-        result_off = model.knowledge_off_generator.generate(prompt=prompt, length=15)
-        text_off = result_off['text']
-        knowledge_off_texts.append(text_off)
-
-        print(f"  {prompt:<20} {text_on[:53]:<55} {text_off[:53]:<55}")
-
-    # Get stats
-    on_stats = model.generator.get_stats()
-    off_stats = model.knowledge_off_generator.get_stats()
-
-    print(f"\n  6-Layers ON stats:")
-    print(f"    Recall hit rate: {on_stats['recall_hit_rate']:.1%}")
-    print(f"    PMI-only rate: {on_stats['pmi_only_rate']:.1%}")
-    print(f"    Knowledge hits: {on_stats.get('knowledge_hits', 0)}")
-    print(f"    3-Spin firings: {on_stats.get('spin3_firings', 0)}")
-    print(f"    Category hits: {on_stats.get('category_hits', 0)}")
-    print(f"    Logic hits: {on_stats.get('logic_hits', 0)}")
-    print(f"    Graded hits: {on_stats.get('graded_hits', 0)}")
-    print(f"    MCMC accept rate: {on_stats.get('mcmc_accept_rate', 0):.1%}")
-
-    print(f"\n  Knowledge OFF stats:")
-    print(f"    Recall hit rate: {off_stats['recall_hit_rate']:.1%}")
-    print(f"    PMI-only rate: {off_stats['pmi_only_rate']:.1%}")
-
-    # ======================================================================
-    # PHASE 3: Beam generation test
-    # ======================================================================
-    print("\n" + "=" * 70)
-    print("BEAM GENERATION (Global Energy Coherence)")
-    print("=" * 70)
-
-    for prompt in ["the", "science", "the dog"]:
-        beam_result = model.generate_beam(prompt=prompt, length=15, n_beams=3)
-        print(f"\n  Prompt: '{prompt}'")
-        print(f"  Best (energy={beam_result['beam_energy']}): {beam_result['text']}")
-        print(f"  All candidates:")
-        for c in beam_result['all_candidates']:
-            marker = " <-- BEST" if c['energy'] == beam_result['beam_energy'] else ""
-            print(f"    energy={c['energy']:>6}: {c['text']}{marker}")
-
-    # ======================================================================
-    # PHASE 4: Ablation study
-    # ======================================================================
-    ablation_prompts = ["the", "science", "research", "students", "education",
-                        "to", "of", "in", "for", "he", "they", "this", "that",
-                        "dog", "water", "fire", "school", "city"]
-    run_ablation(model, ablation_prompts, length=20)
-
-    # ======================================================================
-    # PHASE 5: Perplexity evaluation
-    # ======================================================================
-    print("\n" + "=" * 70)
-    print("PERPLEXITY EVALUATION")
-    print("=" * 70)
-
-    ppl = model.compute_perplexity(n_samples=50)
-    print(f"  Final Perplexity: {ppl:.2f}")
-
-    # ======================================================================
-    # Summary
-    # ======================================================================
-    stats = model.generator.get_stats()
-
-    print("\n" + "=" * 70)
-    print("SUMMARY — v8.1 Recall-Primary + Thorough Training")
-    print("=" * 70)
-    print(f"\n  Architecture: Ising Spin Glass (v8.1 — Recall-Primary, 50K Training)")
-    print(f"  Pipeline: Energy → Boltzmann → MCMC refinement")
-    print(f"  Overrides: NONE (knowledge through Hamiltonian only)")
-    print(f"\n  Layer 1: PMI couplings + local field (legacy fallback)")
-    print(f"  Layer 1b: Graded Couplings — DISABLED (redundant with recall)")
-    print(f"  Layer 2: Knowledge external field (h_knowledge) — ≤10% recall")
-    print(f"  Layer 3: 3-Spin couplings (J3 SPO triples) — ≤10% recall")
-    print(f"  Layer 4: Category couplings (hypernym-based) — ≤5% recall")
-    print(f"  Layer 5: Markov logic penalties (factual consistency) — ≤5% recall")
-    print(f"\n  Integer-only: YES (lookup-table Boltzmann, no np.exp)")
-    print(f"  Sparse PMI: YES (scipy.sparse.csr_matrix)")
-    print(f"  MCMC refinement: YES ({model.mcmc_refine_steps} passes)")
-    print(f"  Graded couplings: {'YES' if model.graded_couplings is not None else 'NO (disabled — redundant with recall)'}")
-    print(f"  Recall-primary mode: {'YES' if model.recall_primary_mode else 'NO'}")
-    print(f"  β_word (recall-only calibrated): {model.beta_word:.6f}")
-    print(f"\n  Scale hierarchy (recall-primary):")
-    print(f"    recall_scale=     {model.recall_scale:>6}  [PRIMARY]")
-    print(f"    knowledge_scale=  {model.knowledge_scale:>6}  [{model.knowledge_scale/model.recall_scale:.0%} of recall]")
-    print(f"    spin3_scale=      {model.spin3_scale:>6}  [{model.spin3_scale/model.recall_scale:.0%} of recall]")
-    print(f"    category_scale=   {model.category_scale:>6}  [{model.category_scale/model.recall_scale:.0%} of recall]")
-    print(f"    logic_rule_scale= {model.logic_rule_scale:>6}  [{model.logic_rule_scale/model.recall_scale:.0%} of recall]")
-    print(f"\n  Knowledge Layer: {kl.n_triples} triples, {len(kl.J3)} J3 entries")
-    print(f"  Category Layer: {cl.n_categories} categories, {cl.n_categorized_words} words")
-    print(f"  Logic Layer: {ml.n_rules} rules ({ml.n_soft_rules} soft, {ml.n_hard_rules} hard)")
-    if model.graded_couplings is not None:
-        gc = model.graded_couplings
-        n_j3 = sum(len(v) for v in gc.J3.values())
-        print(f"  Graded Layer: J₂={gc.J2.nnz:,} non-zero, J₃={n_j3:,} entries")
-    print(f"\n  Generation statistics:")
-    print(f"    Recall hit rate: {stats['recall_hit_rate']:.1%}")
-    print(f"    PMI-only rate: {stats['pmi_only_rate']:.1%}")
-    print(f"    Copy rate: {stats['copy_rate']:.1%}")
-    print(f"    Knowledge hits: {stats.get('knowledge_hits', 0)}")
-    print(f"    3-Spin firings: {stats.get('spin3_firings', 0)}")
-    print(f"    Category hits: {stats.get('category_hits', 0)}")
-    print(f"    Logic hits: {stats.get('logic_hits', 0)}")
-    print(f"    Graded hits: {stats.get('graded_hits', 0)}")
-    print(f"    MCMC accept rate: {stats.get('mcmc_accept_rate', 0):.1%}")
-    print(f"    Ising enabled: {stats['ising_enabled']}")
-    print(f"\n  Perplexity: {ppl:.2f}")
-
-    t_total = time.time() - t0
-    print(f"\nTotal time: {t_total:.1f}s")
-
-    return model
+    total_time = time.time() - t0
+    print(f"\nTotal: {total_time:.1f}s ({total_time/60:.1f}min)")
 
 
 if __name__ == "__main__":

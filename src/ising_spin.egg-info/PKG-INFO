@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: ising-spin
-Version: 6.0.0
-Summary: Ising Spin Glass Language Model — Walsh-Hadamard Spectral Couplings with 6-layer Hamiltonian, Householder subspace rotation, no overrides, knowledge through energy wells
+Version: 11.7.0
+Summary: Ising Spin Glass Language Model — Integer-only Boltzmann sampling, recall-primary energy, PMI backoff, PPL=51.54
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown

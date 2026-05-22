@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ising-spin"
-version = "6.0.0"
-description = "Ising Spin Glass Language Model — Walsh-Hadamard Spectral Couplings with 6-layer Hamiltonian, Householder subspace rotation, no overrides, knowledge through energy wells"
+version = "11.7.0"
+description = "Ising Spin Glass Language Model — Integer-only Boltzmann sampling, recall-primary energy, PMI backoff, PPL=51.54"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
