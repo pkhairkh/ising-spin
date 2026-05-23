@@ -71,9 +71,9 @@ class IsingLMGenerator:
         interpolated: bool = True,
         kn_backoff: bool = True,
         recall_scale: int = 1600,
-        pos_recall_scale: int = 800,
-        topic_recall_scale: int = 400,
-        state_scale: int = 200,
+        pos_recall_scale: int = 800,   # v17.2: increased from 800
+        topic_recall_scale: int = 400, # v17.2: increased from 400
+        state_scale: int = 50,         # v17.2: reduced from 200
     ):
         self.vocab = vocab
         self.pos_system = pos_system
@@ -152,6 +152,10 @@ class IsingLMGenerator:
             'same_word_blocked': 0,
             'closed_loop_blocked': 0,
             'state_energy_sum': 0,
+            # v17.2: Track highest n-gram order for each scale
+            'word_max_n': 0,
+            'pos_max_n': 0,
+            'topic_max_n': 0,
         }
 
     # ===================================================================
@@ -349,9 +353,11 @@ class IsingLMGenerator:
             candidate_words = np.array(candidate_list, dtype=np.int64)
 
             # Top-k filtering by field strength (unigram frequency)
+            # h[w] = floor(log2(total/count(w))): LOWER h = more common = more likely
+            # We want the most common (most likely) candidates, so take LOWEST h values
             if len(candidate_words) > 300:
                 field_vals = self.h[candidate_words]
-                top_k = np.argsort(field_vals)[-300:]
+                top_k = np.argsort(field_vals)[:300]  # 300 most COMMON words
                 candidate_words = candidate_words[top_k]
 
             # === STEP 4: Compute energy ===
@@ -411,18 +417,25 @@ class IsingLMGenerator:
             if self.word_index is not None:
                 recall_matches = self.word_index.lookup(words[:-1])
                 recall_hit = bool(recall_matches)
+                if recall_matches:
+                    best_k = max(recall_matches.keys())
+                    self._stats['word_max_n'] = max(self._stats['word_max_n'], best_k)
             if recall_hit:
                 self._stats['recall_hit'] += 1
-            # Track POS recall hits
+            # Track POS recall hits with n-gram order
             if self.multiscale_recall.pos_index is not None:
                 pos_matches = self.multiscale_recall.pos_index.lookup(words[:-1])
                 if pos_matches:
                     self._stats['pos_recall_hit'] += 1
-            # Track topic recall hits
+                    best_k = max(pos_matches.keys())
+                    self._stats['pos_max_n'] = max(self._stats['pos_max_n'], best_k)
+            # Track topic recall hits with n-gram order
             if self.multiscale_recall.topic_index is not None:
                 topic_matches = self.multiscale_recall.topic_index.lookup(words[:-1])
                 if topic_matches:
                     self._stats['topic_recall_hit'] += 1
+                    best_k = max(topic_matches.keys())
+                    self._stats['topic_max_n'] = max(self._stats['topic_max_n'], best_k)
 
             diagnostics.append({
                 'pos': pos,
@@ -511,9 +524,10 @@ class IsingLMGenerator:
 
                 # v17: recall-only mode is fast enough for all candidates,
                 # but if the candidate set is very large, limit to top-500 + target
+                # We want the most common words (lowest h[]) for accurate Z computation
                 if len(candidate_words) > 500:
                     field_vals = self.h[candidate_words]
-                    top_k = np.argsort(field_vals)[-499:]
+                    top_k = np.argsort(field_vals)[:499]  # 499 most COMMON words
                     candidate_words = candidate_words[top_k]
                     # Always include target word
                     if int(target_word) not in set(candidate_words.tolist()):

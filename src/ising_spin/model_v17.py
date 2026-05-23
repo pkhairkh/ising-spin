@@ -143,9 +143,9 @@ class IsingLMModel:
         topic_ngram_min_count: int = 3,
         # Energy scales
         recall_scale: int = 1600,
-        pos_recall_scale: int = 400,
-        topic_recall_scale: int = 200,
-        state_scale: int = 200,
+        pos_recall_scale: int = 800,   # v17.2: increased from 400 to match word parity
+        topic_recall_scale: int = 400, # v17.2: increased from 200 to match word parity
+        state_scale: int = 50,         # v17.2: reduced from 200 — state should guide, not dominate
         # Hard constraints
         same_word_penalty: int = 200,
         max_closed_class_run: int = 2,
@@ -220,7 +220,7 @@ class IsingLMModel:
         three scales + document state + hard constraints.
         """
         print("=" * 70)
-        print("ISING SPIN GLASS LANGUAGE MODEL v17 — MULTI-SCALE ABSTRACT RECALL")
+        print("ISING SPIN GLASS LANGUAGE MODEL v17.2 — MULTI-SCALE ABSTRACT RECALL")
         print("=" * 70)
         print(f"\n  Architecture: 3-Scale Recall (word+POS+topic) + Document State")
         print(f"  Word n-gram:  max_n={self.ngram_max_n}, scale={self.recall_scale}")

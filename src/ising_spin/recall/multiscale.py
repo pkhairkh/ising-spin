@@ -54,8 +54,8 @@ class MultiScaleRecall:
         pos_index: Optional[PosNgramIndex] = None,
         topic_index: Optional[TopicNgramIndex] = None,
         word_scale: int = 1600,
-        pos_scale: int = 800,
-        topic_scale: int = 400,
+        pos_scale: int = 800,     # v17.2: increased from 400
+        topic_scale: int = 400,   # v17.2: increased from 200
     ):
         """
         Args:

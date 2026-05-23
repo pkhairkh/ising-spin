@@ -26,9 +26,9 @@ class EnergyComputer:
         document_state: DocumentState,
         pos_system: POSTypeSystem,
         recall_scale: int = 1600,      # word n-gram scale (primary)
-        pos_recall_scale: int = 800,    # POS n-gram scale (secondary)
-        topic_recall_scale: int = 400,  # topic n-gram scale (tertiary)
-        state_scale: int = 200,         # document state scale
+        pos_recall_scale: int = 800,    # v17.2: POS n-gram scale (was 400)
+        topic_recall_scale: int = 400,  # v17.2: topic n-gram scale (was 200)
+        state_scale: int = 50,          # v17.2: document state scale (was 200)
         same_word_penalty: int = 200,
         closed_class_double_penalty: int = 50000,
         max_closed_class_run: int = 2,

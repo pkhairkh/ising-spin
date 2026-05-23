@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-v17.0 Training Script — Multi-Scale Abstract Recall + Evolving Document State
+v17.2 Training Script — Multi-Scale Abstract Recall + Evolving Document State
+
+v17.2 CHANGES (from v17.1):
+  - CRITICAL FIX: Top-k candidate filter was selecting RAREST words instead
+    of most common — this caused the incoherent generation in v17.1
+  - CRITICAL FIX: PPL evaluation had the same top-k bug (deflated PPL)
+  - Rebalanced energy scales: pos_recall_scale 400→800, topic_recall_scale
+    200→400, state_scale 200→50 (state should guide, not dominate)
+  - Fixed diagnostics: index entries/continuations now counted correctly
+  - Added n-gram order tracking for POS/Topic recall diagnostics
 
 ARCHITECTURE:
-  Word n-gram (5) + POS n-gram (15) + Topic n-gram (10) + Document State (7 vars)
-
-KEY INSIGHT:
-  When the 5-word n-gram is unseen, the POS 10-gram IS seen.
-  When POS is ambiguous, topic disambiguates.
-  When all n-grams miss, document state carries discourse coherence.
+  Word n-gram (5) + POS n-gram (10) + Topic n-gram (10) + Document State (7 vars)
 
 Usage:
   python -u train_v17.py                          # Default: 500K samples
@@ -40,9 +44,9 @@ from pathlib import Path
 DEFAULT_SAMPLES = 500000
 DEFAULT_VOCAB = 4000
 DEFAULT_RECALL_SCALE = 1600
-DEFAULT_POS_RECALL_SCALE = 400
-DEFAULT_TOPIC_RECALL_SCALE = 200
-DEFAULT_STATE_SCALE = 200
+DEFAULT_POS_RECALL_SCALE = 800   # v17.2: increased from 400
+DEFAULT_TOPIC_RECALL_SCALE = 400  # v17.2: increased from 200
+DEFAULT_STATE_SCALE = 50          # v17.2: reduced from 200
 DEFAULT_POS_NGRAM_MAX_N = 10
 DEFAULT_TOPIC_NGRAM_MAX_N = 10
 
@@ -201,10 +205,16 @@ def print_recall_diagnostics(model):
     # Word recall diagnostics
     if model.word_index is not None:
         word_stats = model.word_index.get_stats() if hasattr(model.word_index, 'get_stats') else {}
-        n_word_entries = getattr(model.word_index, 'n_entries', 0)
-        n_word_sequences = getattr(model.word_index, 'n_sequences', 0)
+        n_word_entries = sum(
+            len(model.word_index.index[k])
+            for k in range(1, model.word_index.max_n + 1)
+        )
+        n_word_sequences = sum(
+            sum(len(v) for v in model.word_index.index[k].values())
+            for k in range(1, model.word_index.max_n + 1)
+        )
         print(f"  WORD n-gram index:")
-        print(f"    entries={n_word_entries:,}, sequences={n_word_sequences:,}")
+        print(f"    contexts={n_word_entries:,}, continuations={n_word_sequences:,}")
         if word_stats:
             for k, v in word_stats.items():
                 print(f"    {k}={v}")
@@ -212,10 +222,16 @@ def print_recall_diagnostics(model):
     # POS recall diagnostics
     if model.pos_index is not None:
         pos_stats = model.pos_index.get_stats() if hasattr(model.pos_index, 'get_stats') else {}
-        n_pos_entries = getattr(model.pos_index, 'n_entries', 0)
-        n_pos_sequences = getattr(model.pos_index, 'n_sequences', 0)
+        n_pos_entries = sum(
+            len(model.pos_index.index[k])
+            for k in range(1, model.pos_index.max_n + 1)
+        )
+        n_pos_sequences = sum(
+            sum(len(v) for v in model.pos_index.index[k].values())
+            for k in range(1, model.pos_index.max_n + 1)
+        )
         print(f"  POS n-gram index:")
-        print(f"    entries={n_pos_entries:,}, sequences={n_pos_sequences:,}")
+        print(f"    contexts={n_pos_entries:,}, continuations={n_pos_sequences:,}")
         if pos_stats:
             for k, v in pos_stats.items():
                 print(f"    {k}={v}")
@@ -223,10 +239,16 @@ def print_recall_diagnostics(model):
     # Topic recall diagnostics
     if model.topic_index is not None:
         topic_stats = model.topic_index.get_stats() if hasattr(model.topic_index, 'get_stats') else {}
-        n_topic_entries = getattr(model.topic_index, 'n_entries', 0)
-        n_topic_sequences = getattr(model.topic_index, 'n_sequences', 0)
+        n_topic_entries = sum(
+            len(model.topic_index.index[k])
+            for k in range(1, model.topic_index.max_n + 1)
+        )
+        n_topic_sequences = sum(
+            sum(len(v) for v in model.topic_index.index[k].values())
+            for k in range(1, model.topic_index.max_n + 1)
+        )
         print(f"  TOPIC n-gram index:")
-        print(f"    entries={n_topic_entries:,}, sequences={n_topic_sequences:,}")
+        print(f"    contexts={n_topic_entries:,}, continuations={n_topic_sequences:,}")
         if topic_stats:
             for k, v in topic_stats.items():
                 print(f"    {k}={v}")
@@ -255,10 +277,14 @@ def print_recall_diagnostics(model):
         pos_hits = gen_stats.get("pos_recall_hit", 0)
         topic_hits = gen_stats.get("topic_recall_hit", 0)
         state_energy = gen_stats.get("state_energy_sum", 0)
+        total_pos = gen_stats.get("total_positions", 0)
         print(f"    word_recall_hits={word_hits}")
         print(f"    pos_recall_hits={pos_hits}")
         print(f"    topic_recall_hits={topic_hits}")
         print(f"    state_energy_sum={state_energy}")
+        if total_pos > 0:
+            avg_state_e = state_energy / total_pos
+            print(f"    avg_state_energy_per_pos={avg_state_e:.1f}")
 
 
 def main():
@@ -317,7 +343,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v17.0 MULTI-SCALE ABSTRACT RECALL", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v17.2 MULTI-SCALE ABSTRACT RECALL", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()}", flush=True)
@@ -333,7 +359,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v17.0 — Multi-Scale Abstract Recall + Document State")
+    print(f"CONFIG: v17.2 — Multi-Scale Abstract Recall + Document State")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -442,12 +468,6 @@ def main():
 
     print(f"\nPPL (full, 100 seqs): {full_ppl:.2f}")
 
-    # --- Multi-Scale Recall Diagnostics ---
-    print(f"\n{'=' * 70}")
-    print("RECALL DIAGNOSTICS")
-    print(f"{'=' * 70}")
-    print_recall_diagnostics(model)
-
     # --- Generation ---
     print(f"\n{'=' * 70}")
     print(f"GENERATION (PPL={full_ppl:.2f})")
@@ -471,8 +491,15 @@ def main():
             topic_hits = stats.get("topic_recall_hit", 0)
             copies = stats.get("copy_used", 0)
             state_e = stats.get("state_energy_sum", 0)
+            word_max_n = stats.get("word_max_n", 0)
+            pos_max_n = stats.get("pos_max_n", 0)
+            topic_max_n = stats.get("topic_max_n", 0)
+            total_pos_gen = stats.get("total_positions", 1)
+            avg_state_e = state_e / max(1, total_pos_gen)
             print(f"  word_hits={word_hits} pos_hits={pos_hits} "
-                  f"topic_hits={topic_hits} copies={copies} state_energy={state_e}")
+                  f"topic_hits={topic_hits} copies={copies}")
+            print(f"  state_energy={state_e} (avg={avg_state_e:.0f}/pos)")
+            print(f"  max_n_grams: word={word_max_n} pos={pos_max_n} topic={topic_max_n}")
 
             generated_texts.append(text)
 
@@ -484,9 +511,15 @@ def main():
             traceback.print_exc()
             generated_texts.append("")
 
+    # --- Multi-Scale Recall Diagnostics (AFTER generation so stats are populated) ---
+    print(f"\n{'=' * 70}")
+    print("RECALL DIAGNOSTICS")
+    print(f"{'=' * 70}")
+    print_recall_diagnostics(model)
+
     # --- Save Results ---
     results = {
-        "version": "v17.0",
+        "version": "v17.2",
         "architecture": "Multi-Scale Abstract Recall + Evolving Document State",
         "timestamp": timestamp,
         "config": {
@@ -529,7 +562,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v17.0 Multi-Scale Abstract Recall + Document State")
+    print(f"DONE — v17.2 Multi-Scale Abstract Recall + Document State")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
