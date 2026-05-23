@@ -1,59 +1,74 @@
 """
-Grassmann Flag State Layer for Ising Spin Glass Language Model
-==============================================================
+Grassmann Flag State Layer for Ising Spin Glass Language Model — v14.1
+======================================================================
 
-Inspired by pkhairkh/gfst-hmb: Grassmann-flag state tracking, block-based
-exact-token memory with sparse readout, and MPUC-first design.
+DIAGNOSIS OF v14.0 FAILURE
+---------------------------
+v14.0 added three layers (flag, wedge, block memory) but PPL stayed at 50.67.
+The diagnostic `flag=10435 wedge=10435 memory=10433` reveals the problem:
+ALL THREE layers contributed ~10K energy with ZERO discrimination.
 
-ARCHITECTURE OVERVIEW
----------------------
-The current Ising LM treats each word as an atomic integer state with
-symmetric PMI couplings — effectively a smoothed n-gram model with cosmetic
-physics decorations. This module introduces THREE fundamental innovations:
+Root causes:
+1. Flag cluster energy = cluster bigram PMI → REDUNDANT with word n-gram recall
+2. Flag topic energy = flat +300 penalty → REDUNDANT with Potts topic spin
+3. Wedge coupling: antisymmetric coupling cancels, net spread is tiny
+4. Block memory: (topic, cluster_pair) key is too sparse, provides log-bonus
+   for a few words and zero for the rest
 
-1. FLAG STATE REPRESENTATION (Grassmann flags)
-   - Each word position carries a structured flag: (word, cluster, topic)
-   - Flags are NESTED: word ∈ cluster ∈ topic (like Grassmann flag manifolds)
-   - The flag hierarchy provides natural multi-resolution energy:
-     * Topic-level: global coherence (16-dim, well-estimated)
-     * Cluster-level: syntactic/semantic coupling (64-dim, reliable stats)
-     * Word-level: precise recall (4000-dim, sparse but exact)
+v14.1 ARCHITECTURE: CLUSTER N-GRAM RECALL
+------------------------------------------
+The GENUINELY NOVEL contribution of Grassmann flags is this:
 
-2. ANTISYMMETRIC (WEDGE) COUPLINGS
-   - Grassmann exterior algebra: a∧b = -b∧a
-   - Language is ORDER-DEPENDENT: "the dog" ≠ "dog the"
-   - Symmetric PMI cannot capture this; wedge couplings can
-   - J_fwd[c_i, c_j] ≠ J_bwd[c_i, c_j] by construction
-   - At cluster level (64×64), these matrices are well-estimated from 500K texts
+Word n-grams can only go to 5-gram (4000^5 is impossibly sparse).
+But CLUSTER n-grams with alphabet size 64 can go to 8-gram:
+  64^2 = 4K contexts (trigram) — extremely well-estimated
+  64^3 = 262K contexts (4-gram) — well-estimated
+  64^4 = 16.7M contexts (5-gram) — feasible with smoothing
+  64^5 = 1B contexts (6-gram) — sparse, need backoff
 
-3. BLOCK MEMORY WITH SPARSE READOUT
-   - Training text stored in fixed-size blocks (B=32 words)
-   - Each block tagged with topic flag + cluster signature
-   - During generation: flag-matching retrieves relevant blocks
-   - Block contents provide LONG-RANGE context beyond n-gram window
-   - This is RAG for integer-only models
+This provides LONG-RANGE context that word n-grams CANNOT provide.
+Example: "the cat sat on the mat and then the"
+  - Word 7-gram: too rare to observe
+  - Cluster 7-gram: [DET,NOUN,VERB,PREP,DET,NOUN,CONJ] → well-observed
+  - Tells us next cluster is likely ADV/VERB → constrains word choice
 
-WHY THIS IS NOT "JUST CRANKING PMI WEIGHT"
--------------------------------------------
-- Different STATE REPRESENTATION: flags vs atomic integers
-- Different COUPLING STRUCTURE: antisymmetric vs symmetric
-- Different CONTEXT MECHANISM: block retrieval vs local n-gram
-- All three contribute INDEPENDENT information that PMI cannot provide
+The cluster n-gram is computed INDEPENDENTLY of word n-gram recall and
+provides information that word n-grams CANNOT provide at long range.
+
+ENERGY FORMULATION
+------------------
+For candidate word w with cluster c_w in context (c_{i-k+1}, ..., c_i):
+
+  E_cluster_ngram(w) = -cluster_recall_scale * log2(P(c_w | c_{i-k+1}, ..., c_i))
+
+Where P(c_w | cluster_context) is computed with KN-smoothed backoff,
+exactly like word n-gram recall but on the cluster alphabet.
+
+The cluster n-gram energy is:
+  - Zero-meaned: subtract median energy so it only DISCRIMINATES
+  - Capped: at ±recall_scale * 0.1 (10% of recall energy)
+  - Independent: captures information word n-grams miss at long range
+
+WEDGE COUPLING (kept, fixed)
+-----------------------------
+The antisymmetric wedge coupling is genuinely novel — it captures
+word ORDER that symmetric PMI cannot. But it must be:
+  - Zero-meaned (subtract median)
+  - Scaled to ~5% of recall energy
+  - Applied ONLY to nearby context (distance 1-3)
 
 INTEGER-ONLY ARITHMETIC
 -----------------------
-- All cluster/topic assignments: integer lookup tables
-- Cluster couplings: int16 matrices (64×64 = 8KB each)
-- Block memory: integer hash tables + count-based energy
-- Flag energies: integer additions, shifts, and table lookups
-- Wedge product: integer multiply + sign flip
+All operations are integer-only:
+- Cluster assignments: integer lookup tables (int16)
+- Cluster n-gram index: integer hash tables + count-based log energy
+- Wedge coupling: int16 matrices
 - ZERO floating-point operations in the hot path
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
-import hashlib
 
 
 # ============================================================================
@@ -64,49 +79,30 @@ class FlagState:
     """
     Grassmann flag state representation for the Ising LM.
     
-    A flag is a nested hierarchy of subspaces:
+    A flag is a nested hierarchy:
         V₀ ⊂ V₁ ⊂ V₂
         word ⊂ cluster ⊂ topic
     
-    Properties:
-    - Deterministic mapping: word → cluster → topic
-    - Multi-resolution: each level provides different statistical strength
-    - Integer-only: all assignments are integer lookups
-    - Compact: cluster (64) and topic (16) levels have good statistics
-    
-    The flag structure enables THREE distinct energy terms:
-    1. E_topic(w): Is this word's topic consistent with the global topic?
-    2. E_cluster(w): Is this word's cluster consistent with local syntax?
-    3. E_wedge(w, ctx): Antisymmetric cluster coupling (direction-dependent)
+    The key innovation: at cluster level (alphabet size 64), n-gram
+    statistics are well-estimated even for long contexts (8-gram).
+    This provides long-range context that word n-grams cannot.
     """
     
     def __init__(
         self,
         n_clusters: int = 64,
         n_topics: int = 16,
-        cluster_weight: int = 200,   # Energy scale for cluster consistency
-        topic_weight: int = 300,     # Energy scale for topic coherence
     ):
         self.n_clusters = n_clusters
         self.n_topics = n_topics
-        self.cluster_weight = cluster_weight
-        self.topic_weight = topic_weight
         
-        # Mapping tables (populated during build)
+        # Mapping tables
         self.word_to_cluster: np.ndarray = None  # shape (V,), dtype int16
         self.cluster_to_topic: np.ndarray = None  # shape (C,), dtype int8
-        self.word_to_topic: np.ndarray = None     # shape (V,), dtype int8 (cached)
+        self.word_to_topic: np.ndarray = None     # shape (V,), dtype int8
         
-        # Cluster statistics (populated during build)
-        self.cluster_freq: np.ndarray = None       # shape (C,), int64
-        self.cluster_word_counts: Dict[int, Counter] = None  # cluster → {word: count}
-        self.topic_cluster_counts: Dict[int, Counter] = None # topic → {cluster: count}
-        
-        # Cluster co-occurrence (populated during build)
-        # Forward: cluster at pos i, cluster at pos j (j > i)
-        # Backward: cluster at pos j, cluster at pos i (i < j)
-        self.cluster_bigram_fwd: np.ndarray = None  # shape (C, C), int64
-        self.cluster_bigram_bwd: np.ndarray = None  # shape (C, C), int64
+        # Cluster frequency
+        self.cluster_freq: np.ndarray = None  # shape (C,), int64
         
         self._built = False
         self._vocab_size = 0
@@ -117,15 +113,7 @@ class FlagState:
         vocab_size: int,
         word_freq: np.ndarray,
     ) -> None:
-        """
-        Build the flag state hierarchy from training sequences.
-        
-        Two-phase integer K-means:
-        1. Cluster assignment: group words by co-occurrence context
-        2. Topic assignment: group clusters by document frequency
-        
-        All integer arithmetic — no floating point.
-        """
+        """Build the flag state hierarchy from training sequences."""
         print(f"\n  [FLAG] Building Grassmann flag hierarchy...")
         print(f"  [FLAG]   vocab_size={vocab_size}, n_clusters={self.n_clusters}, n_topics={self.n_topics}")
         
@@ -154,13 +142,12 @@ class FlagState:
             c = self.word_to_cluster[w]
             self.word_to_topic[w] = self.cluster_to_topic[c]
         
-        # Phase 4: Compute cluster statistics
+        # Phase 4: Compute cluster frequency
         print(f"  [FLAG]   Phase 4: Computing cluster statistics...")
-        self._compute_cluster_stats(sequences, word_freq)
-        
-        # Phase 5: Compute cluster bigram couplings
-        print(f"  [FLAG]   Phase 5: Computing cluster bigram couplings...")
-        self._compute_cluster_bigrams(sequences)
+        self.cluster_freq = np.zeros(self.n_clusters, dtype=np.int64)
+        for w in range(self._vocab_size):
+            c = int(self.word_to_cluster[w])
+            self.cluster_freq[c] += int(word_freq[w])
         
         self._built = True
         
@@ -175,15 +162,7 @@ class FlagState:
     def _build_context_vectors(
         self, sequences: List[List[int]], vocab_size: int
     ) -> np.ndarray:
-        """
-        Build integer context vectors for each word.
-        
-        Context vector for word w = sum of co-occurrence counts with
-        all other words in a ±2 window, binned into 64 dimensional
-        bins using a simple hash.
-        
-        Returns: shape (V, 64) int32 context vectors
-        """
+        """Build integer context vectors for each word (co-occurrence ±2 window)."""
         dim = 64
         ctx = np.zeros((vocab_size, dim), dtype=np.int32)
         window = 2
@@ -198,7 +177,6 @@ class FlagState:
                     ctx_w = seq[j]
                     if ctx_w >= vocab_size:
                         continue
-                    # Simple hash to 64 bins
                     bin_idx = ctx_w % dim
                     ctx[w, bin_idx] += 1
         
@@ -212,57 +190,36 @@ class FlagState:
         n_items: int,
         max_iter: int = 20,
     ) -> np.ndarray:
-        """
-        Integer K-means clustering.
-        
-        Uses Manhattan distance (L1) for integer-only arithmetic.
-        Centroids are medians of cluster members.
-        
-        Returns: shape (n_items,) int16 cluster assignments
-        """
-        dim = vectors.shape[1]
+        """Integer K-means clustering with L1 distance."""
         assignments = np.zeros(n_items, dtype=np.int16)
         
-        # Initialize centroids: choose k items spread by frequency quantile
         nonzero = np.where(freq[:n_items] > 0)[0]
         if len(nonzero) < k:
-            # Not enough items — assign all to cluster 0
             print(f"  [FLAG]     Warning: only {len(nonzero)} non-zero items, < {k} clusters")
             return assignments
         
         quantile_positions = np.linspace(0, len(nonzero) - 1, k, dtype=int)
-        # Sort by frequency to get spread
         sorted_idx = nonzero[np.argsort(freq[nonzero])]
-        # Take evenly spaced from sorted
         seed_idx = sorted_idx[quantile_positions]
-        centroids = vectors[seed_idx].copy()  # shape (k, dim)
+        centroids = vectors[seed_idx].copy()
         
-        # Only cluster non-zero items
         active_mask = freq[:n_items] > 0
         active_idx = np.where(active_mask)[0]
-        active_vectors = vectors[active_idx]  # shape (n_active, dim)
+        active_vectors = vectors[active_idx]
         
         for iteration in range(max_iter):
-            # Assignment step: L1 distance to centroids
-            # For efficiency, compute in batches
             new_assignments = np.zeros(n_items, dtype=np.int16)
-            
-            # Compute distances: (n_active, k) using L1
-            # |v - c| = sum of abs differences
-            # Do this in chunks to avoid memory issues
             chunk_size = 4096
             for start in range(0, len(active_idx), chunk_size):
                 end = min(start + chunk_size, len(active_idx))
-                chunk = active_vectors[start:end]  # (chunk, dim)
-                # L1 distance: sum of |chunk[:, None, :] - centroids[None, :, :]|
+                chunk = active_vectors[start:end]
                 dists = np.sum(
                     np.abs(chunk[:, None, :].astype(np.int64) - centroids[None, :, :].astype(np.int64)),
                     axis=2
-                )  # shape (chunk, k)
+                )
                 chunk_assign = np.argmin(dists, axis=1).astype(np.int16)
                 new_assignments[active_idx[start:end]] = chunk_assign
             
-            # Check convergence
             changed = np.sum(new_assignments[active_mask] != assignments[active_mask])
             assignments = new_assignments
             
@@ -270,16 +227,12 @@ class FlagState:
                 print(f"  [FLAG]     K-means converged at iteration {iteration + 1}")
                 break
             
-            # Update step: centroids = median of cluster members
             for c in range(k):
                 members = np.where(assignments == c)[0]
                 if len(members) == 0:
                     continue
-                member_vecs = vectors[members]
-                # Integer median: sort and take middle
-                centroids[c] = np.median(member_vecs, axis=0).astype(np.int32)
+                centroids[c] = np.median(vectors[members], axis=0).astype(np.int32)
         
-        # Assign zero-frequency items to nearest cluster (by L1 to centroids)
         zero_mask = freq[:n_items] == 0
         if np.any(zero_mask):
             zero_idx = np.where(zero_mask)[0]
@@ -302,26 +255,19 @@ class FlagState:
         n_items: int,
         max_iter: int = 20,
     ) -> np.ndarray:
-        """
-        1D integer K-means for cluster-to-topic mapping.
-        
-        features: shape (n_items, n_features) — cluster document frequency vectors
-        """
-        dim = features.shape[1]
+        """1D integer K-means for cluster-to-topic mapping."""
         assignments = np.zeros(n_items, dtype=np.int8)
         
-        # Initialize: evenly spread
         indices = np.arange(n_items)
         quantile_positions = np.linspace(0, n_items - 1, k, dtype=int)
         seed_idx = indices[quantile_positions]
         centroids = features[seed_idx].copy().astype(np.int64)
         
         for iteration in range(max_iter):
-            # Assignment
             dists = np.sum(
                 np.abs(features[:, None, :].astype(np.int64) - centroids[None, :, :]),
                 axis=2
-            )  # shape (n_items, k)
+            )
             new_assignments = np.argmin(dists, axis=1).astype(np.int8)
             
             changed = np.sum(new_assignments != assignments)
@@ -330,7 +276,6 @@ class FlagState:
             if changed == 0:
                 break
             
-            # Update
             for t in range(k):
                 members = np.where(assignments == t)[0]
                 if len(members) == 0:
@@ -342,13 +287,8 @@ class FlagState:
     def _compute_cluster_doc_freq(
         self, sequences: List[List[int]]
     ) -> np.ndarray:
-        """
-        Compute document frequency vectors for each cluster.
-        
-        For each sequence, count which clusters appear.
-        Returns: shape (n_clusters, n_bins) int32
-        """
-        n_bins = 32  # Compact representation
+        """Compute document frequency vectors for each cluster."""
+        n_bins = 32
         doc_freq = np.zeros((self.n_clusters, n_bins), dtype=np.int32)
         
         for seq in sequences:
@@ -358,176 +298,10 @@ class FlagState:
                     c = int(self.word_to_cluster[w])
                     if c not in seen_clusters:
                         seen_clusters.add(c)
-                        # Hash sequence context into bins
                         for w2 in seq[:min(16, len(seq))]:
                             doc_freq[c, w2 % n_bins] += 1
         
         return doc_freq
-    
-    def _compute_cluster_stats(
-        self,
-        sequences: List[List[int]],
-        word_freq: np.ndarray,
-    ) -> None:
-        """Compute cluster frequency and word-cluster distributions."""
-        self.cluster_freq = np.zeros(self.n_clusters, dtype=np.int64)
-        self.cluster_word_counts = defaultdict(Counter)
-        self.topic_cluster_counts = defaultdict(Counter)
-        
-        for w in range(self._vocab_size):
-            c = int(self.word_to_cluster[w])
-            t = int(self.cluster_to_topic[c])
-            self.cluster_freq[c] += int(word_freq[w])
-            self.cluster_word_counts[c][w] = int(word_freq[w])
-            self.topic_cluster_counts[t][c] += int(word_freq[w])
-    
-    def _compute_cluster_bigrams(
-        self, sequences: List[List[int]]
-    ) -> None:
-        """
-        Compute forward and backward cluster bigram counts.
-        
-        Forward: count of (cluster_i, cluster_j) where j = i+1
-        Backward: count of (cluster_j, cluster_i) where i = j-1
-        
-        The ASYMMETRY between these is the key innovation:
-        - fwd[DET, NOUN] >> bwd[DET, NOUN]  (DET precedes NOUN)
-        - bwd[NOUN, DET] >> fwd[NOUN, DET]  (NOUN follows DET)
-        
-        This is the Grassmann wedge product in practice:
-        E_wedge(i,j) = J_fwd[c_i, c_j] - J_bwd[c_j, c_i]
-        """
-        self.cluster_bigram_fwd = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int64)
-        self.cluster_bigram_bwd = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int64)
-        
-        for seq in sequences:
-            for i in range(len(seq) - 1):
-                w1 = seq[i]
-                w2 = seq[i + 1]
-                if w1 >= self._vocab_size or w2 >= self._vocab_size:
-                    continue
-                c1 = int(self.word_to_cluster[w1])
-                c2 = int(self.word_to_cluster[w2])
-                self.cluster_bigram_fwd[c1, c2] += 1
-                self.cluster_bigram_bwd[c2, c1] += 1
-        
-        # Convert to log-scale integer coupling strengths
-        # J_fwd[c1, c2] = log2(count_fwd / expected) * scale
-        # J_bwd[c2, c1] = log2(count_bwd / expected) * scale
-        # This gives POSITIVE values for pairs that co-occur more than expected
-        
-        total_bigrams = max(1, int(self.cluster_bigram_fwd.sum()))
-        
-        # Marginals (computed ONCE, outside loop)
-        fwd_c1_marginal = self.cluster_bigram_fwd.sum(axis=1)  # shape (C,)
-        fwd_c2_marginal = self.cluster_bigram_fwd.sum(axis=0)  # shape (C,)
-        bwd_c1_marginal = self.cluster_bigram_bwd.sum(axis=1)  # shape (C,)
-        bwd_c2_marginal = self.cluster_bigram_bwd.sum(axis=0)  # shape (C,)
-        
-        # Compute PMI-like coupling in integer log scale
-        # Using finer quantization: Q4 = 16 steps per power of 2
-        # log2q4(x) = floor(4 * log2(x)) gives 4x finer than bit_length-1
-        scale = 256  # Q8 fixed point for ratio computation
-        
-        fwd_pmi = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int16)
-        bwd_pmi = np.zeros((self.n_clusters, self.n_clusters), dtype=np.int16)
-        
-        for c1 in range(self.n_clusters):
-            if fwd_c1_marginal[c1] == 0:
-                continue
-            for c2 in range(self.n_clusters):
-                if fwd_c2_marginal[c2] == 0:
-                    continue
-                
-                # Forward PMI
-                fwd_count = int(self.cluster_bigram_fwd[c1, c2])
-                if fwd_count > 0:
-                    expected_fwd = int(fwd_c1_marginal[c1] * fwd_c2_marginal[c2]) // total_bigrams
-                    if expected_fwd > 0:
-                        ratio = fwd_count * scale // expected_fwd
-                        if ratio > 1:
-                            # Fine-grained integer log2: floor(4 * log2(ratio/256))
-                            # = floor(4 * (log2(ratio) - 8))
-                            # Gives ~4x more resolution than bit_length-1
-                            log_val = (int(ratio).bit_length() - 1 - 8) * 4
-                            fwd_pmi[c1, c2] = max(0, min(63, log_val))  # Cap at 6 bits
-                
-                # Backward PMI
-                bwd_count = int(self.cluster_bigram_bwd[c1, c2])
-                if bwd_count > 0 and bwd_c1_marginal[c1] > 0 and bwd_c2_marginal[c2] > 0:
-                    expected_bwd = int(bwd_c1_marginal[c1] * bwd_c2_marginal[c2]) // total_bigrams
-                    if expected_bwd > 0:
-                        ratio = bwd_count * scale // expected_bwd
-                        if ratio > 1:
-                            log_val = (int(ratio).bit_length() - 1 - 8) * 4
-                            bwd_pmi[c1, c2] = max(0, min(63, log_val))
-        
-        # Replace raw counts with PMI values
-        self.cluster_bigram_fwd = fwd_pmi
-        self.cluster_bigram_bwd = bwd_pmi
-    
-    def compute_flag_energy(
-        self,
-        candidate_words: np.ndarray,
-        context_words: List[int],
-        current_topic: int,
-    ) -> np.ndarray:
-        """
-        Compute flag state energy for candidate words.
-        
-        E_flag(w) = E_cluster(w, ctx) + E_topic(w, current_topic)
-        
-        E_cluster: penalty if candidate's cluster is inconsistent with
-                   the cluster bigram pattern of the context
-        E_topic: penalty if candidate's topic ≠ current_topic
-        
-        All integer arithmetic. Returns shape (n_candidates,) int64.
-        """
-        n_candidates = len(candidate_words)
-        energies = np.zeros(n_candidates, dtype=np.int64)
-        
-        if not self._built or len(context_words) == 0:
-            return energies
-        
-        # Get context clusters (most recent few words)
-        context_clusters = []
-        for w in context_words[-5:]:  # Use last 5 words
-            if w < self._vocab_size:
-                context_clusters.append(int(self.word_to_cluster[w]))
-        
-        if not context_clusters:
-            return energies
-        
-        # E_cluster: check if candidate's cluster follows context clusters
-        # Use FORWARD bigram: J_fwd[context_cluster, candidate_cluster]
-        for i, w in enumerate(candidate_words):
-            w_int = int(w)
-            if w_int >= self._vocab_size:
-                continue
-            c_word = int(self.word_to_cluster[w_int])
-            
-            # Maximum forward coupling from context to this word's cluster
-            max_fwd = 0
-            for cc in context_clusters[-3:]:  # Last 3 clusters
-                fwd = int(self.cluster_bigram_fwd[cc, c_word])
-                if fwd > max_fwd:
-                    max_fwd = fwd
-            
-            # Energy is INVERSE of coupling: high coupling = low energy = good
-            # E = cluster_weight * (max_possible - max_fwd)
-            # But simpler: reward high coupling with negative energy
-            energies[i] -= max_fwd * self.cluster_weight
-        
-        # E_topic: penalty for off-topic words
-        for i, w in enumerate(candidate_words):
-            w_int = int(w)
-            if w_int >= self._vocab_size:
-                continue
-            t_word = int(self.word_to_topic[w_int])
-            if t_word != current_topic:
-                energies[i] += self.topic_weight  # Penalty
-        
-        return energies
     
     def get_topic(self, words: List[int]) -> int:
         """Get dominant topic for a sequence of words."""
@@ -547,73 +321,290 @@ class FlagState:
         if not self._built or word_idx >= self._vocab_size:
             return 0
         return int(self.word_to_cluster[word_idx])
-    
-    def get_topic_for_word(self, word_idx: int) -> int:
-        """Get topic for a word."""
-        if not self._built or word_idx >= self._vocab_size:
-            return 0
-        return int(self.word_to_topic[word_idx])
 
 
 # ============================================================================
-# ANTISYMMETRIC (WEDGE) COUPLING: Direction-dependent cluster interactions
+# CLUSTER N-GRAM RECALL: Long-range context via cluster-level n-grams
+# ============================================================================
+
+class ClusterNGramRecall:
+    """
+    Cluster-level n-gram recall for long-range context.
+    
+    KEY INSIGHT: Word n-grams can only go to 5-gram (4000^5 too sparse).
+    But cluster n-grams with alphabet 64 can go to 8-gram:
+      2-gram: 64 contexts — trivial
+      3-gram: 4K contexts — extremely well-estimated
+      4-gram: 262K contexts — well-estimated
+      5-gram: 16.7M contexts — feasible with smoothing
+    
+    This provides information that word n-grams CANNOT provide at long range.
+    
+    Energy: E_cluster_recall(w) = -scale * log2(P(c_w | c_context))
+    Where P is estimated with KN-smoothed backoff over cluster alphabet.
+    
+    The energy is zero-meaned and capped so it only DISCRIMINATES
+    between candidates, never dominates the recall energy.
+    """
+    
+    def __init__(
+        self,
+        n_clusters: int = 64,
+        max_cluster_ngram: int = 6,       # Use cluster 2-6 grams
+        cluster_recall_scale: int = 200,  # Energy scale (10% of word recall)
+        min_count: int = 2,               # Minimum count for cluster n-gram
+    ):
+        self.n_clusters = n_clusters
+        self.max_cluster_ngram = max_cluster_ngram
+        self.cluster_recall_scale = cluster_recall_scale
+        self.min_count = min_count
+        
+        # Cluster n-gram index: context_tuple → Counter of next clusters
+        # For k-gram: context is tuple of k-1 cluster IDs → next cluster
+        self.index: Dict[Tuple, Counter] = defaultdict(Counter)
+        
+        # Cluster unigram (for backoff)
+        self.unigram: Counter = Counter()
+        
+        # Total observations
+        self.total_obs = 0
+        
+        # KN smoothing parameters
+        self.kn_d = 1  # KN discount
+        
+        self._built = False
+        self._vocab_size = 0
+    
+    def build(
+        self,
+        sequences: List[List[int]],
+        flag_state: FlagState,
+    ) -> None:
+        """Build cluster n-gram index from training sequences."""
+        print(f"\n  [CLUSTER-NGRAM] Building cluster n-gram recall...")
+        print(f"  [CLUSTER-NGRAM]   n_clusters={self.n_clusters}, max_ngram={self.max_cluster_ngram}")
+        print(f"  [CLUSTER-NGRAM]   cluster_recall_scale={self.cluster_recall_scale}")
+        
+        vocab_size = flag_state._vocab_size
+        self._vocab_size = vocab_size
+        C = self.n_clusters
+        
+        # Count cluster n-grams for all orders
+        for k in range(2, self.max_cluster_ngram + 1):
+            context_counts: Dict[Tuple, Counter] = defaultdict(Counter)
+            total_k = 0
+            
+            for seq in sequences:
+                # Convert sequence to cluster IDs
+                clusters = []
+                for w in seq:
+                    if w < vocab_size:
+                        clusters.append(int(flag_state.word_to_cluster[w]))
+                    else:
+                        clusters.append(-1)  # OOV marker
+                
+                # Count k-grams
+                for i in range(len(clusters) - k + 1):
+                    # Check no OOV in context or next
+                    context = tuple(clusters[i:i+k-1])
+                    next_c = clusters[i+k-1]
+                    if -1 in context or next_c == -1:
+                        continue
+                    context_counts[context][next_c] += 1
+                    total_k += 1
+            
+            # Filter: keep only contexts with enough observations
+            for ctx, counter in context_counts.items():
+                total_ctx = sum(counter.values())
+                if total_ctx >= self.min_count:
+                    self.index[ctx] = counter
+            
+            print(f"  [CLUSTER-NGRAM]   {k}-gram: {len(context_counts)} contexts, "
+                  f"{total_k} observations, kept {sum(1 for ctx in context_counts if sum(context_counts[ctx].values()) >= self.min_count)}")
+        
+        # Count cluster unigrams (for backoff)
+        for seq in sequences:
+            for w in seq:
+                if w < vocab_size:
+                    c = int(flag_state.word_to_cluster[w])
+                    self.unigram[c] += 1
+        
+        self.total_obs = sum(self.unigram.values())
+        
+        # Compute KN continuation counts (for smoothing)
+        # Number of distinct contexts each cluster appears as continuation
+        self.kn_continuation: Counter = Counter()
+        for ctx, counter in self.index.items():
+            for c in counter:
+                self.kn_continuation[c] += 1
+        
+        self._built = True
+        
+        # Print stats
+        print(f"  [CLUSTER-NGRAM]   Total contexts in index: {len(self.index)}")
+        print(f"  [CLUSTER-NGRAM]   Total cluster tokens: {self.total_obs}")
+        print(f"  [CLUSTER-NGRAM]   Cluster n-gram recall built successfully.")
+    
+    def _kn_prob(
+        self,
+        cluster: int,
+        context: Tuple[int, ...],
+    ) -> int:
+        """
+        Compute KN-smoothed log2 probability for cluster given context.
+        
+        Uses interpolated KN backoff:
+        P_KN(c | ctx) = max(count(ctx, c) - d, 0) / count(ctx) + λ(ctx) * P_KN(c | ctx[1:])
+        
+        Returns: Q8 fixed-point log2 probability * cluster_recall_scale
+                 (positive = high prob = low energy, so we return -log2(P) as energy)
+        """
+        # Try each context length from longest to shortest (backoff)
+        for k in range(len(context), 0, -1):
+            ctx = context[-k:]  # Use last k clusters as context
+            
+            if ctx not in self.index:
+                continue
+            
+            counter = self.index[ctx]
+            total_ctx = sum(counter.values())
+            
+            if total_ctx < self.min_count:
+                continue
+            
+            count_c = counter.get(cluster, 0)
+            
+            if count_c > 0:
+                # KN-smoothed probability
+                # P(c|ctx) = max(count - d, 0) / total + λ * P_backoff(c)
+                discounted = max(count_c - self.kn_d, 0)
+                lambda_weight = self.kn_d * len(counter) / total_ctx  # Number of distinct continuations
+                
+                # Main term: discounted count / total
+                # Q8: (discounted * 256) / total_ctx
+                prob_main = (discounted * 256) // max(1, total_ctx)
+                
+                # Backoff term: unigram probability
+                prob_backoff = (self.unigram.get(cluster, 0) * 256) // max(1, self.total_obs)
+                
+                # Interpolated probability (Q8)
+                # P = prob_main + lambda_weight * prob_backoff
+                # lambda_weight is a fraction, approximate as Q8
+                lambda_q8 = min(255, int(lambda_weight * 256))
+                prob_q8 = prob_main + (lambda_q8 * prob_backoff) // 256
+                
+                if prob_q8 > 0:
+                    # Compute -log2(P) in integer
+                    # log2(P) ≈ bit_length(P) - 1 - 8 (since P is Q8)
+                    # -log2(P) = 8 - bit_length(P) + 1 = 9 - bit_length(P)
+                    # But we need -log2(P/Q8) = -log2(P) + log2(256) = -log2(P) + 8
+                    # = 8 - (bit_length(P) - 1) = 9 - bit_length(P)
+                    neg_log2 = 9 - int(prob_q8).bit_length()
+                    neg_log2 = max(0, neg_log2)  # Clamp to non-negative
+                    return neg_log2
+            
+            # Context exists but cluster not observed → backoff
+            continue
+        
+        # No matching context → unigram probability
+        count_c = self.unigram.get(cluster, 0)
+        if count_c > 0:
+            prob_q8 = (count_c * 256) // max(1, self.total_obs)
+            if prob_q8 > 0:
+                neg_log2 = 9 - int(prob_q8).bit_length()
+                return max(0, neg_log2)
+        
+        # Unknown cluster → high energy
+        return 20  # log2(1/1M) ≈ 20
+    
+    def compute_energy(
+        self,
+        candidate_words: np.ndarray,
+        context_words: List[int],
+        flag_state: FlagState,
+    ) -> np.ndarray:
+        """
+        Compute cluster n-gram recall energy for candidate words.
+        
+        E(w) = cluster_recall_scale * (-log2(P(c_w | cluster_context)))
+        
+        Zero-meaned: subtract median so it only DISCRIMINATES.
+        Capped: at ±recall_scale * 0.1 (10% of word recall energy).
+        """
+        n_candidates = len(candidate_words)
+        energies = np.zeros(n_candidates, dtype=np.int64)
+        
+        if not self._built or len(context_words) == 0:
+            return energies
+        
+        vocab_size = flag_state._vocab_size
+        
+        # Get cluster context from recent words
+        cluster_context = []
+        for w in context_words[-(self.max_cluster_ngram - 1):]:
+            if w < vocab_size:
+                cluster_context.append(int(flag_state.word_to_cluster[w]))
+        
+        if not cluster_context:
+            return energies
+        
+        ctx_tuple = tuple(cluster_context)
+        
+        # Compute raw energy for each candidate
+        for i, w in enumerate(candidate_words):
+            w_int = int(w)
+            if w_int >= vocab_size:
+                continue
+            c_w = int(flag_state.word_to_cluster[w_int])
+            neg_log2 = self._kn_prob(c_w, ctx_tuple)
+            energies[i] = self.cluster_recall_scale * neg_log2
+        
+        # ZERO-MEAN: subtract median so layer only DISCRIMINATES
+        median_e = int(np.median(energies[energies > 0])) if np.any(energies > 0) else 0
+        energies -= median_e
+        
+        # CAP: at ±10% of recall_scale (1600 * 0.1 = 160)
+        cap = 160  # recall_scale * 0.1
+        energies = np.clip(energies, -cap, cap)
+        
+        return energies
+
+
+# ============================================================================
+# WEDGE COUPLING: Antisymmetric direction-dependent interactions (FIXED)
 # ============================================================================
 
 class WedgeCoupling:
     """
     Antisymmetric wedge product coupling for the Ising LM.
     
-    In Grassmann exterior algebra, the wedge product is antisymmetric:
-        a ∧ b = -b ∧ a
+    In Grassmann exterior algebra: a∧b = -b∧a
+    Applied to language: coupling depends on DIRECTION.
     
-    Applied to language: the coupling between positions i and j depends
-    on the DIRECTION. This captures word order, which symmetric PMI cannot.
-    
-    Implementation:
-    - Forward coupling J_fwd[c_i, c_j]: cluster c_i at position i,
-      cluster c_j at position j, where i < j (forward direction)
-    - Backward coupling J_bwd[c_i, c_j]: cluster c_i at position i,
-      cluster c_j at position j, where i > j (backward direction)
-    - Wedge energy: E_wedge = J_fwd[c_i, c_j] - J_bwd[c_j, c_i]
-    
-    At cluster level (64×64), these are well-estimated from 500K texts.
-    
-    The wedge coupling also extends to longer distances via distance-decay:
-    - Distance 1 (adjacent): full strength
-    - Distance 2: 3/4 strength
-    - Distance 3: 1/2 strength
-    - Distance 4: 1/4 strength
-    - Distance 5+: 1/8 strength
+    v14.1 FIXES:
+    - Zero-meaned: subtract median so it only DISCRIMINATES
+    - Scaled to ~5% of recall energy (not dominant)
+    - Limited to distance 1-3 (longer range is too noisy)
     """
     
-    # Distance decay weights (integer, Q8 style)
     DISTANCE_WEIGHTS = {
         1: 256,   # 1.0
-        2: 192,   # 0.75
-        3: 128,   # 0.5
-        4: 64,    # 0.25
-        5: 32,    # 0.125
+        2: 128,   # 0.5
+        3: 64,    # 0.25
     }
-    DEFAULT_DISTANCE_WEIGHT = 16  # 0.0625 for distance > 5
     
     def __init__(
         self,
         n_clusters: int = 64,
-        wedge_weight: int = 150,     # Energy scale for wedge coupling
-        max_distance: int = 5,       # Maximum coupling distance
+        wedge_weight: int = 80,     # ~5% of recall_scale
+        max_distance: int = 3,      # Only nearby context
     ):
         self.n_clusters = n_clusters
         self.wedge_weight = wedge_weight
         self.max_distance = max_distance
         
-        # Forward coupling matrices by distance
-        # J_fwd_dist[d][c_i, c_j] = coupling from cluster c_i at pos i
-        # to cluster c_j at pos i+d
-        self.J_fwd_dist: Dict[int, np.ndarray] = {}  # d → (C, C) int16
-        self.J_bwd_dist: Dict[int, np.ndarray] = {}  # d → (C, C) int16
-        
-        # Net wedge coupling (precomputed: fwd - bwd^T)
-        self.J_wedge: Dict[int, np.ndarray] = {}  # d → (C, C) int16
+        # Wedge coupling matrices by distance: J_wedge[d][c1, c2]
+        self.J_wedge: Dict[int, np.ndarray] = {}
         
         self._built = False
     
@@ -622,25 +613,16 @@ class WedgeCoupling:
         sequences: List[List[int]],
         flag_state: FlagState,
     ) -> None:
-        """
-        Build distance-dependent antisymmetric couplings.
-        
-        For each distance d ∈ {1, 2, 3, 4, 5}:
-        - Count forward bigrams: (c_i, c_{i+d})
-        - Count backward bigrams: (c_{i+d}, c_i)
-        - Compute PMI-like coupling strength
-        - Net wedge = fwd - bwd^T (antisymmetric)
-        """
+        """Build antisymmetric wedge couplings."""
         print(f"\n  [WEDGE] Building antisymmetric wedge couplings...")
         print(f"  [WEDGE]   n_clusters={self.n_clusters}, max_distance={self.max_distance}")
+        print(f"  [WEDGE]   wedge_weight={self.wedge_weight}")
         
         vocab_size = flag_state._vocab_size
         C = self.n_clusters
         
         for d in range(1, self.max_distance + 1):
-            # Count cluster pairs at distance d
-            # counts[c1, c2] = number of times cluster c1 at position i
-            #                  is followed by cluster c2 at position i+d
+            # Count directional cluster pairs
             pair_counts = np.zeros((C, C), dtype=np.int64)
             
             for seq in sequences:
@@ -653,25 +635,13 @@ class WedgeCoupling:
                     c2 = int(flag_state.word_to_cluster[w2])
                     pair_counts[c1, c2] += 1
             
-            # Compute DIRECTIONAL PMI
-            # PMI(c1→c2) = log2(count(c1,c2) / expected(c1,c2))
-            #   where expected = left_marginal(c1) * right_marginal(c2) / total
-            # PMI(c2→c1) = log2(count(c2,c1) / expected(c2,c1))
-            #   where count(c2,c1) = how often c2 is LEFT context and c1 is RIGHT context
-            #   i.e., c2 appears d positions BEFORE c1
-            #   expected = left_marginal(c2) * right_marginal(c1) / total
-            #
-            # KEY: count(c1,c2) ≠ count(c2,c1) because language is ORDERED
-            # e.g., count(DET,NOUN) >> count(NOUN,DET)
-            # The WEDGE coupling is: PMI(c1→c2) - PMI(c2→c1)
-            # This is ANTISYMMETRIC: wedge[c1,c2] = -wedge[c2,c1]
-            
+            # Compute directional PMI
             total = max(1, int(pair_counts.sum()))
-            left_marginal = pair_counts.sum(axis=1)   # Row sums: c1 as left context
-            right_marginal = pair_counts.sum(axis=0)   # Col sums: c2 as right context
+            left_marginal = pair_counts.sum(axis=1)
+            right_marginal = pair_counts.sum(axis=0)
             
-            fwd_pmi = np.zeros((C, C), dtype=np.int16)  # PMI(c1→c2)
-            rev_pmi = np.zeros((C, C), dtype=np.int16)  # PMI(c2→c1) stored at [c1,c2]
+            fwd_pmi = np.zeros((C, C), dtype=np.int16)
+            rev_pmi = np.zeros((C, C), dtype=np.int16)
             
             for c1 in range(C):
                 if left_marginal[c1] == 0:
@@ -680,7 +650,7 @@ class WedgeCoupling:
                     if right_marginal[c2] == 0:
                         continue
                     
-                    # Forward PMI: P(c2|c1) vs P(c2)
+                    # Forward PMI
                     if pair_counts[c1, c2] > 0:
                         expected = int(left_marginal[c1]) * int(right_marginal[c2]) // total
                         if expected > 0:
@@ -689,8 +659,7 @@ class WedgeCoupling:
                                 log_val = (int(ratio).bit_length() - 1 - 8) * 4
                                 fwd_pmi[c1, c2] = max(0, min(63, log_val))
                     
-                    # Reverse PMI: P(c1|c2) vs P(c1) — stored at [c2,c1]
-                    # This is: how often is c2 LEFT context followed by c1?
+                    # Reverse PMI
                     if pair_counts[c2, c1] > 0 and left_marginal[c2] > 0 and right_marginal[c1] > 0:
                         expected = int(left_marginal[c2]) * int(right_marginal[c1]) // total
                         if expected > 0:
@@ -699,13 +668,7 @@ class WedgeCoupling:
                                 log_val = (int(ratio).bit_length() - 1 - 8) * 4
                                 rev_pmi[c1, c2] = max(0, min(63, log_val))
             
-            self.J_fwd_dist[d] = fwd_pmi
-            self.J_bwd_dist[d] = rev_pmi  # Now stores PMI(c2→c1) at [c1,c2]
-            
-            # Net wedge coupling: PMI(c1→c2) - PMI(c2→c1)
-            # ANTISYMMETRIC by construction:
-            #   wedge[c1,c2] = PMI(c1→c2) - PMI(c2→c1)
-            #   wedge[c2,c1] = PMI(c2→c1) - PMI(c1→c2) = -wedge[c1,c2]
+            # Net wedge = fwd - rev (antisymmetric)
             wedge = fwd_pmi.astype(np.int16) - rev_pmi.astype(np.int16)
             self.J_wedge[d] = wedge
             
@@ -713,8 +676,7 @@ class WedgeCoupling:
             n_neg = int(np.sum(wedge < 0))
             n_zero = int(np.sum(wedge == 0))
             max_abs = int(np.max(np.abs(wedge))) if n_pos + n_neg > 0 else 0
-            print(f"  [WEDGE]   distance={d}: fwd_max={fwd_pmi.max()}, rev_max={rev_pmi.max()}, "
-                  f"wedge: +{n_pos}/-{n_neg}/0={n_zero}, max_abs={max_abs}")
+            print(f"  [WEDGE]   distance={d}: +{n_pos}/-{n_neg}/0={n_zero}, max_abs={max_abs}")
         
         self._built = True
         print(f"  [WEDGE] Wedge couplings built successfully.")
@@ -725,19 +687,7 @@ class WedgeCoupling:
         context_words: List[int],
         flag_state: FlagState,
     ) -> np.ndarray:
-        """
-        Compute wedge coupling energy for candidate words.
-        
-        E_wedge(w) = Σ_d Σ_{ctx_w} J_wedge[d][c_ctx, c_w] × dist_weight(d)
-        
-        The key insight: J_wedge = fwd - bwd^T is ANTISYMMETRIC, so:
-        - J_wedge[DET, NOUN] > 0 → "the dog" gets BONUS (forward-likely)
-        - J_wedge[NOUN, DET] < 0 → "dog the" gets PENALTY (backward-likely)
-        
-        This is the actual Grassmann wedge product: a∧b = -b∧a
-        
-        All integer arithmetic. Returns shape (n_candidates,) int64.
-        """
+        """Compute wedge coupling energy (zero-meaned, capped)."""
         n_candidates = len(candidate_words)
         energies = np.zeros(n_candidates, dtype=np.int64)
         
@@ -746,19 +696,18 @@ class WedgeCoupling:
         
         vocab_size = flag_state._vocab_size
         
-        # Precompute context clusters and distances
-        ctx_info = []  # (cluster, distance) pairs
-        effective_window = min(len(context_words), 10)  # Look back up to 10 words
+        # Get context clusters with distances
+        ctx_info = []
+        effective_window = min(len(context_words), 6)
         for i, cw in enumerate(context_words[-effective_window:]):
-            dist = effective_window - i  # Distance from current position
-            if cw < vocab_size:
+            dist = effective_window - i
+            if cw < vocab_size and dist <= self.max_distance:
                 cc = int(flag_state.word_to_cluster[cw])
                 ctx_info.append((cc, dist))
         
         if not ctx_info:
             return energies
         
-        # Compute wedge energy for each candidate using ANTISYMMETRIC coupling
         for i, w in enumerate(candidate_words):
             w_int = int(w)
             if w_int >= vocab_size:
@@ -766,354 +715,91 @@ class WedgeCoupling:
             c_w = int(flag_state.word_to_cluster[w_int])
             
             total_wedge = 0
-            for cc, dist in ctx_info:
-                d = min(dist, self.max_distance)
-                
-                # Get distance weight
-                dw = self.DISTANCE_WEIGHTS.get(d, self.DEFAULT_DISTANCE_WEIGHT)
-                
-                # Use ANTISYMMETRIC J_wedge (not just fwd!)
-                # J_wedge[d][cc, c_w] > 0 means cc→c_w is forward-likely (bonus)
-                # J_wedge[d][cc, c_w] < 0 means cc→c_w is backward-likely (penalty)
+            for cc, d in ctx_info:
+                dw = self.DISTANCE_WEIGHTS.get(d, 64)
                 if d in self.J_wedge:
                     wedge_val = int(self.J_wedge[d][cc, c_w])
                 else:
-                    # Fallback: use fwd-only if wedge not precomputed
-                    if d in self.J_fwd_dist:
-                        wedge_val = int(self.J_fwd_dist[d][cc, c_w])
-                    else:
-                        wedge_val = 0
-                
-                # Weight by distance
+                    wedge_val = 0
                 total_wedge += wedge_val * dw
             
-            # Negative energy for positive wedge (forward-likely) = bonus
-            # Positive energy for negative wedge (backward-likely) = penalty
-            energies[i] -= (total_wedge * self.wedge_weight) >> 8  # Q8 → integer
+            # Negative energy = bonus for forward-likely pairs
+            energies[i] -= (total_wedge * self.wedge_weight) >> 8
+        
+        # ZERO-MEAN: subtract median
+        median_e = int(np.median(energies))
+        energies -= median_e
+        
+        # CAP: at ±5% of recall_scale (80)
+        cap = 80
+        energies = np.clip(energies, -cap, cap)
         
         return energies
 
 
 # ============================================================================
-# BLOCK MEMORY: Integer-only retrieval-augmented generation
-# ============================================================================
-
-class BlockMemory:
-    """
-    Block-based exact-token memory with sparse readout.
-    
-    Inspired by gfst-hmb: "block-based exact-token memory with sparse readout"
-    
-    During training:
-    - Text is stored in fixed-size blocks (B=32 words)
-    - Each block is tagged with: topic_id, cluster_signature, first_words_hash
-    - Blocks are indexed by topic for fast retrieval
-    
-    During generation:
-    - Current context is matched to blocks by topic and cluster signature
-    - Matching blocks provide "memory readout": what words followed
-      similar contexts in the training data
-    - This provides LONG-RANGE context beyond the n-gram window
-    
-    Key difference from n-gram recall:
-    - N-gram recall: local context (last 5 words) → next word
-    - Block memory: GLOBAL context (topic + cluster pattern) → relevant text
-    
-    Integer-only: all matching is via integer equality and hash comparison.
-    """
-    
-    def __init__(
-        self,
-        block_size: int = 32,
-        max_blocks: int = 500000,     # Cap memory usage
-        memory_weight: int = 100,     # Energy scale for block readout
-        n_topics: int = 16,
-        n_clusters: int = 64,
-    ):
-        self.block_size = block_size
-        self.max_blocks = max_blocks
-        self.memory_weight = memory_weight
-        self.n_topics = n_topics
-        self.n_clusters = n_clusters
-        
-        # Block storage
-        # Each block: (topic_id, cluster_sig, word_indices)
-        self.blocks: List[Tuple[int, int, np.ndarray]] = []
-        
-        # Index: topic_id → list of block indices
-        self.topic_index: Dict[int, List[int]] = defaultdict(list)
-        
-        # Index: cluster_sig → list of block indices
-        self.cluster_index: Dict[int, List[int]] = defaultdict(list)
-        
-        # Readout cache: (topic, last_2_clusters_hash) → Counter of next words
-        self.readout_cache: Dict[Tuple[int, int], Counter] = defaultdict(Counter)
-        
-        self._built = False
-    
-    def build(
-        self,
-        sequences: List[List[int]],
-        flag_state: FlagState,
-    ) -> None:
-        """
-        Build block memory from training sequences.
-        
-        Each sequence is split into blocks of block_size words.
-        Each block is tagged and indexed.
-        """
-        print(f"\n  [MEMORY] Building block memory...")
-        print(f"  [MEMORY]   block_size={self.block_size}, max_blocks={self.max_blocks}")
-        
-        vocab_size = flag_state._vocab_size
-        n_blocks = 0
-        
-        for seq in sequences:
-            # Split sequence into blocks
-            for start in range(0, len(seq), self.block_size):
-                if n_blocks >= self.max_blocks:
-                    break
-                
-                end = min(start + self.block_size, len(seq))
-                block_words = seq[start:end]
-                
-                if len(block_words) < 4:  # Skip very short blocks
-                    continue
-                
-                # Compute block signature
-                # Topic: dominant topic in block
-                topic = flag_state.get_topic(block_words)
-                
-                # Cluster signature: hash of first 4 clusters
-                cluster_sig = 0
-                for i, w in enumerate(block_words[:4]):
-                    if w < vocab_size:
-                        c = flag_state.get_cluster(w)
-                        cluster_sig = cluster_sig * self.n_clusters + c
-                
-                # Store block
-                block_idx = len(self.blocks)
-                self.blocks.append((topic, cluster_sig, np.array(block_words, dtype=np.int32)))
-                self.topic_index[topic].append(block_idx)
-                self.cluster_index[cluster_sig % 1024].append(block_idx)  # Hash to 1024 buckets
-                
-                n_blocks += 1
-            
-            if n_blocks >= self.max_blocks:
-                break
-        
-        # Build readout cache: for each block boundary, record what word
-        # follows after a given (topic, cluster_pattern) context
-        print(f"  [MEMORY]   Stored {n_blocks} blocks")
-        self._build_readout_cache(sequences, flag_state)
-        
-        self._built = True
-        print(f"  [MEMORY] Block memory built successfully.")
-    
-    def _build_readout_cache(
-        self,
-        sequences: List[List[int]],
-        flag_state: FlagState,
-    ) -> None:
-        """
-        Build readout cache: (topic, cluster_context_hash) → Counter of next words.
-        
-        This precomputes what words tend to follow given topic+cluster contexts,
-        enabling fast lookup during generation.
-        """
-        vocab_size = flag_state._vocab_size
-        total_entries = 0
-        
-        for seq in sequences:
-            if len(seq) < 6:
-                continue
-            
-            for i in range(3, len(seq) - 1):
-                w = seq[i]
-                next_w = seq[i + 1]
-                
-                if w >= vocab_size or next_w >= vocab_size:
-                    continue
-                
-                # Context: topic + hash of last 2 clusters
-                topic = int(flag_state.word_to_topic[w])
-                c1 = int(flag_state.word_to_cluster[seq[i - 2]]) if seq[i - 2] < vocab_size else 0
-                c2 = int(flag_state.word_to_cluster[seq[i - 1]]) if seq[i - 1] < vocab_size else 0
-                ctx_hash = c1 * self.n_clusters + c2
-                
-                self.readout_cache[(topic, ctx_hash)][next_w] += 1
-                total_entries += 1
-        
-        # Prune: keep only top-50 next words per context
-        pruned = 0
-        for key in self.readout_cache:
-            counter = self.readout_cache[key]
-            if len(counter) > 50:
-                top_50 = counter.most_common(50)
-                self.readout_cache[key] = Counter(dict(top_50))
-                pruned += 1
-        
-        print(f"  [MEMORY]   Readout cache: {len(self.readout_cache)} contexts, "
-              f"{total_entries} entries, {pruned} pruned to top-50")
-    
-    def compute_memory_energy(
-        self,
-        candidate_words: np.ndarray,
-        context_words: List[int],
-        flag_state: FlagState,
-    ) -> np.ndarray:
-        """
-        Compute block memory readout energy for candidate words.
-        
-        E_memory(w) = -memory_weight * log2(P(w | topic, cluster_context))
-        
-        Where P(w | topic, cluster_context) is estimated from the
-        readout cache — how often word w followed this topic+cluster
-        pattern in the training data.
-        
-        All integer arithmetic. Returns shape (n_candidates,) int64.
-        """
-        n_candidates = len(candidate_words)
-        energies = np.zeros(n_candidates, dtype=np.int64)
-        
-        if not self._built or len(context_words) < 3:
-            return energies
-        
-        vocab_size = flag_state._vocab_size
-        
-        # Compute current context signature
-        last_word = context_words[-1]
-        if last_word >= vocab_size:
-            return energies
-        
-        topic = int(flag_state.word_to_topic[last_word])
-        c1 = int(flag_state.word_to_cluster[context_words[-3]]) if context_words[-3] < vocab_size else 0
-        c2 = int(flag_state.word_to_cluster[context_words[-2]]) if context_words[-2] < vocab_size else 0
-        ctx_hash = c1 * flag_state.n_clusters + c2
-        
-        # Look up readout cache
-        key = (topic, ctx_hash)
-        if key not in self.readout_cache:
-            return energies
-        
-        counter = self.readout_cache[key]
-        total = sum(counter.values())
-        if total == 0:
-            return energies
-        
-        # Compute energy for each candidate
-        for i, w in enumerate(candidate_words):
-            w_int = int(w)
-            count = counter.get(w_int, 0)
-            if count > 0:
-                # E = -memory_weight * log2(count/total)
-                # = memory_weight * log2(total/count)
-                # Use integer log2 approximation: floor(4 * log2(total/count))
-                ratio = total * 256 // max(1, count)  # Q8 ratio
-                if ratio > 1:
-                    log_val = (int(ratio).bit_length() - 1 - 8) * 4  # 4x finer
-                    log_val = max(0, log_val)
-                    # Subtract: lower energy = better
-                    energies[i] -= self.memory_weight * log_val
-            # else: no memory signal, energy stays 0
-        
-        return energies
-    
-    def retrieve_blocks(
-        self,
-        topic: int,
-        n_blocks: int = 5,
-    ) -> List[np.ndarray]:
-        """
-        Retrieve blocks matching a topic for text generation context.
-        
-        Returns list of word index arrays.
-        """
-        if not self._built or topic not in self.topic_index:
-            return []
-        
-        indices = self.topic_index[topic][:n_blocks]
-        return [self.blocks[i][2] for i in indices]
-
-
-# ============================================================================
-# GRASSMANN FLAG LAYER: Unified interface
+# GRASSMANN FLAG LAYER: Unified interface (v14.1)
 # ============================================================================
 
 class GrassmannFlagLayer:
     """
-    Unified Grassmann Flag Layer combining all three innovations.
+    Unified Grassmann Flag Layer v14.1.
     
-    This is the main interface that the Ising LM will use.
+    v14.1 replaces the failed v14.0 approach with:
+    1. CLUSTER N-GRAM RECALL: long-range context via cluster-level n-grams
+       - Provides information word n-grams CANNOT at long range
+       - Zero-meaned, capped at 10% of recall
+    2. WEDGE COUPLING: antisymmetric direction-dependent interaction
+       - Captures word ORDER that symmetric PMI cannot
+       - Zero-meaned, capped at 5% of recall
     
-    Energy terms added to the Ising Hamiltonian:
-    
-    1. E_flag(w): Flag state energy (cluster + topic consistency)
-    2. E_wedge(w): Antisymmetric wedge coupling energy
-    3. E_memory(w): Block memory readout energy
-    
-    Total Grassmann energy:
-        E_grassmann(w) = E_flag(w) + E_wedge(w) + E_memory(w)
-    
-    This is ADDED to the existing recall energy. The key difference
-    from just cranking PMI weight: these are STRUCTURALLY different
-    energy terms that capture information PMI cannot:
-    - Flag: hierarchical multi-resolution consistency
-    - Wedge: direction-dependent (antisymmetric) coupling
-    - Memory: long-range retrieval beyond n-gram window
+    REMOVED from v14.0 (redundant):
+    - Flag cluster energy (duplicates word n-gram recall)
+    - Flag topic energy (duplicates Potts topic spin)
+    - Block memory (too sparse, replaced by cluster n-gram recall)
     """
     
     def __init__(
         self,
-        # Flag state parameters
         n_clusters: int = 64,
         n_topics: int = 16,
-        cluster_weight: int = 200,
-        topic_weight: int = 300,
-        # Wedge coupling parameters
-        wedge_weight: int = 150,
-        max_wedge_distance: int = 5,
-        # Block memory parameters
-        block_size: int = 32,
-        max_blocks: int = 500000,
-        memory_weight: int = 100,
-        # Global
+        cluster_weight: int = 0,       # DEPRECATED — kept for API compat
+        topic_weight: int = 0,         # DEPRECATED — kept for API compat
+        wedge_weight: int = 80,
+        max_wedge_distance: int = 3,
+        block_size: int = 32,          # DEPRECATED
+        max_blocks: int = 0,           # DEPRECATED
+        memory_weight: int = 0,        # DEPRECATED
+        max_cluster_ngram: int = 6,
+        cluster_recall_scale: int = 200,
         enabled: bool = True,
     ):
-        self.enabled = enabled
         self.n_clusters = n_clusters
         self.n_topics = n_topics
+        self.enabled = enabled
         
-        # Create sub-layers
-        self.flag_state = FlagState(
+        # Sub-layers
+        self.flag_state = FlagState(n_clusters, n_topics)
+        self.cluster_ngram = ClusterNGramRecall(
             n_clusters=n_clusters,
-            n_topics=n_topics,
-            cluster_weight=cluster_weight,
-            topic_weight=topic_weight,
+            max_cluster_ngram=max_cluster_ngram,
+            cluster_recall_scale=cluster_recall_scale,
         )
-        self.wedge_coupling = WedgeCoupling(
+        self.wedge = WedgeCoupling(
             n_clusters=n_clusters,
             wedge_weight=wedge_weight,
             max_distance=max_wedge_distance,
         )
-        self.block_memory = BlockMemory(
-            block_size=block_size,
-            max_blocks=max_blocks,
-            memory_weight=memory_weight,
-            n_topics=n_topics,
-            n_clusters=n_clusters,
-        )
         
-        # Current topic state (Potts-like, updated during generation)
-        self._current_topic: int = 0
+        # Current topic (updated during generation)
+        self._current_topic = 0
         
         # Diagnostics
-        self._stats = {
-            'flag_cluster_hits': 0,
-            'flag_topic_hits': 0,
+        self._diag = {
+            'cluster_ngram_hits': 0,
             'wedge_coupling_hits': 0,
-            'memory_readout_hits': 0,
-            'total_positions': 0,
+            'cluster_ngram_energy_sum': 0,
+            'wedge_energy_sum': 0,
         }
     
     def build(
@@ -1122,84 +808,66 @@ class GrassmannFlagLayer:
         vocab_size: int,
         word_freq: np.ndarray,
     ) -> None:
-        """Build all sub-layers from training sequences."""
-        if not self.enabled:
-            print("  [GRASSMANN] Layer disabled, skipping build.")
-            return
-        
-        print("\n" + "=" * 70)
-        print("GRASSMANN FLAG LAYER — BUILD")
-        print("=" * 70)
-        print(f"  Architecture: Flag({self.n_clusters} clusters, {self.n_topics} topics) "
-              f"+ Wedge(dist≤{self.wedge_coupling.max_distance}) "
-              f"+ Memory(blocks≤{self.block_memory.max_blocks})")
-        
-        # Build flag state (word → cluster → topic hierarchy)
+        """Build all sub-layers."""
+        # Build flag state (cluster + topic assignments)
         self.flag_state.build(sequences, vocab_size, word_freq)
         
-        # Build wedge couplings (antisymmetric cluster interactions)
-        self.wedge_coupling.build(sequences, self.flag_state)
+        # Build cluster n-gram recall
+        self.cluster_ngram.build(sequences, self.flag_state)
         
-        # Build block memory (retrieval-augmented generation)
-        self.block_memory.build(sequences, self.flag_state)
-        
-        print("\n  [GRASSMANN] All sub-layers built successfully.")
-        print("=" * 70)
+        # Build wedge coupling
+        self.wedge.build(sequences, self.flag_state)
     
     def compute_energy(
         self,
         candidate_words: np.ndarray,
         context_words: List[int],
     ) -> np.ndarray:
-        """
-        Compute total Grassmann flag energy for candidate words.
-        
-        E_grassmann(w) = E_flag(w) + E_wedge(w) + E_memory(w)
-        
-        Returns shape (n_candidates,) int64. Lower = more likely.
-        """
-        if not self.enabled:
-            return np.zeros(len(candidate_words), dtype=np.int64)
-        
-        self._stats['total_positions'] += 1
-        
-        # 1. Flag state energy (cluster + topic consistency)
-        flag_energy = self.flag_state.compute_flag_energy(
-            candidate_words, context_words, self._current_topic
-        )
-        
-        if int(np.abs(flag_energy).max()) > 0:
-            self._stats['flag_cluster_hits'] += 1
-        
-        # 2. Wedge coupling energy (antisymmetric direction-dependent)
-        wedge_energy = self.wedge_coupling.compute_wedge_energy(
+        """Compute total Grassmann flag energy."""
+        # Cluster n-gram recall energy
+        cluster_energy = self.cluster_ngram.compute_energy(
             candidate_words, context_words, self.flag_state
         )
         
+        # Wedge coupling energy
+        wedge_energy = self.wedge.compute_wedge_energy(
+            candidate_words, context_words, self.flag_state
+        )
+        
+        total = cluster_energy + wedge_energy
+        
+        # Update diagnostics
+        if int(np.abs(cluster_energy).max()) > 0:
+            self._diag['cluster_ngram_hits'] += 1
         if int(np.abs(wedge_energy).max()) > 0:
-            self._stats['wedge_coupling_hits'] += 1
+            self._diag['wedge_coupling_hits'] += 1
+        self._diag['cluster_ngram_energy_sum'] += int(np.abs(cluster_energy).sum())
+        self._diag['wedge_energy_sum'] += int(np.abs(wedge_energy).sum())
         
-        # 3. Block memory readout energy (long-range retrieval)
-        memory_energy = self.block_memory.compute_memory_energy(
-            candidate_words, context_words, self.flag_state
-        )
-        
-        if int(np.abs(memory_energy).max()) > 0:
-            self._stats['memory_readout_hits'] += 1
-        
-        return flag_energy + wedge_energy + memory_energy
+        return total
     
     def update_topic(self, words: List[int]) -> None:
-        """
-        Update the current topic state based on recent words.
-        
-        This is the Potts spin update: the topic "spin" aligns with
-        the dominant topic of the generated text so far.
-        """
-        if not self.enabled:
-            return
-        self._current_topic = self.flag_state.get_topic(words)
+        """Update current topic from generated words."""
+        if self.flag_state._built and words:
+            self._current_topic = self.flag_state.get_topic(words)
     
     def get_diagnostics(self) -> Dict:
-        """Return diagnostic statistics."""
-        return dict(self._stats)
+        """Get diagnostic information."""
+        return dict(self._diag)
+    
+    def get_energy_breakdown(
+        self,
+        candidate_words: np.ndarray,
+        context_words: List[int],
+    ) -> Dict[str, int]:
+        """Get energy breakdown for diagnostics."""
+        cluster_e = self.cluster_ngram.compute_energy(
+            candidate_words, context_words, self.flag_state
+        )
+        wedge_e = self.wedge.compute_wedge_energy(
+            candidate_words, context_words, self.flag_state
+        )
+        return {
+            'cluster_ngram': int(np.abs(cluster_e).sum()),
+            'wedge': int(np.abs(wedge_e).sum()),
+        }

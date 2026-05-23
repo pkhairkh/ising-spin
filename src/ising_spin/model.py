@@ -3995,7 +3995,7 @@ class IsingLM:
             'topic_spin_flips': 0, 'topic_coherence_penalties': 0,
             'mcmc_flips_accepted': 0, 'mcmc_flips_proposed': 0,
             'grassmann_flag_hits': 0, 'grassmann_wedge_hits': 0,
-            'grassmann_memory_hits': 0,
+            'grassmann_memory_hits': 0, 'grassmann_cluster_ngram_hits': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -4208,12 +4208,11 @@ class IsingLM:
             energies += grassmann_energy
             # Track diagnostics
             gf_stats = self.grassmann_flag_layer.get_diagnostics()
-            if gf_stats.get('flag_cluster_hits', 0) > 0:
+            if gf_stats.get('cluster_ngram_hits', 0) > 0:
+                self._stats['grassmann_cluster_ngram_hits'] = self._stats.get('grassmann_cluster_ngram_hits', 0) + 1
                 self._stats['grassmann_flag_hits'] = self._stats.get('grassmann_flag_hits', 0) + 1
             if gf_stats.get('wedge_coupling_hits', 0) > 0:
                 self._stats['grassmann_wedge_hits'] = self._stats.get('grassmann_wedge_hits', 0) + 1
-            if gf_stats.get('memory_readout_hits', 0) > 0:
-                self._stats['grassmann_memory_hits'] = self._stats.get('grassmann_memory_hits', 0) + 1
 
         # === LOCAL FIELD (unigram frequency) ===
         # v5.0: Field always contributes fully, no damping
@@ -5165,13 +5164,15 @@ class IsingLMModel:
         grassmann_flag_enabled: bool = False,
         grassmann_n_clusters: int = 64,
         grassmann_n_topics: int = 16,
-        grassmann_cluster_weight: int = 200,
-        grassmann_topic_weight: int = 300,
-        grassmann_wedge_weight: int = 150,
-        grassmann_max_wedge_distance: int = 5,
-        grassmann_block_size: int = 32,
-        grassmann_max_blocks: int = 500000,
-        grassmann_memory_weight: int = 100,
+        grassmann_cluster_weight: int = 0,       # DEPRECATED in v14.1
+        grassmann_topic_weight: int = 0,         # DEPRECATED in v14.1
+        grassmann_wedge_weight: int = 80,
+        grassmann_max_wedge_distance: int = 3,
+        grassmann_block_size: int = 32,          # DEPRECATED in v14.1
+        grassmann_max_blocks: int = 0,           # DEPRECATED in v14.1
+        grassmann_memory_weight: int = 0,        # DEPRECATED in v14.1
+        grassmann_max_cluster_ngram: int = 6,
+        grassmann_cluster_recall_scale: int = 200,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -5227,7 +5228,7 @@ class IsingLMModel:
         # v12.1: N-gram index sequence cap
         self.ngram_max_sequences = ngram_max_sequences
 
-        # v14.0: Grassmann Flag Layer parameters
+        # v14.1: Grassmann Flag Layer parameters
         self.grassmann_flag_enabled = grassmann_flag_enabled
         self.grassmann_n_clusters = grassmann_n_clusters
         self.grassmann_n_topics = grassmann_n_topics
@@ -5238,6 +5239,8 @@ class IsingLMModel:
         self.grassmann_block_size = grassmann_block_size
         self.grassmann_max_blocks = grassmann_max_blocks
         self.grassmann_memory_weight = grassmann_memory_weight
+        self.grassmann_max_cluster_ngram = grassmann_max_cluster_ngram
+        self.grassmann_cluster_recall_scale = grassmann_cluster_recall_scale
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
@@ -5577,6 +5580,8 @@ class IsingLMModel:
                 block_size=self.grassmann_block_size,
                 max_blocks=self.grassmann_max_blocks,
                 memory_weight=self.grassmann_memory_weight,
+                max_cluster_ngram=self.grassmann_max_cluster_ngram,
+                cluster_recall_scale=self.grassmann_cluster_recall_scale,
                 enabled=True,
             )
             # Build from training sequences
