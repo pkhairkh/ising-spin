@@ -71,6 +71,7 @@ from typing import Dict, List, Optional, Tuple, Set
 import scipy.sparse as sp
 
 from .grassmann_flag import GrassmannFlagLayer
+from .context_accumulator import ContextAccumulatorLayer
 
 
 def _get_rss_mb() -> int:
@@ -3915,6 +3916,7 @@ class IsingLM:
         interpolated: bool = False,
         kn_backoff: bool = False,
         grassmann_flag_layer: Optional[GrassmannFlagLayer] = None,
+        context_accumulator_layer: Optional[ContextAccumulatorLayer] = None,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -3961,6 +3963,9 @@ class IsingLM:
         # v14.0: Grassmann Flag Layer (flag states + wedge couplings + block memory)
         self.grassmann_flag_layer = grassmann_flag_layer
 
+        # v15.0: Context Accumulator Layer (H2W field + 3-spin + confidence)
+        self.context_accumulator_layer = context_accumulator_layer
+
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=50000)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=50000)
 
@@ -3996,6 +4001,7 @@ class IsingLM:
             'mcmc_flips_accepted': 0, 'mcmc_flips_proposed': 0,
             'grassmann_flag_hits': 0, 'grassmann_wedge_hits': 0,
             'grassmann_memory_hits': 0, 'grassmann_cluster_ngram_hits': 0,
+            'caf_h2w_hits': 0, 'caf_spin3_hits': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -4213,6 +4219,25 @@ class IsingLM:
                 self._stats['grassmann_flag_hits'] = self._stats.get('grassmann_flag_hits', 0) + 1
             if gf_stats.get('wedge_coupling_hits', 0) > 0:
                 self._stats['grassmann_wedge_hits'] = self._stats.get('grassmann_wedge_hits', 0) + 1
+
+        # === CONTEXT ACCUMULATOR ENERGY (v15: H2W field + 3-spin + confidence) ===
+        # The FUNDAMENTAL change: this layer can COMPETE with recall energy.
+        # - H2W accumulator field: up to ±800 (50% of recall_scale)
+        # - 3-spin compositional: up to ±400 (25% of recall_scale)
+        # When the accumulator has strong signal, it CAN shift recall's ranking.
+        if self.context_accumulator_layer is not None and self.context_accumulator_layer.enabled:
+            ca_energy, ca_confidence = self.context_accumulator_layer.compute_energy(
+                candidate_words, context_words,
+                recall_ngram_level=5,
+                recall_ngram_count=100,
+            )
+            energies += ca_energy
+            # Track diagnostics
+            ca_stats = self.context_accumulator_layer.get_diagnostics()
+            if ca_stats.get('h2w_hits', 0) > 0:
+                self._stats['caf_h2w_hits'] = self._stats.get('caf_h2w_hits', 0) + 1
+            if ca_stats.get('spin3_hits', 0) > 0:
+                self._stats['caf_spin3_hits'] = self._stats.get('caf_spin3_hits', 0) + 1
 
         # === LOCAL FIELD (unigram frequency) ===
         # v5.0: Field always contributes fully, no damping
@@ -4918,6 +4943,12 @@ class IsingLM:
         if self.grassmann_flag_layer is not None and self.grassmann_flag_layer.enabled:
             self.grassmann_flag_layer.update_topic(words)
 
+        # v15.0: Initialize Context Accumulator from prompt
+        if self.context_accumulator_layer is not None and self.context_accumulator_layer.enabled:
+            self.context_accumulator_layer.reset()
+            for w in words:
+                self.context_accumulator_layer.update_context(w)
+
         for pos in range(1, length):
             # v8.2: Periodic Potts spin-flip for topic coherence
             if (self.topic_spin_layer is not None
@@ -5027,6 +5058,10 @@ class IsingLM:
             # v14.0: Update Grassmann flag topic state
             if self.grassmann_flag_layer is not None and self.grassmann_flag_layer.enabled:
                 self.grassmann_flag_layer.update_topic(words)
+
+            # v15.0: Update Context Accumulator state
+            if self.context_accumulator_layer is not None and self.context_accumulator_layer.enabled:
+                self.context_accumulator_layer.update_context(chosen_word)
 
             self._stats['total_positions'] += 1
             if recall_hit:
@@ -5173,6 +5208,17 @@ class IsingLMModel:
         grassmann_memory_weight: int = 0,        # DEPRECATED in v14.1
         grassmann_max_cluster_ngram: int = 6,
         grassmann_cluster_recall_scale: int = 200,
+        # v15.0: Context Accumulator Layer (H2W field + 3-spin + confidence)
+        context_accumulator_enabled: bool = False,
+        accumulator_weight: int = 800,
+        accumulator_context_window: int = 50,
+        accumulator_decay_interval: int = 10,
+        accumulator_histogram_increment: int = 16,
+        caf_spin3_weight: int = 400,
+        caf_spin3_window: int = 20,
+        caf_spin3_min_count: int = 3,
+        caf_confidence_min_count: int = 10,
+        caf_min_confidence_q8: int = 128,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -5242,6 +5288,18 @@ class IsingLMModel:
         self.grassmann_max_cluster_ngram = grassmann_max_cluster_ngram
         self.grassmann_cluster_recall_scale = grassmann_cluster_recall_scale
 
+        # v15.0: Context Accumulator Layer parameters
+        self.context_accumulator_enabled = context_accumulator_enabled
+        self.accumulator_weight = accumulator_weight
+        self.accumulator_context_window = accumulator_context_window
+        self.accumulator_decay_interval = accumulator_decay_interval
+        self.accumulator_histogram_increment = accumulator_histogram_increment
+        self.caf_spin3_weight = caf_spin3_weight
+        self.caf_spin3_window = caf_spin3_window
+        self.caf_spin3_min_count = caf_spin3_min_count
+        self.caf_confidence_min_count = caf_confidence_min_count
+        self.caf_min_confidence_q8 = caf_min_confidence_q8
+
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
         self.J: Optional[sp.csr_matrix] = None
@@ -5255,6 +5313,7 @@ class IsingLMModel:
         self.graded_couplings: Optional[GradedCouplings] = None
         self.topic_spin_layer: Optional[TopicSpinLayer] = None
         self.grassmann_flag_layer: Optional[GrassmannFlagLayer] = None
+        self.context_accumulator_layer: Optional[ContextAccumulatorLayer] = None
         self.generator: Optional[IsingLM] = None
         self.baseline_generator: Optional[IsingLM] = None
         self.sequences: Optional[List[List[int]]] = None
@@ -5596,6 +5655,44 @@ class IsingLMModel:
         else:
             print("\n[11b/13] Skipping Grassmann Flag Layer (disabled)")
             self.grassmann_flag_layer = None
+
+        # Step 11c: Build Context Accumulator Layer (v15: H2W + 3-spin + confidence)
+        if self.context_accumulator_enabled:
+            print("\n[11c/13] Building Context Accumulator Layer (v15)...")
+            self.context_accumulator_layer = ContextAccumulatorLayer(
+                n_clusters=self.grassmann_n_clusters,
+                n_topics=self.grassmann_n_topics,
+                accumulator_weight=self.accumulator_weight,
+                context_window=self.accumulator_context_window,
+                decay_interval=self.accumulator_decay_interval,
+                histogram_increment=self.accumulator_histogram_increment,
+                spin3_weight=self.caf_spin3_weight,
+                spin3_window=self.caf_spin3_window,
+                spin3_min_count=self.caf_spin3_min_count,
+                confidence_min_count=self.caf_confidence_min_count,
+                min_confidence_q8=self.caf_min_confidence_q8,
+                wedge_weight=self.grassmann_wedge_weight,
+                max_wedge_distance=self.grassmann_max_wedge_distance,
+                max_cluster_ngram=self.grassmann_max_cluster_ngram,
+                cluster_recall_scale=self.grassmann_cluster_recall_scale,
+                enabled=True,
+            )
+            # Build from training sequences
+            word_freq = np.zeros(len(self.vocab), dtype=np.int64)
+            for seq in self.sequences:
+                for w in seq:
+                    if w < len(self.vocab):
+                        word_freq[w] += 1
+            self.context_accumulator_layer.build(
+                self.sequences, len(self.vocab), word_freq
+            )
+            # Disable Grassmann flag layer (context accumulator supersedes it)
+            if self.grassmann_flag_layer is not None:
+                print("  [v15] Disabling Grassmann Flag Layer (superseded by Context Accumulator)")
+                self.grassmann_flag_layer = None
+        else:
+            print("\n[11c/13] Skipping Context Accumulator Layer (disabled)")
+            self.context_accumulator_layer = None
 
         # Step 12: Build generators
         print("\n[12/13] Building generators...")
@@ -6045,6 +6142,7 @@ class IsingLMModel:
             graded_couplings=self.graded_couplings,
             topic_spin_layer=self.topic_spin_layer,
             grassmann_flag_layer=self.grassmann_flag_layer,
+            context_accumulator_layer=self.context_accumulator_layer,
             interpolated=self.interpolated,
             kn_backoff=self.kn_backoff,
         )
@@ -6200,6 +6298,10 @@ class IsingLMModel:
             if len(seq) < 3:
                 continue
 
+            # v15.0: Reset context accumulator for each new sequence
+            if gen.context_accumulator_layer is not None and gen.context_accumulator_layer.enabled:
+                gen.context_accumulator_layer.reset()
+
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
                 context_words = seq[:pos]
@@ -6261,6 +6363,10 @@ class IsingLMModel:
                     total_log2_prob += -15 * LOG2_SCALE
 
                 total_tokens += 1
+
+                # v15.0: Update context accumulator with actual next word
+                if gen.context_accumulator_layer is not None and gen.context_accumulator_layer.enabled:
+                    gen.context_accumulator_layer.update_context(target_word)
 
         if total_tokens == 0:
             return float('inf')

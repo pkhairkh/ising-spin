@@ -1,5 +1,6 @@
 pyproject.toml
 src/ising_spin/__init__.py
+src/ising_spin/context_accumulator.py
 src/ising_spin/grassmann_flag.py
 src/ising_spin/model.py
 src/ising_spin.egg-info/PKG-INFO
