@@ -72,6 +72,7 @@ import scipy.sparse as sp
 
 from .grassmann_flag import GrassmannFlagLayer
 from .context_accumulator import ContextAccumulatorLayer
+from .longrange_coupling import LongRangeCouplingLayer
 
 
 def _get_rss_mb() -> int:
@@ -3917,6 +3918,7 @@ class IsingLM:
         kn_backoff: bool = False,
         grassmann_flag_layer: Optional[GrassmannFlagLayer] = None,
         context_accumulator_layer: Optional[ContextAccumulatorLayer] = None,
+        longrange_layer: Optional[LongRangeCouplingLayer] = None,
     ):
         self.vocab = vocab
         self.ngram_index = ngram_index
@@ -3966,6 +3968,9 @@ class IsingLM:
         # v15.0: Context Accumulator Layer (H2W field + 3-spin + confidence)
         self.context_accumulator_layer = context_accumulator_layer
 
+        # v16.0: Long-Range Word-Word Coupling Layer (direct PMI, no clusters)
+        self.longrange_layer = longrange_layer
+
         self.type_sampler = IntegerBoltzmannSampler(beta=beta_type, max_delta=50000)
         self.word_sampler = IntegerBoltzmannSampler(beta=beta_word, max_delta=50000)
 
@@ -4002,6 +4007,7 @@ class IsingLM:
             'grassmann_flag_hits': 0, 'grassmann_wedge_hits': 0,
             'grassmann_memory_hits': 0, 'grassmann_cluster_ngram_hits': 0,
             'caf_h2w_hits': 0, 'caf_spin3_hits': 0,
+            'lr_hits': 0,
         }
 
     def _get_word_type(self, word_idx: int) -> int:
@@ -4238,6 +4244,30 @@ class IsingLM:
                 self._stats['caf_h2w_hits'] = self._stats.get('caf_h2w_hits', 0) + 1
             if ca_stats.get('spin3_hits', 0) > 0:
                 self._stats['caf_spin3_hits'] = self._stats.get('caf_spin3_hits', 0) + 1
+
+        # === LONG-RANGE COUPLING ENERGY (v16: direct word→word PMI) ===
+        # THE KEY DIFFERENCE from v15: NO cluster routing. Direct word→word PMI.
+        # With 5 active context words × PMI 5 × decay ~128/256 × weight 800:
+        #   E_lr ≈ 5 × 5 × 0.5 × 800 = 10,000 — COMPETES with recall's ±32,000
+        # Also applies recall confidence scaling: when recall is uncertain,
+        # long-range coupling matters more.
+        if self.longrange_layer is not None and self.longrange_layer.enabled:
+            lr_energy, lr_confidence = self.longrange_layer.compute_energy(
+                candidate_words, context_words,
+                recall_ngram_level=5,
+                recall_ngram_count=100,
+            )
+            # Apply confidence scaling to recall energy (reduce recall when uncertain)
+            if lr_confidence < 256:
+                # Scale recall energies by confidence (Q8: 256=100%, 128=50%)
+                confidence_factor = lr_confidence  # Q8
+                recall_reduction = ((256 - confidence_factor) * recall_energies.astype(np.int64)) >> 8
+                energies += recall_reduction  # Add back some of recall's penalty
+            energies += lr_energy
+            # Track diagnostics
+            lr_stats = self.longrange_layer.get_diagnostics()
+            if lr_stats.get('lr_hits', 0) > 0:
+                self._stats['lr_hits'] = self._stats.get('lr_hits', 0) + 1
 
         # === LOCAL FIELD (unigram frequency) ===
         # v5.0: Field always contributes fully, no damping
@@ -4949,6 +4979,12 @@ class IsingLM:
             for w in words:
                 self.context_accumulator_layer.update_context(w)
 
+        # v16.0: Initialize Long-Range Coupling from prompt
+        if self.longrange_layer is not None and self.longrange_layer.enabled:
+            self.longrange_layer.reset()
+            for w in words:
+                self.longrange_layer.update_context(w)
+
         for pos in range(1, length):
             # v8.2: Periodic Potts spin-flip for topic coherence
             if (self.topic_spin_layer is not None
@@ -5062,6 +5098,10 @@ class IsingLM:
             # v15.0: Update Context Accumulator state
             if self.context_accumulator_layer is not None and self.context_accumulator_layer.enabled:
                 self.context_accumulator_layer.update_context(chosen_word)
+
+            # v16.0: Update Long-Range Coupling state
+            if self.longrange_layer is not None and self.longrange_layer.enabled:
+                self.longrange_layer.update_context(chosen_word)
 
             self._stats['total_positions'] += 1
             if recall_hit:
@@ -5219,6 +5259,15 @@ class IsingLMModel:
         caf_spin3_min_count: int = 3,
         caf_confidence_min_count: int = 10,
         caf_min_confidence_q8: int = 128,
+        # v16.0: Long-Range Word-Word Coupling (direct PMI, no clusters)
+        longrange_enabled: bool = False,
+        longrange_weight: int = 800,
+        longrange_window: int = 30,
+        longrange_top_k: int = 200,
+        longrange_pmi_cap: int = 64,
+        longrange_min_count: int = 5,
+        longrange_confidence_min_count: int = 10,
+        longrange_min_confidence_q8: int = 128,
     ):
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
@@ -5299,6 +5348,16 @@ class IsingLMModel:
         self.caf_spin3_min_count = caf_spin3_min_count
         self.caf_confidence_min_count = caf_confidence_min_count
         self.caf_min_confidence_q8 = caf_min_confidence_q8
+
+        # v16.0: Long-Range Word-Word Coupling parameters
+        self.longrange_enabled = longrange_enabled
+        self.longrange_weight = longrange_weight
+        self.longrange_window = longrange_window
+        self.longrange_top_k = longrange_top_k
+        self.longrange_pmi_cap = longrange_pmi_cap
+        self.longrange_min_count = longrange_min_count
+        self.longrange_confidence_min_count = longrange_confidence_min_count
+        self.longrange_min_confidence_q8 = longrange_min_confidence_q8
 
         self.vocab: Optional[Vocabulary] = None
         self.types: Optional[POSTypeSystem] = None
@@ -5693,6 +5752,41 @@ class IsingLMModel:
         else:
             print("\n[11c/13] Skipping Context Accumulator Layer (disabled)")
             self.context_accumulator_layer = None
+
+        # Step 11d: Build Long-Range Coupling Layer (v16: direct word→word PMI)
+        if self.longrange_enabled:
+            print("\n[11d/13] Building Long-Range Coupling Layer (v16)...")
+            # Reuse word_freq from context accumulator build, or compute it
+            if not hasattr(self, '_word_freq') or self._word_freq is None:
+                self._word_freq = np.zeros(len(self.vocab), dtype=np.int64)
+                for seq in self.sequences:
+                    for w in seq:
+                        if w < len(self.vocab):
+                            self._word_freq[w] += 1
+            self.longrange_layer = LongRangeCouplingLayer(
+                vocab_size=len(self.vocab),
+                window=self.longrange_window,
+                top_k=self.longrange_top_k,
+                longrange_weight=self.longrange_weight,
+                pmi_cap=self.longrange_pmi_cap,
+                min_count=self.longrange_min_count,
+                confidence_min_count=self.longrange_confidence_min_count,
+                min_confidence_q8=self.longrange_min_confidence_q8,
+                enabled=True,
+            )
+            self.longrange_layer.build(
+                self.sequences, len(self.vocab), self._word_freq
+            )
+            # v16: Disable context accumulator and grassmann (longrange supersedes both)
+            if self.context_accumulator_layer is not None:
+                print("  [v16] Disabling Context Accumulator Layer (superseded by Long-Range Coupling)")
+                self.context_accumulator_layer = None
+            if self.grassmann_flag_layer is not None:
+                print("  [v16] Disabling Grassmann Flag Layer (superseded by Long-Range Coupling)")
+                self.grassmann_flag_layer = None
+        else:
+            print("\n[11d/13] Skipping Long-Range Coupling Layer (disabled)")
+            self.longrange_layer = None
 
         # Step 12: Build generators
         print("\n[12/13] Building generators...")
@@ -6143,6 +6237,7 @@ class IsingLMModel:
             topic_spin_layer=self.topic_spin_layer,
             grassmann_flag_layer=self.grassmann_flag_layer,
             context_accumulator_layer=self.context_accumulator_layer,
+            longrange_layer=self.longrange_layer if hasattr(self, 'longrange_layer') else None,
             interpolated=self.interpolated,
             kn_backoff=self.kn_backoff,
         )
@@ -6302,6 +6397,10 @@ class IsingLMModel:
             if gen.context_accumulator_layer is not None and gen.context_accumulator_layer.enabled:
                 gen.context_accumulator_layer.reset()
 
+            # v16.0: Reset long-range coupling for each new sequence
+            if gen.longrange_layer is not None and gen.longrange_layer.enabled:
+                gen.longrange_layer.reset()
+
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
                 context_words = seq[:pos]
@@ -6367,6 +6466,10 @@ class IsingLMModel:
                 # v15.0: Update context accumulator with actual next word
                 if gen.context_accumulator_layer is not None and gen.context_accumulator_layer.enabled:
                     gen.context_accumulator_layer.update_context(target_word)
+
+                # v16.0: Update long-range coupling with actual next word
+                if gen.longrange_layer is not None and gen.longrange_layer.enabled:
+                    gen.longrange_layer.update_context(target_word)
 
         if total_tokens == 0:
             return float('inf')

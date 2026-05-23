@@ -19,3 +19,6 @@ build/
 
 # OS
 .DS_Store
+*.log
+output/
+training_results.json
