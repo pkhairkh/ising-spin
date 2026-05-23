@@ -1,17 +1,24 @@
 """
-Ising Spin Glass Language Model — v17.1
+Ising Spin Glass Language Model — v18.0
 
-Multi-Scale Abstract Recall + Evolving Document State.
+Multi-Scale Abstract Recall + VSA Binding + Evolving Document State.
 
 Architecture:
     - Word-level n-gram recall (5-gram) — exact word context
     - POS-level n-gram recall (10-gram) — abstract syntactic generalization
     - Topic-level n-gram recall (10-gram) — discourse coherence
+    - VSA qFHRR binding (v18 NEW) — compositional word+POS+topic encoding
     - Document state (7 evolving integer variables) — full-document context
     - ADDITIVE energy fusion — all scales reinforce each other
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
 
-v17.1 Bug Fixes:
+v18.0 Changes:
+    - Added VSA qFHRR binding module for compositional token encoding
+    - E_vsa_bind energy term captures word+POS+topic interactions
+    - State scale rebalanced from 50 to 400 for meaningful contribution
+    - VSA energy scale default = 800 (comparable to POS recall)
+
+v17.1 Bug Fixes (carried forward):
     - DocumentState.build() now receives idx2word → state update rules fire
       correctly. Previously, word_str was always None because POSTypeSystem
       didn't have idx2word, causing all state vars (mode, tense, etc.) to
@@ -34,6 +41,7 @@ from .recall import (
 )
 from .state import DocumentState
 from .energy import EnergyComputer
+from .vsa import QFHRRVectors, VSAEncoder
 from .model_v17 import IsingLMModel
 
-__version__ = "17.1.0"
+__version__ = "18.0.0"
