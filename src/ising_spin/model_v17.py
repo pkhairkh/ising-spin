@@ -135,7 +135,7 @@ class IsingLMModel:
         ngram_min_count: int = 2,
         ngram_max_sequences: int = 1000000,
         # POS
-        pos_ngram_max_n: int = 15,
+        pos_ngram_max_n: int = 10,
         pos_ngram_min_count: int = 2,
         # Topic
         n_topics: int = 16,
@@ -143,8 +143,8 @@ class IsingLMModel:
         topic_ngram_min_count: int = 3,
         # Energy scales
         recall_scale: int = 1600,
-        pos_recall_scale: int = 800,
-        topic_recall_scale: int = 400,
+        pos_recall_scale: int = 400,
+        topic_recall_scale: int = 200,
         state_scale: int = 200,
         # Hard constraints
         same_word_penalty: int = 200,
@@ -402,7 +402,7 @@ class IsingLMModel:
             pos_system=self.pos_system,
             word_topics=self.topic_assigner.word_topics,
         )
-        self.document_state.build(self.sequences)
+        self.document_state.build(self.sequences, idx2word=self.vocab.idx2word)
 
         # ------------------------------------------------------------------
         # Step 12: Build energy computer

@@ -1,27 +1,29 @@
 """
-Multi-scale recall: combines word, POS, and topic indexes via product-of-experts.
+Multi-scale recall: combines word, POS, and topic indexes via ADDITIVE energy.
 
-This is the v17 equivalent of what recall alone did in v1-v16.
-Each scale independently computes energies, then they're combined
-as a product of experts (take the BEST/lowest energy per word).
+v17.1: Switched from Product of Experts (min) to Additive combination.
 
 The three scales cover different context ranges:
   - Word:  1-5 tokens of exact lexical context (precise but sparse)
-  - POS:   1-15 tokens of syntactic context (less sparse, captures grammar)
+  - POS:   1-10 tokens of syntactic context (less sparse, captures grammar)
   - Topic: 1-10 tokens of discourse context (very dense, captures coherence)
 
-Product of experts means: for each candidate word, we take the MINIMUM energy
-across all scales. This lets each scale "veto" the others' mistakes. A word
-that gets low energy from ANY scale is considered likely.
+ADDITIVE combination: E_total(w) = E_word(w) + E_POS(w) + E_topic(w)
+
+Why additive instead of Product of Experts (min):
+  - PoE (min): The strongest scale ALWAYS wins. When word n-gram hits with
+    energy 0, POS and topic opinions are completely ignored. This means
+    POS/topic only matter when word n-gram misses, which is rare.
+  - Additive: All scales vote. If a word is likely under BOTH word and POS
+    n-grams, it gets even lower energy (more confident). If it's unlikely
+    under word but likely under POS, it gets moderate energy (not the
+    POS-only energy, which would be too optimistic).
+  - This matches the Ising model physics: E = Σ E_i, each term independent.
 
 Energy scales (default):
   - Word:  1600  (strongest — exact word matches are most informative)
   - POS:    800  (half — syntactic patterns are useful but less specific)
   - Topic:  400  (quarter — discourse coherence is weakest per-token signal)
-
-The relative scales ensure that when a word n-gram hits, it dominates
-(the word scale is 4x the topic scale). But when word n-grams miss
-(long context), the POS and topic scales provide crucial fallback.
 """
 
 from typing import Dict, List, Optional
@@ -38,15 +40,12 @@ class MultiScaleRecall:
     """
     Combines recall from all scales: word, POS, and topic.
 
-    This is the v17 equivalent of what recall alone did in v1-v16.
-    Each scale independently computes energies, then they're combined
-    as a product of experts (take the BEST/lowest energy per word).
+    Uses ADDITIVE energy combination: E_total = E_word + E_POS + E_topic.
 
-    Product of Experts: take the minimum energy per word across all scales.
-    This lets each scale "veto" the others' mistakes. A word that looks
-    unlikely under word n-grams but likely under POS n-grams gets the
-    POS energy -- it's a reasonable continuation given the syntax even
-    if the exact word sequence hasn't been seen.
+    This means all scales contribute to the final energy. A word that's
+    likely under multiple scales gets even lower energy (more confident).
+    A word that's unlikely under word n-grams but likely under POS n-grams
+    gets moderate energy (not the POS-only energy).
     """
 
     def __init__(
@@ -85,11 +84,15 @@ class MultiScaleRecall:
         **kwargs,
     ) -> np.ndarray:
         """
-        Compute combined energy from all scales using product of experts.
+        Compute combined energy from all scales using ADDITIVE combination.
 
-        For each candidate word, takes the MINIMUM energy across all
-        available scales. This means any scale can "veto" a high energy
-        from another scale by providing a lower one.
+        E_total(w) = E_word(w) + E_POS(w) + E_topic(w)
+
+        Each scale computes its own energy independently, then they're summed.
+        This means:
+        - Words likely under ALL scales get the lowest total energy
+        - Words likely under SOME scales get moderate energy
+        - Words unlikely under ALL scales get the highest total energy
 
         Args:
             context_words:     Context word IDs (passed to all indexes).
@@ -104,10 +107,7 @@ class MultiScaleRecall:
             LOWER energy = more likely.
         """
         n_candidates = len(candidate_words)
-        # Start with maximum possible energy (all scales missed)
-        # The max across scales is the maximum any single scale would produce
-        max_scale = max(self.word_scale, self.pos_scale, self.topic_scale)
-        combined = np.full(n_candidates, 20 * max_scale, dtype=np.int64)
+        combined = np.zeros(n_candidates, dtype=np.int64)
 
         # Word-level recall (strongest signal, most specific)
         if self.word_index is not None and self.word_index._built:
@@ -120,7 +120,7 @@ class MultiScaleRecall:
                 interpolated=interpolated,
                 kn_backoff=kn_backoff,
             )
-            combined = np.minimum(combined, word_energy)
+            combined += word_energy
 
         # POS-level recall (syntactic patterns, less sparse than word)
         if self.pos_index is not None and self.pos_index._built:
@@ -133,7 +133,7 @@ class MultiScaleRecall:
                 interpolated=interpolated,
                 kn_backoff=kn_backoff,
             )
-            combined = np.minimum(combined, pos_energy)
+            combined += pos_energy
 
         # Topic-level recall (discourse coherence, very dense)
         if self.topic_index is not None and self.topic_index._built:
@@ -146,7 +146,7 @@ class MultiScaleRecall:
                 interpolated=interpolated,
                 kn_backoff=kn_backoff,
             )
-            combined = np.minimum(combined, topic_energy)
+            combined += topic_energy
 
         return combined
 
@@ -169,7 +169,7 @@ class MultiScaleRecall:
 
     def summary(self) -> str:
         """Return a human-readable summary of all indexes."""
-        lines = ["MultiScaleRecall:"]
+        lines = ["MultiScaleRecall (additive):"]
         if self.word_index is not None:
             built = "built" if self.word_index._built else "NOT built"
             n_ctx = sum(

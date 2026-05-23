@@ -1,25 +1,26 @@
 """
-Ising Spin Glass Language Model — v17.0
+Ising Spin Glass Language Model — v17.1
 
 Multi-Scale Abstract Recall + Evolving Document State.
 
 Architecture:
     - Word-level n-gram recall (5-gram) — exact word context
-    - POS-level n-gram recall (15-gram) — abstract syntactic generalization
+    - POS-level n-gram recall (10-gram) — abstract syntactic generalization
     - Topic-level n-gram recall (10-gram) — discourse coherence
     - Document state (7 evolving integer variables) — full-document context
-    - Product of Experts fusion — each scale vetoes the others' mistakes
+    - ADDITIVE energy fusion — all scales reinforce each other
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
 
-v17 Key Insight:
-    v1-v16 had recall + weak perturbation layers → recall dominated everything.
-    v17 has recall at MULTIPLE SCALES → each scale independently constrains
-    predictions. No single scale dominates. They VETO each other's mistakes.
-    
-    When the 5-word n-gram is unseen, the POS 10-gram IS seen (thousands of
-    times). When the POS n-gram is ambiguous, the topic n-gram disambiguates.
-    When all n-grams miss, the document state carries discourse coherence
-    across the entire document.
+v17.1 Bug Fixes:
+    - DocumentState.build() now receives idx2word → state update rules fire
+      correctly. Previously, word_str was always None because POSTypeSystem
+      didn't have idx2word, causing all state vars (mode, tense, etc.) to
+      stay at defaults → compatibility tables were useless.
+    - Generator diagnostics now track POS/topic recall hits and state energy.
+    - POS n-gram max_n reduced from 15 to 10 (13GB → ~6GB on 1M corpus).
+    - Energy combination switched from PoE (min) to additive — all scales
+      now contribute to the final energy, reinforcing each other.
+    - POS/topic recall scales halved (400/200) for additive combination.
 """
 
 from .vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
@@ -35,4 +36,4 @@ from .state import DocumentState
 from .energy import EnergyComputer
 from .model_v17 import IsingLMModel
 
-__version__ = "17.0.0"
+__version__ = "17.1.0"

@@ -146,9 +146,12 @@ class IsingLMGenerator:
         self._stats = {
             'total_positions': 0,
             'recall_hit': 0,
+            'pos_recall_hit': 0,
+            'topic_recall_hit': 0,
             'copy_used': 0,
             'same_word_blocked': 0,
             'closed_loop_blocked': 0,
+            'state_energy_sum': 0,
         }
 
     # ===================================================================
@@ -397,12 +400,29 @@ class IsingLMGenerator:
 
             # Track diagnostics
             self._stats['total_positions'] += 1
+            # Track state energy for the chosen word (cheap: single word lookup)
+            if self.document_state._built:
+                chosen_word_arr = np.array([chosen_word], dtype=np.int64)
+                state_e = self.document_state.compute_energy(
+                    chosen_word_arr, state_scale=self.state_scale
+                )
+                self._stats['state_energy_sum'] += int(state_e[0])
             recall_hit = False
             if self.word_index is not None:
                 recall_matches = self.word_index.lookup(words[:-1])
                 recall_hit = bool(recall_matches)
             if recall_hit:
                 self._stats['recall_hit'] += 1
+            # Track POS recall hits
+            if self.multiscale_recall.pos_index is not None:
+                pos_matches = self.multiscale_recall.pos_index.lookup(words[:-1])
+                if pos_matches:
+                    self._stats['pos_recall_hit'] += 1
+            # Track topic recall hits
+            if self.multiscale_recall.topic_index is not None:
+                topic_matches = self.multiscale_recall.topic_index.lookup(words[:-1])
+                if topic_matches:
+                    self._stats['topic_recall_hit'] += 1
 
             diagnostics.append({
                 'pos': pos,

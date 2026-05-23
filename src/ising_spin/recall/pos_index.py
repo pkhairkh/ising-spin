@@ -10,7 +10,7 @@ The index maps: POS_context_tuple -> Counter({word_id: count})
 Example:
   Word 5-gram ["the", "big", "brown", "dog", "chased"] is probably unique.
   POS  5-gram [DET, ADJ, ADJ, NOUN, VERB]   has been seen thousands of times.
-  POS 15-gram (full clause pattern)           still has meaningful counts.
+  POS 10-gram (full clause pattern)           still has meaningful counts.
 
 When the exact 5-word n-gram is unseen, the POS pattern HAS been seen, and
 it tells us: "after DET ADJ ADJ NOUN VERB, the next word is typically a
@@ -61,7 +61,7 @@ class PosNgramIndex(AbstractRecallIndex):
     POS-level n-gram index for abstract recall.
 
     Instead of context = [w1, w2, w3, w4], we use context = [pos1, pos2, pos3, pos4, ...]
-    up to max_n=15 (much longer than word n-grams because POS sequences are far less sparse).
+    up to max_n=10 (much longer than word n-grams because POS sequences are far less sparse).
 
     The index maps: POS context tuple -> {word_id: count}
 
@@ -71,11 +71,11 @@ class PosNgramIndex(AbstractRecallIndex):
 
     def __init__(
         self,
-        max_n: int = 15,
+        max_n: int = 10,
         min_count: int = 2,
         pos_system: Optional[POSTypeSystem] = None,
     ):
-        self.max_n = max_n  # Longer than word n-grams (15 vs 5)
+        self.max_n = max_n  # Longer than word n-grams (10 vs 5)
         self.min_count = min_count
         self.pos_system = pos_system
 

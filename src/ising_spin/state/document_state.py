@@ -246,6 +246,7 @@ class DocumentState:
         self,
         sequences: List[List[int]],
         word_pos_tags: Optional[List[List[str]]] = None,
+        idx2word: Optional[Dict[int, str]] = None,
     ) -> "DocumentState":
         """
         Build state-word compatibility tables from training data.
@@ -261,6 +262,9 @@ class DocumentState:
             sequences: List of integer token-id sequences.
             word_pos_tags: Optional parallel list of POS tag sequences.
                            If None, rule-based POS assignment is used.
+            idx2word: Mapping from word ID to word string. REQUIRED for
+                      state update rules to fire correctly. If not provided,
+                      falls back to pos_system.idx2word (if available).
 
         Returns:
             self
@@ -294,8 +298,11 @@ class DocumentState:
                 # Get word string for rule evaluation
                 word_str = None
                 pos_tag = None
-                if self.pos_system is not None:
-                    word_str = self.pos_system.idx2word.get(word_id) if hasattr(self.pos_system, 'idx2word') else None
+                # Priority: (1) idx2word parameter, (2) pos_system.idx2word
+                if idx2word is not None:
+                    word_str = idx2word.get(word_id)
+                elif self.pos_system is not None and hasattr(self.pos_system, 'idx2word'):
+                    word_str = self.pos_system.idx2word.get(word_id)
                 if pos_tags is not None and pos_i < len(pos_tags):
                     pos_tag = pos_tags[pos_i]
 
