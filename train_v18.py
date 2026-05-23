@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-v18.2 Training Script — Integer ESN Reservoir + Factorial State Coupling
+v18.3 Training Script — Cross-Scale RFF + Integer ESN Reservoir + Factorial State Coupling
+
+v18.3 CHANGES (from v18.2):
+  - NEW: Cross-Scale RFF (E_rff energy term)
+    Joint word+POS+topic random Fourier features
+    Captures cross-scale interactions that independent per-scale terms miss
+  - NEW: --rff-dim (default 256), --rff-hash-dim (default 32), --rff-scale (default 600), --no-rff
 
 v18.2 CHANGES (from v18.1):
   - NEW: Integer ESN Reservoir (E_reservoir energy term, ~50 token lookback)
@@ -32,6 +38,7 @@ v18.0 CHANGES (from v17.4 — PPL=19.19 best but incoherent generation):
 ARCHITECTURE:
   Word n-gram (5) + POS n-gram (10) + Topic n-gram (10)
   + Dense AM (256-dim random features, degree=2) + VSA Binding (512-dim qFHRR)
+  + Cross-Scale RFF (256-dim, joint word+POS+topic features)
   + ESN Reservoir (512-dim, alpha=0.95, ~50 token lookback)
   + Factorial Coupling (5 pairs, mean-field inference)
   + Document State (7 vars, scale=400)
@@ -42,6 +49,9 @@ Usage:
   python -u train_v18.py --vocab 49000              # Custom vocab size
   python -u train_v18.py --no-vsa                   # Ablation: without VSA binding
   python -u train_v18.py --no-dense-am              # Ablation: without Dense AM
+  python -u train_v18.py --no-rff                    # Ablation: without Cross-Scale RFF
+  python -u train_v18.py --rff-dim 128                # Smaller RFF
+  python -u train_v18.py --rff-scale 400               # Weaker RFF energy
   python -u train_v18.py --no-reservoir             # Ablation: without ESN reservoir
   python -u train_v18.py --no-mf                    # Ablation: without mean-field coupling
   python -u train_v18.py --reservoir-dim 256        # Smaller reservoir
@@ -87,6 +97,9 @@ DEFAULT_RESERVOIR_ALPHA = 31130  # v18.2 NEW (~0.95 in Q15)
 DEFAULT_COUPLING_SCALE = 200     # v18.2 NEW
 DEFAULT_MF_ITERATIONS = 5        # v18.2 NEW
 DEFAULT_MF_LAMBDA_Q15 = 16384    # v18.2 NEW (~0.5 in Q15)
+DEFAULT_RFF_SCALE = 600            # v18.3 NEW
+DEFAULT_RFF_DIM = 256              # v18.3 NEW
+DEFAULT_RFF_HASH_DIM = 32          # v18.3 NEW
 DEFAULT_POS_NGRAM_MAX_N = 10
 DEFAULT_TOPIC_NGRAM_MAX_N = 10
 
@@ -240,7 +253,7 @@ def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="v18.2 Training — Integer ESN Reservoir + Factorial State Coupling"
+        description="v18.3 Training — Cross-Scale RFF + ESN Reservoir + Factorial State Coupling"
     )
 
     # Core parameters
@@ -289,6 +302,14 @@ def main():
     parser.add_argument("--pos-ngram-max-n", type=int, default=DEFAULT_POS_NGRAM_MAX_N)
     parser.add_argument("--topic-ngram-max-n", type=int, default=DEFAULT_TOPIC_NGRAM_MAX_N)
 
+    # RFF parameters (v18.3 NEW)
+    parser.add_argument("--rff-scale", type=int, default=DEFAULT_RFF_SCALE,
+                        help="Cross-Scale RFF energy scale (default: 600)")
+    parser.add_argument("--rff-dim", type=int, default=DEFAULT_RFF_DIM,
+                        help="Cross-Scale RFF feature dimension (default: 256)")
+    parser.add_argument("--rff-hash-dim", type=int, default=DEFAULT_RFF_HASH_DIM,
+                        help="Cross-Scale RFF context hash dimension (default: 32)")
+
     # Ablation flags
     parser.add_argument("--no-pos-recall", action="store_true",
                         help="Ablation: disable POS n-gram recall")
@@ -304,6 +325,8 @@ def main():
                         help="Ablation: disable ESN reservoir (v18.2)")
     parser.add_argument("--no-mf", action="store_true",
                         help="Ablation: disable mean-field coupling inference (v18.2)")
+    parser.add_argument("--no-rff", action="store_true",
+                        help="Ablation: disable Cross-Scale RFF (v18.3)")
 
     # Standard n-gram parameters
     parser.add_argument("--no-kn-backoff", action="store_true")
@@ -324,6 +347,7 @@ def main():
     dense_am_enabled = not args.no_dense_am
     reservoir_enabled = not args.no_reservoir    # v18.2
     mf_enabled = not args.no_mf                  # v18.2
+    rff_enabled = not args.no_rff                # v18.3
 
     kn_backoff = not args.no_kn_backoff
     interpolated = not args.no_interpolated
@@ -334,7 +358,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v18.2 ESN RESERVOIR + FACTORIAL COUPLING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v18.3 CROSS-SCALE RFF + ESN RESERVOIR + FACTORIAL COUPLING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -349,7 +373,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v18.2 — Integer ESN Reservoir + Factorial State Coupling")
+    print(f"CONFIG: v18.3 — Cross-Scale RFF + Integer ESN Reservoir + Factorial State Coupling")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -373,6 +397,10 @@ def main():
     print(f"    enabled={mf_enabled}, coupling_scale={args.coupling_scale}, "
           f"mf_iterations={args.mf_iterations}, lambda_q15={args.mf_lambda_q15}"
           f"{' [DISABLED --no-mf]' if args.no_mf else ''}")
+    print(f"  CROSS-SCALE RFF (v18.3 NEW):")
+    print(f"    enabled={rff_enabled}, D={args.rff_dim}, hash_dim={args.rff_hash_dim}, "
+          f"scale={args.rff_scale}"
+          f"{' [DISABLED --no-rff]' if args.no_rff else ''}")
     print(f"  DOCUMENT STATE:")
     print(f"    state_scale={state_scale} (was 50 in v17)"
           f"{' [DISABLED]' if args.no_state else ''}")
@@ -430,6 +458,12 @@ def main():
         mf_enabled=mf_enabled,
         mf_iterations=args.mf_iterations,
         mf_lambda_q15=args.mf_lambda_q15,
+        # RFF (v18.3 NEW)
+        rff_enabled=rff_enabled,
+        rff_dim=args.rff_dim,
+        rff_hash_dim=args.rff_hash_dim,
+        rff_seed=42,
+        rff_scale=args.rff_scale,
         # Hard constraints
         same_word_penalty=args.same_word_penalty,
         max_closed_class_run=2,
@@ -516,8 +550,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "v18.2",
-        "architecture": "Multi-Scale Recall + Dense AM + VSA + ESN Reservoir + Factorial Coupling",
+        "version": "v18.3",
+        "architecture": "Multi-Scale Recall + Dense AM + VSA + Cross-Scale RFF + ESN Reservoir + Factorial Coupling",
         "timestamp": timestamp,
         "config": {
             "recall_scale": args.recall_scale,
@@ -540,6 +574,10 @@ def main():
             "mf_iterations": args.mf_iterations,
             "mf_lambda_q15": args.mf_lambda_q15,
             "mf_enabled": mf_enabled,
+            "rff_scale": args.rff_scale,
+            "rff_dim": args.rff_dim,
+            "rff_hash_dim": args.rff_hash_dim,
+            "rff_enabled": rff_enabled,
             "vocab_max_size": args.vocab,
             "kn_backoff": kn_backoff,
             "interpolated": interpolated,
@@ -564,7 +602,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v18.2 Integer ESN Reservoir + Factorial State Coupling")
+    print(f"DONE — v18.3 Cross-Scale RFF + Integer ESN Reservoir + Factorial State Coupling")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

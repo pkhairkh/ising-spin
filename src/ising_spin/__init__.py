@@ -1,8 +1,8 @@
 """
-Ising Spin Glass Language Model — v18.2
+Ising Spin Glass Language Model — v18.3
 
 Multi-Scale Abstract Recall + Dense AM + VSA Binding + Integer ESN Reservoir
-+ Factorial State Coupling + Evolving Document State.
++ Cross-Scale RFF + Factorial State Coupling + Evolving Document State.
 
 Architecture:
     - Word-level n-gram recall (5-gram) — exact word context
@@ -10,11 +10,18 @@ Architecture:
     - Topic-level n-gram recall (10-gram) — discourse coherence
     - Dense AM (v18.1) — nonlinear pattern matching with random features
     - VSA qFHRR binding (v18.0) — compositional word+POS+topic encoding
-    - Integer ESN Reservoir (v18.2 NEW) — long-range temporal dynamics (~50 token lookback)
-    - Factorial State Coupling (v18.2 NEW) — mean-field inference + coupling energy
+    - Integer ESN Reservoir (v18.2) — long-range temporal dynamics (~50 token lookback)
+    - Cross-Scale RFF (v18.3 NEW) — joint word+POS+topic random Fourier features
+    - Factorial State Coupling (v18.2) — mean-field inference + coupling energy
     - Document state (7 evolving integer variables) — full-document context
     - ADDITIVE energy fusion — all scales reinforce each other
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
+
+v18.3 Changes:
+    - Added Cross-Scale RFF (E_rff energy term)
+      Combines word+POS+topic into joint random Fourier features
+      Captures cross-scale interactions that independent per-scale terms miss
+      Pre-aggregated Theta matrix: (V, D) int8
 
 v18.2 Changes:
     - Added Integer ESN Reservoir (E_reservoir energy term)
@@ -53,6 +60,7 @@ from .energy import EnergyComputer
 from .vsa import QFHRRVectors, VSAEncoder
 from .dense_am import RandomFeatureProjector, DenseAMEnergy
 from .reservoir import IntegerESN
+from .rff import CrossScaleRFF
 from .model_v17 import IsingLMModel
 
-__version__ = "18.2.0"
+__version__ = "18.3.0"

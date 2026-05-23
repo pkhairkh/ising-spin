@@ -1,16 +1,23 @@
 """
-Ising Spin Glass Language Model v18.2 — Integer ESN Reservoir + Factorial State Coupling
+Ising Spin Glass Language Model v18.3 — Cross-Scale RFF + Integer ESN Reservoir + Factorial State Coupling
 
-Architecture (extends v18.1):
+Architecture (extends v18.2):
   1. Word-level n-gram recall (5-gram)
   2. POS-level n-gram recall (10-gram)
   3. Topic-level n-gram recall (10-gram)
   4. Dense AM (v18.1 — nonlinear pattern matching with random features)
   5. VSA qFHRR binding (v18.0 — compositional word+POS+topic encoding)
-  6. Reservoir (v18.2 NEW — Integer ESN for ~50 token lookback)
-  7. Document state (7 evolving integer variables, REBALANCED scale=400)
-  8. Factorial coupling (v18.2 NEW — mean-field state inference + coupling energy)
-  9. Hard constraints (POS type, same-word, closed-class)
+  6. Reservoir (v18.2 — Integer ESN for ~50 token lookback)
+  7. Cross-Scale RFF (v18.3 NEW — joint word+POS+topic random Fourier features)
+  8. Document state (7 evolving integer variables, REBALANCED scale=400)
+  9. Factorial coupling (v18.2 — mean-field state inference + coupling energy)
+ 10. Hard constraints (POS type, same-word, closed-class)
+
+Key insight (v18.3): Dense AM, VSA, and Reservoir each operate on a SINGLE
+scale — word, word+POS+topic, or temporal. Cross-Scale RFF combines word+
+POS+topic into a SINGLE feature vector via random projection with cosine
+nonlinearity, capturing interactions that independent per-scale energy terms
+miss (e.g., "NOUN in SPORTS context" vs "NOUN in POLITICS context").
 
 Key insight (v18.2): Standard n-gram recall has a HARD window (5 tokens for
 word, 10 for POS/topic). The Integer ESN provides a SOFT window via
@@ -22,6 +29,11 @@ Additionally, the 7 state variables are no longer independent. Pairwise
 compatibility tables capture correlations (e.g., topic=SCIENCE co-occurs
 with mode=DESCRIPTION). Mean-field inference iteratively refines state
 values using coupling, and coupling energy penalizes unlikely combinations.
+
+v18.3 changes from v18.2:
+  - NEW: Cross-Scale RFF module (E_rff energy term)
+  - NEW: --rff-dim, --rff-hash-dim, --rff-scale, --no-rff CLI flags
+  - CHANGED: EnergyComputer now includes E_rff term
 
 v18.2 changes from v18.1:
   - NEW: Integer ESN reservoir (E_reservoir energy term, ~50 token lookback)
@@ -61,6 +73,7 @@ from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 from .vsa import VSAEncoder
 from .dense_am import RandomFeatureProjector, DenseAMEnergy
 from .reservoir import IntegerESN
+from .rff import CrossScaleRFF
 
 
 def _get_rss_mb() -> int:
@@ -134,10 +147,10 @@ def _load_fineweb_edu(
 
 class IsingLMModelV18:
     """
-    v18.2: Multi-Scale Abstract Recall + Dense AM + VSA Binding + Integer ESN
-           Reservoir + Factorial State Coupling.
+    v18.3: Multi-Scale Abstract Recall + Dense AM + VSA Binding + Integer ESN
+           Reservoir + Cross-Scale RFF + Factorial State Coupling.
 
-    Training pipeline (extends v18.1 with steps 12-14 for ESN + coupling):
+    Training pipeline (extends v18.2 with step 14 for Cross-Scale RFF):
       1. Load corpus / use provided texts
       2. Build vocabulary
       3. Tokenize texts → sequences
@@ -151,11 +164,12 @@ class IsingLMModelV18:
       11. Build document state
       12. Build Dense AM (random feature projector + pre-aggregation) (v18.1)
       13. Build VSA encoder and readout matrix (v18.0)
-      14. Build Integer ESN reservoir (v18.2 NEW)
-      15. Build factorial state coupling (v18.2 NEW)
-      16. Build energy computer (with Reservoir + Coupling + Dense AM + VSA)
-      17. Auto-calibrate beta
-      18. Build generator
+      14. Build Cross-Scale RFF (v18.3 NEW)
+      15. Build Integer ESN reservoir (v18.2)
+      16. Build factorial state coupling (v18.2)
+      17. Build energy computer (with RFF + Reservoir + Coupling + Dense AM + VSA)
+      18. Auto-calibrate beta
+      19. Build generator
     """
 
     def __init__(
@@ -202,6 +216,12 @@ class IsingLMModelV18:
         mf_enabled: bool = True,          # v18.2: enable/disable mean-field inference
         mf_iterations: int = 5,           # v18.2: number of mean-field iterations
         mf_lambda_q15: int = 16384,       # v18.2: coupling strength in Q15 (~0.5)
+        # RFF (v18.3 NEW)
+        rff_enabled: bool = True,           # v18.3: enable/disable Cross-Scale RFF
+        rff_dim: int = 256,                 # v18.3: RFF feature dimension
+        rff_hash_dim: int = 32,             # v18.3: RFF context hash dimension
+        rff_seed: int = 42,                 # v18.3: RFF random seed
+        rff_scale: int = 600,               # v18.3: RFF energy scale
         # Hard constraints
         same_word_penalty: int = 200,
         max_closed_class_run: int = 2,
@@ -253,6 +273,11 @@ class IsingLMModelV18:
         self.mf_enabled = mf_enabled
         self.mf_iterations = mf_iterations
         self.mf_lambda_q15 = mf_lambda_q15
+        self.rff_enabled = rff_enabled
+        self.rff_dim = rff_dim
+        self.rff_hash_dim = rff_hash_dim
+        self.rff_seed = rff_seed
+        self.rff_scale = rff_scale
         self.same_word_penalty = same_word_penalty
         self.max_closed_class_run = max_closed_class_run
         self.beta_type = beta_type
@@ -277,6 +302,7 @@ class IsingLMModelV18:
         self.dense_am: Optional[DenseAMEnergy] = None       # v18.1
         self.vsa_encoder: Optional[VSAEncoder] = None       # v18.0
         self.reservoir: Optional[IntegerESN] = None         # v18.2 NEW
+        self.rff: Optional[CrossScaleRFF] = None             # v18.3 NEW
         self.energy_computer: Optional[EnergyComputer] = None
         self.generator = None
 
@@ -289,11 +315,12 @@ class IsingLMModelV18:
         Full training pipeline for v18.2 — Integer ESN Reservoir + Factorial State Coupling.
         """
         print("=" * 70)
-        print("ISING SPIN GLASS LANGUAGE MODEL v18.2 — ESN RESERVOIR + FACTORIAL COUPLING")
+        print("ISING SPIN GLASS LANGUAGE MODEL v18.3 — CROSS-SCALE RFF + ESN RESERVOIR + FACTORIAL COUPLING")
         print("=" * 70)
-        print(f"\n  Architecture: 3-Scale Recall + Dense AM + VSA + ESN Reservoir + Factorial Coupling")
-        print(f"  v18.2 NEW: Integer ESN Reservoir (D={self.reservoir_dim}, alpha_q15={self.reservoir_alpha_q15}, ~50 token lookback)")
-        print(f"  v18.2 NEW: Factorial State Coupling (5 pairs, mf_iterations={self.mf_iterations}, lambda_q15={self.mf_lambda_q15})")
+        print(f"\n  Architecture: 3-Scale Recall + Dense AM + VSA + Cross-Scale RFF + ESN Reservoir + Factorial Coupling")
+        print(f"  v18.3 NEW: Cross-Scale RFF (D={self.rff_dim}, hash_dim={self.rff_hash_dim}, scale={self.rff_scale})")
+        print(f"  v18.2: Integer ESN Reservoir (D={self.reservoir_dim}, alpha_q15={self.reservoir_alpha_q15}, ~50 token lookback)")
+        print(f"  v18.2: Factorial State Coupling (5 pairs, mf_iterations={self.mf_iterations}, lambda_q15={self.mf_lambda_q15})")
         print(f"  v18.1: Dense AM (F(x)=x^{self.dense_am_degree}, D={self.dense_am_dim})")
         print(f"  v18.0: VSA qFHRR binding (E_vsa_bind energy term)")
         print(f"  Word n-gram:  max_n={self.ngram_max_n}, scale={self.recall_scale}")
@@ -304,6 +331,8 @@ class IsingLMModelV18:
         print(f"  VSA binding:  enabled={self.vsa_enabled}, D={self.vsa_dimension}, scale={self.vsa_scale}")
         print(f"  Reservoir:    enabled={self.reservoir_enabled}, D={self.reservoir_dim}, "
               f"alpha_q15={self.reservoir_alpha_q15}, scale={self.reservoir_scale}")
+        print(f"  RFF:          enabled={self.rff_enabled}, D={self.rff_dim}, "
+              f"hash_dim={self.rff_hash_dim}, scale={self.rff_scale}")
         print(f"  Coupling:     enabled={self.mf_enabled}, scale={self.coupling_scale}, "
               f"mf_iters={self.mf_iterations}, lambda_q15={self.mf_lambda_q15}")
         print(f"  Document state: scale={self.state_scale}")
@@ -317,16 +346,16 @@ class IsingLMModelV18:
         # Step 1: Load corpus
         # ------------------------------------------------------------------
         if texts is None:
-            print("[1/18] Loading corpus...")
+            print("[1/19] Loading corpus...")
             texts = _load_fineweb_edu(n_samples=n_samples)
             print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
         else:
-            print(f"[1/18] Using provided texts ({len(texts)} texts)")
+            print(f"[1/19] Using provided texts ({len(texts)} texts)")
 
         # ------------------------------------------------------------------
         # Step 2: Build vocabulary
         # ------------------------------------------------------------------
-        print("\n[2/18] Building vocabulary...")
+        print("\n[2/19] Building vocabulary...")
         self.vocab = Vocabulary(
             min_freq=self.vocab_min_freq,
             max_size=self.vocab_max_size,
@@ -337,7 +366,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 3: Tokenize texts → sequences
         # ------------------------------------------------------------------
-        print("\n[3/18] Tokenizing texts...")
+        print("\n[3/19] Tokenizing texts...")
         sequences = _tokenize_texts(texts, self.vocab)
         sequences = _truncate_sequences(sequences, max_len=self.max_seq_len)
         print(f"  Tokenized: {len(sequences):,} sequences")
@@ -366,7 +395,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 5: Build POS type system
         # ------------------------------------------------------------------
-        print("\n[5/18] Building POS type system...")
+        print("\n[5/19] Building POS type system...")
         self.pos_system = POSTypeSystem(
             vocab_size=len(self.vocab),
             window=5,
@@ -380,7 +409,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 6: Build topic assigner
         # ------------------------------------------------------------------
-        print("\n[6/18] Building topic assigner...")
+        print("\n[6/19] Building topic assigner...")
         self.topic_assigner = TopicAssigner(n_topics=self.n_topics)
         self.topic_assigner.build(texts, self.vocab)
 
@@ -388,7 +417,7 @@ class IsingLMModelV18:
         # Step 7: Build word n-gram index
         # ------------------------------------------------------------------
         rss_pre = _get_rss_mb()
-        print(f"\n[7/18] Building word n-gram index...")
+        print(f"\n[7/19] Building word n-gram index...")
 
         ngram_seqs = self.sequences
         if self.ngram_max_sequences > 0 and len(self.sequences) > self.ngram_max_sequences:
@@ -410,7 +439,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 8: Build POS n-gram index
         # ------------------------------------------------------------------
-        print("\n[8/18] Building POS n-gram index...")
+        print("\n[8/19] Building POS n-gram index...")
         word_pos_tags = {}
         TAG_PRIORITY = {
             POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
@@ -436,7 +465,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 9: Build topic n-gram index
         # ------------------------------------------------------------------
-        print("\n[9/18] Building topic n-gram index...")
+        print("\n[9/19] Building topic n-gram index...")
         self.topic_index = TopicNgramIndex(
             max_n=self.topic_ngram_max_n,
             min_count=self.topic_ngram_min_count,
@@ -451,7 +480,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 10: Build multi-scale recall
         # ------------------------------------------------------------------
-        print("\n[10/18] Building multi-scale recall...")
+        print("\n[10/19] Building multi-scale recall...")
         self.multiscale_recall = MultiScaleRecall(
             word_index=self.word_index,
             pos_index=self.pos_index,
@@ -465,7 +494,7 @@ class IsingLMModelV18:
         # ------------------------------------------------------------------
         # Step 11: Build document state
         # ------------------------------------------------------------------
-        print("\n[11/18] Building document state...")
+        print("\n[11/19] Building document state...")
         self.document_state = DocumentState(
             vocab_size=len(self.vocab),
             n_topics=self.n_topics,
@@ -478,7 +507,7 @@ class IsingLMModelV18:
         # Step 12: Build Dense AM (v18.1)
         # ------------------------------------------------------------------
         if self.dense_am_enabled:
-            print(f"\n[12/18] Building Dense AM (D={self.dense_am_dim}, degree={self.dense_am_degree})...")
+            print(f"\n[12/19] Building Dense AM (D={self.dense_am_dim}, degree={self.dense_am_degree})...")
             projector = RandomFeatureProjector(
                 vocab_size=len(self.vocab),
                 D=self.dense_am_dim,
@@ -503,14 +532,14 @@ class IsingLMModelV18:
                 mem_mb = self.dense_am.Phi.nbytes / (1024 * 1024)
                 print(f"    Dense AM Phi: shape={self.dense_am.Phi.shape}, memory={mem_mb:.1f} MB")
         else:
-            print(f"\n[12/18] Dense AM DISABLED (--no-dense-am flag)")
+            print(f"\n[12/19] Dense AM DISABLED (--no-dense-am flag)")
             self.dense_am = None
 
         # ------------------------------------------------------------------
         # Step 13: Build VSA encoder and readout matrix (v18.0)
         # ------------------------------------------------------------------
         if self.vsa_enabled:
-            print(f"\n[13/18] Building VSA encoder (D={self.vsa_dimension})...")
+            print(f"\n[13/19] Building VSA encoder (D={self.vsa_dimension})...")
             self.vsa_encoder = VSAEncoder(
                 vocab_size=len(self.vocab),
                 n_pos=N_POS,
@@ -527,14 +556,47 @@ class IsingLMModelV18:
                 mem_mb = R.nbytes / (1024 * 1024)
                 print(f"  VSA readout: shape={R.shape}, memory={mem_mb:.1f} MB")
         else:
-            print(f"\n[13/18] VSA module DISABLED (--no-vsa flag)")
+            print(f"\n[13/19] VSA module DISABLED (--no-vsa flag)")
             self.vsa_encoder = None
 
         # ------------------------------------------------------------------
-        # Step 14: Build Integer ESN reservoir (v18.2 NEW)
+        # Step 14: Build Cross-Scale RFF (v18.3 NEW)
+        # ------------------------------------------------------------------
+        if self.rff_enabled:
+            print(f"\n[14/19] Building Cross-Scale RFF (D={self.rff_dim}, "
+                  f"hash_dim={self.rff_hash_dim})...")
+            self.rff = CrossScaleRFF(
+                vocab_size=len(self.vocab),
+                n_pos=N_POS,
+                n_topics=self.n_topics,
+                D=self.rff_dim,
+                context_hash_dim=self.rff_hash_dim,
+                seed=self.rff_seed,
+                rff_scale=self.rff_scale,
+            )
+
+            max_seqs = min(len(self.sequences), 200000)
+            t_rff = time.time()
+            self.rff.build(
+                self.sequences,
+                word_pos_tags=word_pos_tags,
+                word_topics=self.topic_assigner.word_topics,
+                max_sequences=max_seqs,
+            )
+            print(f"    RFF Theta build took {time.time()-t_rff:.1f}s")
+
+            if self.rff.Theta is not None:
+                mem_T = self.rff.Theta.nbytes / (1024 * 1024)
+                print(f"    RFF Theta: shape={self.rff.Theta.shape}, memory={mem_T:.1f} MB")
+        else:
+            print(f"\n[14/19] Cross-Scale RFF DISABLED (--no-rff flag)")
+            self.rff = None
+
+        # ------------------------------------------------------------------
+        # Step 15: Build Integer ESN reservoir (v18.2)
         # ------------------------------------------------------------------
         if self.reservoir_enabled:
-            print(f"\n[14/18] Building Integer ESN Reservoir (D={self.reservoir_dim}, "
+            print(f"\n[15/19] Building Integer ESN Reservoir (D={self.reservoir_dim}, "
                   f"alpha_q15={self.reservoir_alpha_q15})...")
             self.reservoir = IntegerESN(
                 vocab_size=len(self.vocab),
@@ -555,14 +617,14 @@ class IsingLMModelV18:
                 print(f"    ESN W_in: {self.reservoir.W_in.shape}, memory={mem_W:.1f} MB")
                 print(f"    ESN R: {self.reservoir.R.shape}, memory={mem_R:.1f} MB")
         else:
-            print(f"\n[14/18] ESN Reservoir DISABLED (--no-reservoir flag)")
+            print(f"\n[15/19] ESN Reservoir DISABLED (--no-reservoir flag)")
             self.reservoir = None
 
         # ------------------------------------------------------------------
-        # Step 15: Build factorial state coupling (v18.2 NEW)
+        # Step 16: Build factorial state coupling (v18.2)
         # ------------------------------------------------------------------
         if self.mf_enabled:
-            print(f"\n[15/18] Building Factorial State Coupling "
+            print(f"\n[16/19] Building Factorial State Coupling "
                   f"(5 pairs, mf_iters={self.mf_iterations})...")
             self.document_state.build_coupling(
                 self.sequences,
@@ -571,57 +633,61 @@ class IsingLMModelV18:
                 mf_lambda_q15=self.mf_lambda_q15,
             )
         else:
-            print(f"\n[15/18] Factorial Coupling DISABLED (--no-mf flag)")
+            print(f"\n[16/19] Factorial Coupling DISABLED (--no-mf flag)")
 
         # ------------------------------------------------------------------
-        # Step 16: Build energy computer (with Reservoir + Coupling + Dense AM + VSA)
+        # Step 17: Build energy computer (with RFF + Reservoir + Coupling + Dense AM + VSA)
         # ------------------------------------------------------------------
-        print("\n[16/18] Building energy computer...")
+        print("\n[17/19] Building energy computer...")
         self.energy_computer = EnergyComputer(
             multiscale_recall=self.multiscale_recall,
             document_state=self.document_state,
             pos_system=self.pos_system,
             vsa_encoder=self.vsa_encoder,
             dense_am=self.dense_am,            # v18.1
-            reservoir=self.reservoir,          # v18.2 NEW
+            reservoir=self.reservoir,          # v18.2
+            rff=self.rff,                      # v18.3 NEW
             recall_scale=self.recall_scale,
             pos_recall_scale=self.pos_recall_scale,
             topic_recall_scale=self.topic_recall_scale,
             state_scale=self.state_scale,
             vsa_scale=self.vsa_scale,
             dense_am_scale=self.dense_am_scale,
-            reservoir_scale=self.reservoir_scale,   # v18.2 NEW
-            coupling_scale=self.coupling_scale,      # v18.2 NEW
+            reservoir_scale=self.reservoir_scale,   # v18.2
+            coupling_scale=self.coupling_scale,      # v18.2
+            rff_scale=self.rff_scale,               # v18.3 NEW
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
             interpolated=self.interpolated,
             kn_backoff=self.kn_backoff,
-            mf_enabled=self.mf_enabled,             # v18.2 NEW
+            mf_enabled=self.mf_enabled,             # v18.2
         )
 
         # ------------------------------------------------------------------
-        # Step 17: Auto-calibrate beta
+        # Step 18: Auto-calibrate beta
         # ------------------------------------------------------------------
         if self.auto_calibrate_beta:
-            print("\n[17/18] Auto-calibrating beta from recall energy distribution...")
+            print("\n[18/19] Auto-calibrating beta from recall energy distribution...")
             self._auto_calibrate_beta()
         else:
-            print(f"\n[17/18] Using provided beta_word={self.beta_word:.6f}")
+            print(f"\n[18/19] Using provided beta_word={self.beta_word:.6f}")
 
         # ------------------------------------------------------------------
-        # Step 18: Build generator
+        # Step 19: Build generator
         # ------------------------------------------------------------------
-        print("\n[18/18] Building generator...")
+        print("\n[19/19] Building generator...")
         self._build_generator()
 
         t_total = time.time() - t0
         print(f"\nTraining complete: {t_total:.1f}s")
-        print(f"  Integer-only: YES (v18.2 — ZERO float operations in hot path)")
+        print(f"  Integer-only: YES (v18.3 — ZERO float operations in hot path)")
         print(f"  Dense AM: {'ENABLED' if self.dense_am else 'DISABLED'} "
               f"(degree={self.dense_am_degree})" if self.dense_am else "")
         print(f"  VSA binding: {'ENABLED' if self.vsa_encoder else 'DISABLED'}")
         print(f"  Reservoir: {'ENABLED' if self.reservoir else 'DISABLED'} "
               f"(D={self.reservoir_dim})" if self.reservoir else "")
+        print(f"  RFF: {'ENABLED' if self.rff else 'DISABLED'} "
+              f"(D={self.rff_dim})" if self.rff else "")
         print(f"  Coupling: {'ENABLED' if self.mf_enabled else 'DISABLED'} "
               f"(scale={self.coupling_scale})")
         print(f"  State scale: {self.state_scale} (was 50 in v17)")
