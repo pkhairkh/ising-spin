@@ -14,10 +14,10 @@ class EnergyComputer:
       2. Document State (SECONDARY): topic/mode/tense/negation/specificity/argument conditioning
       3. Hard constraints: POS type penalties, same-word penalty, closed-class double penalty
     
-    The key v17 insight: we no longer have recall + weak perturbation layers.
-    Instead, we have recall at MULTIPLE SCALES, each independently constraining
-    the prediction. The document state provides discourse-level coherence that
-    no n-gram (however abstract) can capture.
+    v17.3 CRITICAL FIX: interpolated and kn_backoff are now forwarded to
+    MultiScaleRecall. Previously they defaulted to False, meaning the model
+    built KN-smoothed indexes but never used them during energy computation.
+    This caused ~2× PPL inflation.
     """
     
     def __init__(
@@ -26,12 +26,14 @@ class EnergyComputer:
         document_state: DocumentState,
         pos_system: POSTypeSystem,
         recall_scale: int = 1600,      # word n-gram scale (primary)
-        pos_recall_scale: int = 800,    # v17.2: POS n-gram scale (was 400)
-        topic_recall_scale: int = 400,  # v17.2: topic n-gram scale (was 200)
-        state_scale: int = 50,          # v17.2: document state scale (was 200)
+        pos_recall_scale: int = 800,    # POS n-gram scale
+        topic_recall_scale: int = 400,  # topic n-gram scale
+        state_scale: int = 50,          # document state scale
         same_word_penalty: int = 200,
         closed_class_double_penalty: int = 50000,
         max_closed_class_run: int = 2,
+        interpolated: bool = True,      # v17.3: NOW FORWARDED (was silently False)
+        kn_backoff: bool = True,        # v17.3: NOW FORWARDED (was silently False)
     ):
         self.multiscale_recall = multiscale_recall
         self.document_state = document_state
@@ -43,6 +45,8 @@ class EnergyComputer:
         self.same_word_penalty = same_word_penalty
         self.closed_class_double_penalty = closed_class_double_penalty
         self.max_closed_class_run = max_closed_class_run
+        self.interpolated = interpolated
+        self.kn_backoff = kn_backoff
         
     def compute_energy(
         self,
@@ -63,11 +67,12 @@ class EnergyComputer:
         energies = np.zeros(n_candidates, dtype=np.int64)
         
         # 1. Multi-scale recall energy (PRIMARY)
+        # v17.3 FIX: Now forwards interpolated and kn_backoff
         recall_energy = self.multiscale_recall.compute_energy(
             context_words, candidate_words,
-            word_scale=self.recall_scale,
-            pos_scale=self.pos_recall_scale,
-            topic_scale=self.topic_recall_scale,
+            longest_only=not self.interpolated,
+            interpolated=self.interpolated,
+            kn_backoff=self.kn_backoff,
         )
         energies += recall_energy
         

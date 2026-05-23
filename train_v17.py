@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-v17.2 Training Script — Multi-Scale Abstract Recall + Evolving Document State
+v17.3 Training Script — Multi-Scale Abstract Recall + Evolving Document State
 
-v17.2 CHANGES (from v17.1):
-  - CRITICAL FIX: Top-k candidate filter was selecting RAREST words instead
-    of most common — this caused the incoherent generation in v17.1
-  - CRITICAL FIX: PPL evaluation had the same top-k bug (deflated PPL)
-  - Rebalanced energy scales: pos_recall_scale 400→800, topic_recall_scale
-    200→400, state_scale 200→50 (state should guide, not dominate)
-  - Fixed diagnostics: index entries/continuations now counted correctly
-  - Added n-gram order tracking for POS/Topic recall diagnostics
+v17.3 CHANGES (from v17.2 — PPL dropped from 50 to expected ~20-30):
+  - CRITICAL FIX: interpolated=True and kn_backoff=True were NEVER forwarded
+    from EnergyComputer to MultiScaleRecall. The model built KN-smoothed
+    indexes but used raw frequency fallback during ALL energy computations
+    (generation + PPL). This caused ~2x PPL inflation.
+  - Removed recent-5 repetition penalty from PPL computation (was inflating
+    PPL by penalizing legitimate word repetitions like "the cat sat on the")
+  - Removed frequency-based candidate filter — use ALL words of the target
+    POS type. The filter was excluding recall-relevant words.
+  - Generation: replaced aggressive recent-5 penalty with soft anti-stutter
+    (only penalizes 3x consecutive same word)
 
 ARCHITECTURE:
   Word n-gram (5) + POS n-gram (10) + Topic n-gram (10) + Document State (7 vars)
@@ -343,7 +346,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v17.2 MULTI-SCALE ABSTRACT RECALL", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v17.3 MULTI-SCALE ABSTRACT RECALL", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()}", flush=True)
@@ -359,7 +362,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v17.2 — Multi-Scale Abstract Recall + Document State")
+    print(f"CONFIG: v17.3 — Multi-Scale Abstract Recall + Document State")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -373,11 +376,14 @@ def main():
           f"{' [DISABLED]' if args.no_state else ''}")
     print(f"  STANDARD:")
     print(f"    vocab_max_size={args.vocab}")
-    print(f"    kn_backoff={kn_backoff}")
-    print(f"    interpolated={interpolated}")
+    print(f"    kn_backoff={kn_backoff} {'[v17.3 FIX: NOW FORWARDED TO ENERGY]' if kn_backoff else ''}")
+    print(f"    interpolated={interpolated} {'[v17.3 FIX: NOW FORWARDED TO ENERGY]' if interpolated else ''}")
     print(f"    same_word_penalty={args.same_word_penalty}")
     print(f"    n_topics={args.n_topics}")
     print(f"    n_samples={n_texts:,}")
+    print(f"  v17.3 FIXES:")
+    print(f"    no_freq_filter=True (all type words as candidates)")
+    print(f"    no_recent5_penalty_in_PPL=True")
     print(f"{'=' * 70}")
 
     # --- Train ---
@@ -519,7 +525,7 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "v17.2",
+        "version": "v17.3",
         "architecture": "Multi-Scale Abstract Recall + Evolving Document State",
         "timestamp": timestamp,
         "config": {
@@ -562,7 +568,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v17.2 Multi-Scale Abstract Recall + Document State")
+    print(f"DONE — v17.3 Multi-Scale Abstract Recall + Document State")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

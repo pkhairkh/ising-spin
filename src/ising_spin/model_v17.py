@@ -220,7 +220,7 @@ class IsingLMModel:
         three scales + document state + hard constraints.
         """
         print("=" * 70)
-        print("ISING SPIN GLASS LANGUAGE MODEL v17.2 — MULTI-SCALE ABSTRACT RECALL")
+        print("ISING SPIN GLASS LANGUAGE MODEL v17.3 — MULTI-SCALE ABSTRACT RECALL")
         print("=" * 70)
         print(f"\n  Architecture: 3-Scale Recall (word+POS+topic) + Document State")
         print(f"  Word n-gram:  max_n={self.ngram_max_n}, scale={self.recall_scale}")
@@ -418,6 +418,8 @@ class IsingLMModel:
             state_scale=self.state_scale,
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
+            interpolated=self.interpolated,    # v17.3 FIX: was silently False
+            kn_backoff=self.kn_backoff,        # v17.3 FIX: was silently False
         )
 
         # ------------------------------------------------------------------

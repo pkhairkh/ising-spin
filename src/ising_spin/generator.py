@@ -347,18 +347,13 @@ class IsingLMGenerator:
                 consecutive_copies = 0
 
             # === STEP 3: Get candidate words ===
+            # v17.3: Use ALL words of the chosen type (no frequency filter).
+            # The frequency filter was excluding recall-relevant words.
+            # The Boltzmann sampler naturally handles the full distribution.
             candidate_list = self.type_words.get(chosen_type, [])
             if not candidate_list:
                 candidate_list = list(range(min(200, self.vocab_size)))
             candidate_words = np.array(candidate_list, dtype=np.int64)
-
-            # Top-k filtering by field strength (unigram frequency)
-            # h[w] = floor(log2(total/count(w))): LOWER h = more common = more likely
-            # We want the most common (most likely) candidates, so take LOWEST h values
-            if len(candidate_words) > 300:
-                field_vals = self.h[candidate_words]
-                top_k = np.argsort(field_vals)[:300]  # 300 most COMMON words
-                candidate_words = candidate_words[top_k]
 
             # === STEP 4: Compute energy ===
             # Determine closed_class_run for the energy computer
@@ -379,14 +374,15 @@ class IsingLMGenerator:
                 closed_class_run=closed_run,
             )
 
-            # Additional penalties that depend on context
-            # Repetition penalty for recent words
-            if len(words) > 0:
-                recent = set(words[-5:])
-                rep_penalty = max(200, self.recall_scale // 8)
+            # Repetition penalty: only penalize consecutive same word
+            # v17.3: Removed recent-5 penalty (too aggressive, hurt coherence)
+            # The same-word penalty in EnergyComputer already handles w[t]==w[t-1]
+            # Here we add a soft penalty for w[t]==w[t-2] (anti-stutter)
+            if len(words) >= 2 and words[-1] == words[-2]:
+                # Last two words are the same — penalize repeating again
                 for i, w in enumerate(candidate_words):
-                    if int(w) in recent:
-                        word_energies[i] += rep_penalty
+                    if int(w) == words[-1]:
+                        word_energies[i] += 150  # Soft anti-stutter
 
             # === STEP 5: Boltzmann sample ===
             chosen_energy = 0
@@ -522,16 +518,9 @@ class IsingLMGenerator:
                     continue
                 candidate_words = np.array(candidate_list, dtype=np.int64)
 
-                # v17: recall-only mode is fast enough for all candidates,
-                # but if the candidate set is very large, limit to top-500 + target
-                # We want the most common words (lowest h[]) for accurate Z computation
-                if len(candidate_words) > 500:
-                    field_vals = self.h[candidate_words]
-                    top_k = np.argsort(field_vals)[:499]  # 499 most COMMON words
-                    candidate_words = candidate_words[top_k]
-                    # Always include target word
-                    if int(target_word) not in set(candidate_words.tolist()):
-                        candidate_words = np.append(candidate_words, target_word)
+                # v17.3: Use ALL words of the target type for accurate PPL.
+                # No frequency filter — the full partition function gives honest PPL.
+                # Each type has <1200 words, so this is fast enough.
 
                 # Check if target word is in candidates
                 target_in_candidates = int(target_word) in set(candidate_words.tolist())
@@ -563,13 +552,9 @@ class IsingLMGenerator:
                     closed_class_run=closed_run,
                 )
 
-                # Additional repetition penalty (matches generation)
-                if len(context_words) > 0:
-                    recent = set(context_words[-5:])
-                    rep_penalty = max(200, self.recall_scale // 8)
-                    for i, w in enumerate(candidate_words):
-                        if int(w) in recent:
-                            energies[i] += rep_penalty
+                # v17.3: NO additional repetition penalty in PPL.
+                # The recent-5 penalty was a generation heuristic that inflated PPL
+                # by penalizing legitimate word repetitions ("the cat sat on the").
 
                 # Compute log2 probabilities (integer, x LOG2_SCALE)
                 log_probs = sampler.compute_log_probabilities(energies)
