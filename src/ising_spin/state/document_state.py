@@ -17,6 +17,20 @@ State variables:
   specificity (1-4): Specificity level
   argument_pos (1-6): Argument position
 
+v18.2 NEW: Factorial State Coupling
+  The 7 state variables are no longer independent. Pairwise compatibility
+tables capture correlations (e.g., topic=SCIENCE co-occurs with
+mode=DESCRIPTION, but rarely with mode=ARGUMENT). Mean-field inference
+iteratively refines state values using coupling, and coupling energy
+penalizes unlikely state combinations.
+
+  Coupled pairs (5 most informative out of C(7,2)=21):
+    1. topic × mode       (16×8)  — topic determines discourse mode
+    2. topic × tense      (16×4)  — topics have tense preferences
+    3. mode × tense       (8×4)   — narrative=past, instruction=present
+    4. mode × argument    (8×6)   — argument structure depends on mode
+    5. tense × negation   (4×3)   — negation more common in past tense
+
 Key insight: State variables carry information ACROSS THE ENTIRE DOCUMENT.
 When "however" appears at position 50, it sets mode=ARGUMENT, and that
 persists until the next mode-changing word at position 80+.  No n-gram
@@ -236,6 +250,24 @@ class DocumentState:
         self.specificity_word_counts: Optional[np.ndarray] = None  # (5, vocab_size) int64
         self.argument_word_counts: Optional[np.ndarray] = None   # (7, vocab_size) int64
 
+        # v18.2: Pairwise compatibility tables for factorial state coupling
+        # 5 coupled pairs: (var_i_name, var_j_name, shape_i, shape_j)
+        self.coupling_pairs = [
+            ("topic", "mode",       self.n_topics + 1, 9),    # 17×9
+            ("topic", "tense",      self.n_topics + 1, 5),    # 17×5
+            ("mode",  "tense",      9, 5),                    # 9×5
+            ("mode",  "argument_pos", 9, 7),                  # 9×7
+            ("tense", "negation",   5, 4),                     # 5×4
+        ]
+
+        # Pairwise co-occurrence counts: compat_{i,j}[val_i, val_j]
+        self.pair_compat_tables: Optional[Dict[str, np.ndarray]] = None
+
+        # Mean-field parameters
+        self.mf_iterations: int = 5       # number of mean-field iterations
+        self.mf_lambda_q15: int = 16384   # coupling strength in Q15 (0.5)
+        self._coupling_built = False
+
         self._built = False
 
     # ===================================================================
@@ -337,6 +369,314 @@ class DocumentState:
 
         return self
 
+    # ===================================================================
+    # BUILD COUPLING: Pairwise compatibility tables (v18.2)
+    # ===================================================================
+
+    def build_coupling(
+        self,
+        sequences: List[List[int]],
+        idx2word: Optional[Dict[int, str]] = None,
+        mf_iterations: int = 5,
+        mf_lambda_q15: int = 16384,
+    ) -> "DocumentState":
+        """
+        Build pairwise compatibility tables from training data (v18.2).
+
+        For each coupled pair of state variables (i, j), we count how
+        often each (val_i, val_j) combination occurs in training data.
+        The resulting compatibility tables capture correlations like:
+          - topic=SCIENCE often co-occurs with mode=DESCRIPTION
+          - mode=ARGUMENT often co-occurs with tense=PAST
+          - negation=NEGATED rarely co-occurs with mode=LIST
+
+        The compatibility table stores log-likelihood ratios:
+          compat[i,j][val_i, val_j] = log2(joint_count / expected_if_independent)
+
+        where expected_if_independent = (marginal_i * marginal_j) / total.
+        Positive values mean the pair co-occurs MORE than expected
+        (compatible), negative means LESS than expected (incompatible).
+
+        All integer, using int_log2_fine() for log2 computation.
+
+        Args:
+            sequences: List of integer token-id sequences.
+            idx2word: Mapping from word ID to word string.
+            mf_iterations: Number of mean-field iterations (default 5).
+            mf_lambda_q15: Coupling strength in Q15 (default 16384 ≈ 0.5).
+
+        Returns:
+            self
+        """
+        self.mf_iterations = mf_iterations
+        self.mf_lambda_q15 = mf_lambda_q15
+
+        # State variable ranges (index 0 = unspecified/default)
+        var_ranges = {
+            "topic": self.n_topics + 1,        # 0..16
+            "mode": 9,                         # 0..8
+            "tense": 5,                        # 0..4
+            "negation": 4,                     # 0..3
+            "specificity": 5,                  # 0..4
+            "argument_pos": 7,                 # 0..6
+        }
+
+        # Initialize pairwise count tables
+        pair_counts = {}
+        pair_marginals_i = {}
+        pair_marginals_j = {}
+
+        for pair_name, (var_i, var_j, shape_i, shape_j) in self._iter_coupling_pairs():
+            pair_counts[pair_name] = np.zeros((shape_i, shape_j), dtype=np.int64)
+            pair_marginals_i[pair_name] = np.zeros(shape_i, dtype=np.int64)
+            pair_marginals_j[pair_name] = np.zeros(shape_j, dtype=np.int64)
+
+        # Count co-occurrences from training data
+        total_positions = 0
+
+        for seq in sequences:
+            self.reset()
+
+            for pos_i, word_id in enumerate(seq):
+                if word_id < 0 or word_id >= self.vocab_size:
+                    continue
+
+                # Get word string
+                word_str = None
+                if idx2word is not None:
+                    word_str = idx2word.get(word_id)
+                elif self.pos_system is not None and hasattr(self.pos_system, 'idx2word'):
+                    word_str = self.pos_system.idx2word.get(word_id)
+
+                # Record current state BEFORE update
+                state_snapshot = self.get_state_vector()
+
+                # Count pairwise co-occurrences
+                for pair_name, (var_i, var_j, _, _) in self._iter_coupling_pairs():
+                    val_i = state_snapshot[var_i]
+                    val_j = state_snapshot[var_j]
+                    pair_counts[pair_name][val_i, val_j] += 1
+                    pair_marginals_i[pair_name][val_i] += 1
+                    pair_marginals_j[pair_name][val_j] += 1
+
+                # Update state
+                self.update(word_id, word_str=word_str)
+                total_positions += 1
+
+        # Build compatibility tables from counts
+        # compat[i,j][val_i, val_j] = log2(observed / expected) * scale
+        # where expected = marg_i * marg_j / total
+        # Positive = co-occurs more than expected (compatible)
+        # Negative = co-occurs less than expected (incompatible)
+        COMPAT_SCALE = 64  # Q6 scaling for compatibility values
+
+        self.pair_compat_tables = {}
+
+        for pair_name, (var_i, var_j, shape_i, shape_j) in self._iter_coupling_pairs():
+            counts = pair_counts[pair_name]
+            marg_i = pair_marginals_i[pair_name]
+            marg_j = pair_marginals_j[pair_name]
+            total = int(counts.sum())
+
+            compat = np.zeros((shape_i, shape_j), dtype=np.int16)
+
+            if total > 0:
+                for vi in range(shape_i):
+                    for vj in range(shape_j):
+                        observed = int(counts[vi, vj])
+                        if observed == 0:
+                            # Unobserved pair: negative compatibility (penalty)
+                            compat[vi, vj] = -COMPAT_SCALE * 5
+                            continue
+
+                        mi = int(marg_i[vi])
+                        mj = int(marg_j[vj])
+                        if mi == 0 or mj == 0:
+                            continue
+
+                        # Expected count if independent
+                        expected = (mi * mj) // total
+
+                        if expected == 0:
+                            expected = 1
+
+                        # Log-likelihood ratio: log2(observed / expected)
+                        if observed >= expected:
+                            # More than expected: positive compat
+                            ratio = observed // max(1, expected)
+                            if ratio >= 2:
+                                log2_ratio = int_log2_fine(ratio)
+                                compat[vi, vj] = min(
+                                    (log2_ratio * COMPAT_SCALE) >> 8,
+                                    32767
+                                )
+                            else:
+                                compat[vi, vj] = 0
+                        else:
+                            # Less than expected: negative compat
+                            ratio = expected // max(1, observed)
+                            if ratio >= 2:
+                                log2_ratio = int_log2_fine(ratio)
+                                compat[vi, vj] = max(
+                                    -((log2_ratio * COMPAT_SCALE) >> 8),
+                                    -32768
+                                )
+                            else:
+                                compat[vi, vj] = 0
+
+            self.pair_compat_tables[pair_name] = compat
+
+        self._coupling_built = True
+
+        print(f"  DocumentState.build_coupling(): {len(sequences)} sequences, "
+              f"{total_positions} positions, {len(self.pair_compat_tables)} pairs")
+        for pair_name, compat in self.pair_compat_tables.items():
+            compat_range = f"[{int(compat.min())}, {int(compat.max())}]"
+            print(f"    {pair_name}: shape={compat.shape}, range={compat_range}")
+
+        return self
+
+    def _iter_coupling_pairs(self):
+        """
+        Iterate over coupling pairs, yielding (pair_name, (var_i, var_j, shape_i, shape_j)).
+        """
+        for var_i, var_j, shape_i, shape_j in self.coupling_pairs:
+            pair_name = f"{var_i}_x_{var_j}"
+            yield pair_name, (var_i, var_j, shape_i, shape_j)
+
+    # ===================================================================
+    # MEAN-FIELD INFERENCE (v18.2)
+    # ===================================================================
+
+    def run_mean_field(self) -> None:
+        """
+        Run mean-field inference to refine state variables via coupling.
+
+        For each iteration:
+          For each state variable i:
+            Compute field from all coupled variables:
+              field_i(val) = sum_{j ~ i} lambda * compat_{i,j}[val, val_j]
+            Set val_i = argmax(field_i) over all possible values
+
+        This iteratively adjusts state values to be more consistent with
+        each other. For example, if topic=SCIENCE and mode=ARGUMENT are
+        rarely compatible, the coupling will push one of them to a more
+        consistent value.
+
+        The coupling strength lambda_q15 controls how strongly the
+        coupling influences the state. lambda=0 means no coupling
+        (independent variables), lambda=0.5 means moderate coupling.
+
+        All integer. The field computation is O(K) per variable where
+        K is the number of coupled pairs (5 here), and the argmax is
+        over the range of the variable (max 17 for topic).
+        Total: ~5 iterations × 6 variables × 5 pairs × 17 values = ~2550 ops.
+        """
+        if not self._coupling_built or self.pair_compat_tables is None:
+            return
+
+        # State variable ranges (for argmax)
+        var_info = {
+            "topic":       (1, self.n_topics + 1),   # 1..16
+            "mode":        (1, 9),                   # 1..8
+            "tense":       (1, 5),                   # 1..4
+            "negation":    (1, 4),                   # 1..3
+            "specificity": (1, 5),                   # 1..4
+            "argument_pos": (1, 7),                  # 1..6
+        }
+
+        lambda_q15 = self.mf_lambda_q15
+
+        for _iteration in range(self.mf_iterations):
+            # For each variable, compute field from coupled variables
+            for var_name, (val_min, val_max) in var_info.items():
+                if var_name == "entity":
+                    continue  # Entity has 64 values, skip coupling
+
+                current_val = getattr(self, var_name)
+
+                # Compute field for each possible value
+                best_val = current_val
+                best_field = -2**30  # very negative
+
+                for candidate_val in range(val_min, val_max):
+                    field = 0
+
+                    # Sum contributions from all coupled pairs
+                    for pair_name, (var_i, var_j, _, _) in self._iter_coupling_pairs():
+                        if var_i == var_name:
+                            # This variable is the first in the pair
+                            val_j = getattr(self, var_j)
+                            compat = self.pair_compat_tables[pair_name]
+                            if 0 <= candidate_val < compat.shape[0] and 0 <= val_j < compat.shape[1]:
+                                field += (lambda_q15 * int(compat[candidate_val, val_j])) >> 15
+                        elif var_j == var_name:
+                            # This variable is the second in the pair
+                            val_i = getattr(self, var_i)
+                            compat = self.pair_compat_tables[pair_name]
+                            if 0 <= val_i < compat.shape[0] and 0 <= candidate_val < compat.shape[1]:
+                                field += (lambda_q15 * int(compat[val_i, candidate_val])) >> 15
+
+                    if field > best_field:
+                        best_field = field
+                        best_val = candidate_val
+
+                # Update state variable to best value
+                # Only update if the coupling suggests a different value
+                # (keep the deterministic rule result as the default)
+                if best_val != current_val:
+                    setattr(self, var_name, best_val)
+
+    # ===================================================================
+    # COUPLING ENERGY (v18.2)
+    # ===================================================================
+
+    def compute_coupling_energy(
+        self,
+        coupling_scale: int = 200,
+    ) -> int:
+        """
+        Compute coupling energy for the current state configuration.
+
+        E_coupling = -sum_{pairs (i,j)} lambda * compat_table[val_i, val_j]
+
+        The coupling energy penalizes unlikely state combinations.
+        If the current state values are compatible (positive compat),
+        the energy is negative (preferred). If incompatible (negative
+        compat), the energy is positive (penalized).
+
+        This is a SCALAR energy, not per-candidate. It affects the
+        overall energy baseline but doesn't differentiate between
+        candidate words directly. Its primary role is to ensure the
+        mean-field inference produces consistent state values, which
+        then influence word selection through the state-word
+        compatibility tables.
+
+        Args:
+            coupling_scale: Scaling factor for coupling energy (default 200).
+
+        Returns:
+            Integer coupling energy (int64). Negative = compatible state.
+        """
+        if not self._coupling_built or self.pair_compat_tables is None:
+            return 0
+
+        total_compat = 0
+
+        for pair_name, (var_i, var_j, _, _) in self._iter_coupling_pairs():
+            val_i = getattr(self, var_i)
+            val_j = getattr(self, var_j)
+            compat = self.pair_compat_tables[pair_name]
+
+            if 0 <= val_i < compat.shape[0] and 0 <= val_j < compat.shape[1]:
+                total_compat += int(compat[val_i, val_j])
+
+        # E_coupling = -lambda * total_compat * coupling_scale / Q15
+        # With lambda in Q15, the division brings it back to integer scale
+        energy = -(self.mf_lambda_q15 * total_compat * coupling_scale) >> 15
+
+        return energy
+
     def _print_table_stats(self):
         """Print statistics about the compatibility tables."""
         tables = {
@@ -369,6 +709,9 @@ class DocumentState:
         self.argument_pos = self.ARG_PREMISE
         self._negated_word_count = 0
         self._scoped_word_count = 0
+
+        # v18.2: Also reset mean-field coupling (no coupling needed at start)
+        # Mean-field will run after each word update if coupling is built
 
     # ===================================================================
     # UPDATE: Deterministic state transitions

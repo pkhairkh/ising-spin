@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-v18.1 Training Script — Dense AM + VSA Binding + State Scale Rebalance
+v18.2 Training Script — Integer ESN Reservoir + Factorial State Coupling
+
+v18.2 CHANGES (from v18.1):
+  - NEW: Integer ESN Reservoir (E_reservoir energy term, ~50 token lookback)
+    Fixed random recurrent network with exponential decay (alpha ~0.95)
+    Pre-aggregated readout matrix R: (V, D) int16 via training accumulation
+  - NEW: Factorial State Coupling with mean-field inference
+    5 pairwise compatibility tables (topic×mode, topic×tense, mode×tense, etc.)
+    Mean-field iterations refine state variables for consistency
+    E_coupling energy term penalizes unlikely state combinations
+  - NEW: --reservoir-dim (default 512), --reservoir-alpha (default 31130)
+  - NEW: --reservoir-scale (default 800), --no-reservoir
+  - NEW: --coupling-scale (default 200), --no-mf
 
 v18.1 CHANGES (from v18.0):
   - NEW: Dense Associative Memory module (E_dense_am energy term)
@@ -20,6 +32,8 @@ v18.0 CHANGES (from v17.4 — PPL=19.19 best but incoherent generation):
 ARCHITECTURE:
   Word n-gram (5) + POS n-gram (10) + Topic n-gram (10)
   + Dense AM (256-dim random features, degree=2) + VSA Binding (512-dim qFHRR)
+  + ESN Reservoir (512-dim, alpha=0.95, ~50 token lookback)
+  + Factorial Coupling (5 pairs, mean-field inference)
   + Document State (7 vars, scale=400)
 
 Usage:
@@ -28,10 +42,11 @@ Usage:
   python -u train_v18.py --vocab 49000              # Custom vocab size
   python -u train_v18.py --no-vsa                   # Ablation: without VSA binding
   python -u train_v18.py --no-dense-am              # Ablation: without Dense AM
-  python -u train_v18.py --dense-am-degree 1        # Linear Dense AM (recalls standard)
-  python -u train_v18.py --dense-am-dim 512         # Larger feature dimension
-  python -u train_v18.py --vsa-scale 400            # Custom VSA energy scale
-  python -u train_v18.py --state-scale 400          # Custom state scale
+  python -u train_v18.py --no-reservoir             # Ablation: without ESN reservoir
+  python -u train_v18.py --no-mf                    # Ablation: without mean-field coupling
+  python -u train_v18.py --reservoir-dim 256        # Smaller reservoir
+  python -u train_v18.py --reservoir-alpha 31130    # Custom decay (0.95)
+  python -u train_v18.py --coupling-scale 400       # Stronger coupling
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -66,6 +81,12 @@ DEFAULT_DENSE_AM_SCALE = 1200  # v18.1 NEW
 DEFAULT_DENSE_AM_DIM = 256     # v18.1 NEW
 DEFAULT_DENSE_AM_DEGREE = 2    # v18.1 NEW
 DEFAULT_DENSE_AM_HASH_DIM = 32 # v18.1 NEW
+DEFAULT_RESERVOIR_SCALE = 800    # v18.2 NEW
+DEFAULT_RESERVOIR_DIM = 512      # v18.2 NEW
+DEFAULT_RESERVOIR_ALPHA = 31130  # v18.2 NEW (~0.95 in Q15)
+DEFAULT_COUPLING_SCALE = 200     # v18.2 NEW
+DEFAULT_MF_ITERATIONS = 5        # v18.2 NEW
+DEFAULT_MF_LAMBDA_Q15 = 16384    # v18.2 NEW (~0.5 in Q15)
 DEFAULT_POS_NGRAM_MAX_N = 10
 DEFAULT_TOPIC_NGRAM_MAX_N = 10
 
@@ -219,7 +240,7 @@ def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="v18.1 Training — Dense AM + VSA Binding + State Scale Rebalance"
+        description="v18.2 Training — Integer ESN Reservoir + Factorial State Coupling"
     )
 
     # Core parameters
@@ -238,7 +259,7 @@ def main():
     parser.add_argument("--vsa-dimension", type=int, default=DEFAULT_VSA_DIMENSION,
                         help="VSA vector dimension (default: 512)")
 
-    # Dense AM parameters (v18.1 NEW)
+    # Dense AM parameters (v18.1)
     parser.add_argument("--dense-am-scale", type=int, default=DEFAULT_DENSE_AM_SCALE,
                         help="Dense AM energy scale (default: 1200)")
     parser.add_argument("--dense-am-dim", type=int, default=DEFAULT_DENSE_AM_DIM,
@@ -247,6 +268,22 @@ def main():
                         help="Dense AM polynomial degree: 1=linear, 2=Dense AM (default: 2)")
     parser.add_argument("--dense-am-hash-dim", type=int, default=DEFAULT_DENSE_AM_HASH_DIM,
                         help="Dense AM context hash dimension (default: 32)")
+
+    # Reservoir parameters (v18.2 NEW)
+    parser.add_argument("--reservoir-scale", type=int, default=DEFAULT_RESERVOIR_SCALE,
+                        help="ESN reservoir energy scale (default: 800)")
+    parser.add_argument("--reservoir-dim", type=int, default=DEFAULT_RESERVOIR_DIM,
+                        help="ESN reservoir state dimension (default: 512)")
+    parser.add_argument("--reservoir-alpha", type=int, default=DEFAULT_RESERVOIR_ALPHA,
+                        help="ESN decay factor in Q15 (default: 31130 ≈ 0.95)")
+
+    # Coupling parameters (v18.2 NEW)
+    parser.add_argument("--coupling-scale", type=int, default=DEFAULT_COUPLING_SCALE,
+                        help="Factorial state coupling energy scale (default: 200)")
+    parser.add_argument("--mf-iterations", type=int, default=DEFAULT_MF_ITERATIONS,
+                        help="Number of mean-field iterations (default: 5)")
+    parser.add_argument("--mf-lambda-q15", type=int, default=DEFAULT_MF_LAMBDA_Q15,
+                        help="Mean-field coupling strength in Q15 (default: 16384 ≈ 0.5)")
 
     # POS and Topic n-gram sizes
     parser.add_argument("--pos-ngram-max-n", type=int, default=DEFAULT_POS_NGRAM_MAX_N)
@@ -263,6 +300,10 @@ def main():
                         help="Ablation: disable VSA binding module")
     parser.add_argument("--no-dense-am", action="store_true",
                         help="Ablation: disable Dense AM module (v18.1)")
+    parser.add_argument("--no-reservoir", action="store_true",
+                        help="Ablation: disable ESN reservoir (v18.2)")
+    parser.add_argument("--no-mf", action="store_true",
+                        help="Ablation: disable mean-field coupling inference (v18.2)")
 
     # Standard n-gram parameters
     parser.add_argument("--no-kn-backoff", action="store_true")
@@ -281,6 +322,8 @@ def main():
     state_scale = 0 if args.no_state else args.state_scale
     vsa_enabled = not args.no_vsa
     dense_am_enabled = not args.no_dense_am
+    reservoir_enabled = not args.no_reservoir    # v18.2
+    mf_enabled = not args.no_mf                  # v18.2
 
     kn_backoff = not args.no_kn_backoff
     interpolated = not args.no_interpolated
@@ -291,7 +334,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v18.1 DENSE AM + VSA BINDING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v18.2 ESN RESERVOIR + FACTORIAL COUPLING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -306,7 +349,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v18.1 — Dense AM + VSA Binding + State Scale Rebalance")
+    print(f"CONFIG: v18.2 — Integer ESN Reservoir + Factorial State Coupling")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -315,13 +358,21 @@ def main():
     print(f"  TOPIC RECALL:")
     print(f"    topic_ngram_max_n={args.topic_ngram_max_n}, topic_recall_scale={topic_recall_scale}"
           f"{' [DISABLED]' if args.no_topic_recall else ''}")
-    print(f"  DENSE AM (v18.1 NEW):")
+    print(f"  DENSE AM (v18.1):")
     print(f"    enabled={dense_am_enabled}, D={args.dense_am_dim}, degree={args.dense_am_degree}, "
           f"scale={args.dense_am_scale}, hash_dim={args.dense_am_hash_dim}"
           f"{' [DISABLED --no-dense-am]' if args.no_dense_am else ''}")
     print(f"  VSA BINDING (v18.0):")
     print(f"    enabled={vsa_enabled}, dimension={args.vsa_dimension}, vsa_scale={args.vsa_scale}"
           f"{' [DISABLED --no-vsa]' if args.no_vsa else ''}")
+    print(f"  ESN RESERVOIR (v18.2 NEW):")
+    print(f"    enabled={reservoir_enabled}, D={args.reservoir_dim}, alpha_q15={args.reservoir_alpha}, "
+          f"scale={args.reservoir_scale}"
+          f"{' [DISABLED --no-reservoir]' if args.no_reservoir else ''}")
+    print(f"  FACTORIAL COUPLING (v18.2 NEW):")
+    print(f"    enabled={mf_enabled}, coupling_scale={args.coupling_scale}, "
+          f"mf_iterations={args.mf_iterations}, lambda_q15={args.mf_lambda_q15}"
+          f"{' [DISABLED --no-mf]' if args.no_mf else ''}")
     print(f"  DOCUMENT STATE:")
     print(f"    state_scale={state_scale} (was 50 in v17)"
           f"{' [DISABLED]' if args.no_state else ''}")
@@ -358,6 +409,8 @@ def main():
         state_scale=state_scale,
         vsa_scale=args.vsa_scale,
         dense_am_scale=args.dense_am_scale,
+        reservoir_scale=args.reservoir_scale,      # v18.2 NEW
+        coupling_scale=args.coupling_scale,         # v18.2 NEW
         # VSA
         vsa_enabled=vsa_enabled,
         vsa_dimension=args.vsa_dimension,
@@ -368,6 +421,15 @@ def main():
         dense_am_degree=args.dense_am_degree,
         dense_am_seed=42,
         dense_am_hash_dim=args.dense_am_hash_dim,
+        # Reservoir (v18.2 NEW)
+        reservoir_enabled=reservoir_enabled,
+        reservoir_dim=args.reservoir_dim,
+        reservoir_alpha_q15=args.reservoir_alpha,
+        reservoir_seed=42,
+        # Coupling (v18.2 NEW)
+        mf_enabled=mf_enabled,
+        mf_iterations=args.mf_iterations,
+        mf_lambda_q15=args.mf_lambda_q15,
         # Hard constraints
         same_word_penalty=args.same_word_penalty,
         max_closed_class_run=2,
@@ -454,8 +516,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "v18.1",
-        "architecture": "Multi-Scale Recall + Dense AM + VSA Binding + Document State",
+        "version": "v18.2",
+        "architecture": "Multi-Scale Recall + Dense AM + VSA + ESN Reservoir + Factorial Coupling",
         "timestamp": timestamp,
         "config": {
             "recall_scale": args.recall_scale,
@@ -470,6 +532,14 @@ def main():
             "dense_am_degree": args.dense_am_degree,
             "dense_am_hash_dim": args.dense_am_hash_dim,
             "dense_am_enabled": dense_am_enabled,
+            "reservoir_scale": args.reservoir_scale,
+            "reservoir_dim": args.reservoir_dim,
+            "reservoir_alpha_q15": args.reservoir_alpha,
+            "reservoir_enabled": reservoir_enabled,
+            "coupling_scale": args.coupling_scale,
+            "mf_iterations": args.mf_iterations,
+            "mf_lambda_q15": args.mf_lambda_q15,
+            "mf_enabled": mf_enabled,
             "vocab_max_size": args.vocab,
             "kn_backoff": kn_backoff,
             "interpolated": interpolated,
@@ -494,7 +564,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v18.1 Dense AM + VSA Binding + State Scale Rebalance")
+    print(f"DONE — v18.2 Integer ESN Reservoir + Factorial State Coupling")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

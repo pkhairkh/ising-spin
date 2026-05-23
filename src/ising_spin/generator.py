@@ -23,6 +23,7 @@ from .recall import WordNgramIndex, MultiScaleRecall
 from .state import DocumentState
 from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
+from .reservoir import IntegerESN  # v18.2
 
 
 class IsingLMGenerator:
@@ -63,6 +64,7 @@ class IsingLMGenerator:
         word_sampler: IntegerBoltzmannSampler,
         type_sampler: IntegerBoltzmannSampler,
         word_index: Optional[WordNgramIndex] = None,
+        reservoir: Optional[IntegerESN] = None,      # v18.2: ESN reservoir
         copy_enabled: bool = True,
         copy_min_context: int = 3,
         copy_min_confidence: float = 0.4,
@@ -83,6 +85,7 @@ class IsingLMGenerator:
         self.word_sampler = word_sampler
         self.type_sampler = type_sampler
         self.word_index = word_index  # for copy mechanism
+        self.reservoir = reservoir  # v18.2: ESN reservoir
         self.vocab_size = len(vocab)
 
         self.copy_enabled = copy_enabled
@@ -291,9 +294,15 @@ class IsingLMGenerator:
 
         # Initialize document state from prompt
         self.document_state.reset()
+        # v18.2: Reset ESN reservoir for new generation
+        if self.reservoir is not None:
+            self.reservoir.reset()
         for w in words:
             word_str = self.vocab.idx2word.get(w, "")
             self.document_state.update(w, word_str=word_str)
+            # v18.2: Feed prompt words to reservoir
+            if self.reservoir is not None:
+                self.reservoir.step(w)
 
         # v17.4: Track content positions separately, since <S> tokens
         # inflate the words list but aren't "real" content positions.
@@ -419,6 +428,10 @@ class IsingLMGenerator:
             word_str = self.vocab.idx2word.get(chosen_word, "")
             self.document_state.update(chosen_word, word_str=word_str)
 
+            # v18.2: Feed generated word to ESN reservoir
+            if self.reservoir is not None:
+                self.reservoir.step(chosen_word)
+
             # Track diagnostics
             self._stats['total_positions'] += 1
             # Track state energy for the chosen word (cheap: single word lookup)
@@ -522,6 +535,9 @@ class IsingLMGenerator:
 
             # Reset document state for each new sequence
             self.document_state.reset()
+            # v18.2: Reset ESN reservoir for each test sequence
+            if self.reservoir is not None:
+                self.reservoir.reset()
 
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
@@ -590,6 +606,10 @@ class IsingLMGenerator:
                 # Update document state with actual next word
                 word_str = self.vocab.idx2word.get(target_word, "")
                 self.document_state.update(target_word, word_str=word_str)
+
+                # v18.2: Feed target word to ESN reservoir
+                if self.reservoir is not None:
+                    self.reservoir.step(target_word)
 
         if total_tokens == 0:
             return float('inf')

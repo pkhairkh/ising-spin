@@ -1,17 +1,29 @@
 """
-Ising Spin Glass Language Model — v18.1
+Ising Spin Glass Language Model — v18.2
 
-Multi-Scale Abstract Recall + Dense AM + VSA Binding + Evolving Document State.
+Multi-Scale Abstract Recall + Dense AM + VSA Binding + Integer ESN Reservoir
++ Factorial State Coupling + Evolving Document State.
 
 Architecture:
     - Word-level n-gram recall (5-gram) — exact word context
     - POS-level n-gram recall (10-gram) — abstract syntactic generalization
     - Topic-level n-gram recall (10-gram) — discourse coherence
-    - Dense AM (v18.1 NEW) — nonlinear pattern matching with random features
+    - Dense AM (v18.1) — nonlinear pattern matching with random features
     - VSA qFHRR binding (v18.0) — compositional word+POS+topic encoding
+    - Integer ESN Reservoir (v18.2 NEW) — long-range temporal dynamics (~50 token lookback)
+    - Factorial State Coupling (v18.2 NEW) — mean-field inference + coupling energy
     - Document state (7 evolving integer variables) — full-document context
     - ADDITIVE energy fusion — all scales reinforce each other
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
+
+v18.2 Changes:
+    - Added Integer ESN Reservoir (E_reservoir energy term)
+      Fixed random recurrent network with exponential decay (~50 token lookback)
+      Pre-aggregated readout R: (V, 512) int16
+    - Added Factorial State Coupling with mean-field inference
+      5 pairwise compatibility tables for state variable correlations
+      E_coupling energy term penalizes unlikely state combinations
+    - Generator now tracks reservoir state per-token
 
 v18.1 Changes:
     - Added Dense Associative Memory module with polynomial nonlinearity
@@ -25,17 +37,6 @@ v18.0 Changes:
     - E_vsa_bind energy term captures word+POS+topic interactions
     - State scale rebalanced from 50 to 400 for meaningful contribution
     - VSA energy scale default = 800 (comparable to POS recall)
-
-v17.1 Bug Fixes (carried forward):
-    - DocumentState.build() now receives idx2word → state update rules fire
-      correctly. Previously, word_str was always None because POSTypeSystem
-      didn't have idx2word, causing all state vars (mode, tense, etc.) to
-      stay at defaults → compatibility tables were useless.
-    - Generator diagnostics now track POS/topic recall hits and state energy.
-    - POS n-gram max_n reduced from 15 to 10 (13GB → ~6GB on 1M corpus).
-    - Energy combination switched from PoE (min) to additive — all scales
-      now contribute to the final energy, reinforcing each other.
-    - POS/topic recall scales halved (400/200) for additive combination.
 """
 
 from .vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
@@ -51,6 +52,7 @@ from .state import DocumentState
 from .energy import EnergyComputer
 from .vsa import QFHRRVectors, VSAEncoder
 from .dense_am import RandomFeatureProjector, DenseAMEnergy
+from .reservoir import IntegerESN
 from .model_v17 import IsingLMModel
 
-__version__ = "18.1.0"
+__version__ = "18.2.0"
