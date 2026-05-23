@@ -148,22 +148,29 @@ class PosNgramIndex(AbstractRecallIndex):
         self._derive_pos_tags()
 
         for seq in sequences:
+            # v17.4: Handle <S> sentence boundaries
+            NS = 5  # Number of special tokens
             start = 0
             for i, w in enumerate(seq):
-                if w >= 4:
+                if w >= NS:
                     start = i
                     break
+                elif w == 4:  # <S> token
+                    start = i + 1
 
             # Convert to POS tag sequence
             pos_seq = self._seq_to_pos(seq)
 
+            eff_start = start
             for t in range(start, len(seq)):
                 continuation = seq[t]  # Record the WORD, not the POS tag
-                if continuation < 4:
+                if continuation < NS:
+                    if continuation == 4:  # <S> — sentence boundary
+                        eff_start = t + 1
                     continue
 
                 for k in range(1, self.max_n + 1):
-                    if t - k < start:
+                    if t - k < eff_start:
                         break
 
                     # Context is POS tags, not word IDs
@@ -234,21 +241,28 @@ class PosNgramIndex(AbstractRecallIndex):
             batch = sequences[start:end]
 
             for seq in batch:
+                # v17.4: Handle <S> sentence boundaries
+                NS = 5
                 s_start = 0
                 for i, w in enumerate(seq):
-                    if w >= 4:
+                    if w >= NS:
                         s_start = i
                         break
+                    elif w == 4:  # <S> token
+                        s_start = i + 1
 
                 pos_seq = self._seq_to_pos(seq)
 
+                eff_start = s_start
                 for t in range(s_start, len(seq)):
                     continuation = seq[t]
-                    if continuation < 4:
+                    if continuation < NS:
+                        if continuation == 4:  # <S> — sentence boundary
+                            eff_start = t + 1
                         continue
 
                     for k in range(1, self.max_n + 1):
-                        if t - k < s_start:
+                        if t - k < eff_start:
                             break
                         pos_context = tuple(pos_seq[t - k:t])
                         x_count = sum(1 for p in pos_context if p == POS2IDX["X"])
@@ -364,6 +378,15 @@ class PosNgramIndex(AbstractRecallIndex):
         context_ids: word IDs -- converted to POS tags internally.
         Returns {k: [(word, count, total), ...]}.
         """
+        # v17.4: Truncate context at last <S> (sentence boundary)
+        SENT_IDX = 4
+        last_sent = -1
+        for i, w in enumerate(context_ids):
+            if w == SENT_IDX:
+                last_sent = i
+        if last_sent >= 0:
+            context_ids = context_ids[last_sent + 1:]
+
         # Convert word IDs to POS tags
         pos_context = [self._word_to_pos(w) for w in context_ids]
 
@@ -447,7 +470,9 @@ class PosNgramIndex(AbstractRecallIndex):
             matches = {best_k: matches[best_k]}
 
         for k, continuations in matches.items():
-            context_weight = context_weight_factor ** (k - 1)
+            # v17.4 FIX: Cap context_weight (same as word_index)
+            raw_weight = context_weight_factor ** (k - 1)
+            context_weight = min(raw_weight, 16)
             cont_lookup = {}
             for word, count, total in continuations:
                 if count > 0 and total > 0:

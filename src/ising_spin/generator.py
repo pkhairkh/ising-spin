@@ -99,18 +99,18 @@ class IsingLMGenerator:
         self.state_scale = state_scale
 
         # Build type→words index from POS system
+        # v17.4 FIX: Each word goes into ALL its allowed type buckets, not just primary.
+        # Previously, "run" (NOUN+VERB) was only in its primary bucket (NOUN),
+        # making it impossible to generate "they run" (needs VERB bucket).
+        # Now, "run" appears in BOTH NOUN and VERB buckets.
+        # The energy computer's POS type penalty (+5000 for type mismatch) still
+        # prevents generating "the run" when VERB type is chosen, because the
+        # energy for "run" in the VERB bucket will be much lower than in NOUN.
         self.type_words: Dict[int, List[int]] = {t: [] for t in range(N_POS)}
-        TAG_PRIORITY = {
-            POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
-            POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
-            POS2IDX["PREP"]: 6, POS2IDX["NUM"]: 7, POS2IDX["ADV"]: 8,
-            POS2IDX["ADJ"]: 9, POS2IDX["NOUN"]: 10, POS2IDX["VERB"]: 11,
-            POS2IDX["X"]: 12,
-        }
         for w, allowed in pos_system.allowed_types.items():
             if allowed:
-                primary = min(allowed, key=lambda t: TAG_PRIORITY.get(t, 99))
-                self.type_words[primary].append(w)
+                for t in allowed:
+                    self.type_words[t].append(w)
 
         # Pre-compute allowed POS transitions from grammar penalties
         self.allowed_transitions: Set[Tuple[int, int]] = set()
@@ -157,6 +157,13 @@ class IsingLMGenerator:
             'pos_max_n': 0,
             'topic_max_n': 0,
         }
+
+        # v17.4: Word IDs that end a sentence — used to insert <S> boundary
+        self._sent_end_word_ids = set()
+        for punct in ['.', '!', '?']:
+            idx = vocab.word2idx.get(punct)
+            if idx is not None:
+                self._sent_end_word_ids.add(idx)
 
     # ===================================================================
     # WORD TYPE HELPERS
@@ -262,14 +269,15 @@ class IsingLMGenerator:
 
         All energy computation and sampling is integer-only.
         """
-        # Resolve prompt — tokenize ALL words
-        prompt_words = prompt.strip().split()
+        # Resolve prompt — v17.4 FIX: Use vocab.encode() instead of text.split()
+        # The old code did prompt.split() + manual .lower() fallback, which missed:
+        # - Contraction splitting ("don't" → "do" + "n't")
+        # - Punctuation stripping ("hello," → "hello" + ",")
+        # - Number handling, hyphenated words
         prompt_tokens = []
-        for w in prompt_words:
-            idx = self.vocab.word2idx.get(w)
-            if idx is None:
-                idx = self.vocab.word2idx.get(w.lower())
-            if idx is not None and idx >= 4:  # Skip special tokens
+        encoded = self.vocab.encode(prompt)
+        for idx in encoded:
+            if idx >= 5:  # v17.4: Skip special tokens (UNK=0, BOS=1, EOS=2, PAD=3, SENT=4)
                 prompt_tokens.append(idx)
         # Fallback: if no words found, use "the"
         if not prompt_tokens:
@@ -287,7 +295,11 @@ class IsingLMGenerator:
             word_str = self.vocab.idx2word.get(w, "")
             self.document_state.update(w, word_str=word_str)
 
-        for pos in range(len(words), length):
+        # v17.4: Track content positions separately, since <S> tokens
+        # inflate the words list but aren't "real" content positions.
+        n_content = len(prompt_tokens)
+
+        for pos in range(n_content, length):
             # === STEP 1: Choose POS type (BOLTZMANN) ===
             valid_types = self._get_valid_next_types(types_list[-1], types_list)
 
@@ -395,6 +407,13 @@ class IsingLMGenerator:
 
             words.append(chosen_word)
             types_list.append(chosen_type)
+
+            # v17.4: Insert sentence boundary marker after sentence-ending punctuation.
+            # This prevents n-gram lookups from crossing sentence boundaries.
+            SENT_IDX = 4  # <S> token index in vocabulary
+            if chosen_word in self._sent_end_word_ids:
+                words.append(SENT_IDX)
+                types_list.append(0)  # PUNCT type for <S>
 
             # === STEP 6: Update document state ===
             word_str = self.vocab.idx2word.get(chosen_word, "")

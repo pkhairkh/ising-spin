@@ -2,7 +2,10 @@
 Integer-only vocabulary mapping between words and indices.
 
 Special tokens:
-    <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3
+    <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3, <S>=4
+
+v17.4: <S> (sentence boundary) inserted after '.', '!', '?' to prevent
+       cross-sentence n-gram contamination.
 
 Path 3a: Enhanced tokenizer handles contractions, hyphens, and numbers.
 """
@@ -26,7 +29,8 @@ class Vocabulary:
     BOS = "<BOS>"
     EOS = "<EOS>"
     PAD = "<PAD>"
-    SPECIALS = [UNK, BOS, EOS, PAD]
+    SENT = "<S>"  # v17.4: Sentence boundary marker — prevents cross-sentence n-grams
+    SPECIALS = [UNK, BOS, EOS, PAD, SENT]
 
     # Contraction suffixes to split off
     CONTRACTION_SUFFIXES = [
@@ -47,6 +51,9 @@ class Vocabulary:
         self.word_counts: Counter = Counter()
         self._built = False
 
+    # Sentence-ending punctuation — v17.4: insert <S> after these
+    SENTENCE_ENDS = {'.', '!', '?'}
+
     def _tokenize(self, text: str) -> List[str]:
         """
         Enhanced tokenizer with better handling of contractions, hyphens,
@@ -56,6 +63,9 @@ class Vocabulary:
           - Contractions: "don't" -> "do" + "n't", "it's" -> "it" + "'s"
           - Hyphens: "well-known" -> "well-known" (kept as one token)
           - Numbers: "3.14" stays as one token, "1,000" stays as one token
+        v17.4 improvement:
+          - Sentence boundaries: insert <S> after '.', '!', '?' to prevent
+            cross-sentence n-gram contamination
         """
         tokens = []
         for word in text.split():
@@ -78,6 +88,9 @@ class Vocabulary:
             # Add leading punctuation tokens
             tokens.extend(leading_punct)
 
+            # v17.4: Track if trailing punct includes sentence end
+            has_sentence_end = any(p in self.SENTENCE_ENDS for p in trailing_punct)
+
             if not stripped:
                 tokens.extend(reversed(trailing_punct))
                 continue
@@ -99,6 +112,8 @@ class Vocabulary:
 
             if contraction_found:
                 tokens.extend(reversed(trailing_punct))
+                if has_sentence_end:
+                    tokens.append(self.SENT)
                 continue
 
             # === Handle numbers (keep as single token) ===
@@ -107,6 +122,8 @@ class Vocabulary:
             if cleaned.replace("-", "").isdigit() and len(lower) > 0:
                 tokens.append(lower)
                 tokens.extend(reversed(trailing_punct))
+                if has_sentence_end:
+                    tokens.append(self.SENT)
                 continue
 
             # === Handle hyphenated words (keep as single token) ===
@@ -116,11 +133,17 @@ class Vocabulary:
                 if all(len(p) >= 1 and (p.isalpha() or p.isdigit()) for p in parts):
                     tokens.append(lower)
                     tokens.extend(reversed(trailing_punct))
+                    if has_sentence_end:
+                        tokens.append(self.SENT)
                     continue
 
             # === Default: use the word as-is (lowercased) ===
             tokens.append(lower)
             tokens.extend(reversed(trailing_punct))
+
+            # v17.4: Insert sentence boundary marker after sentence-ending punct
+            if has_sentence_end:
+                tokens.append(self.SENT)
 
         return tokens
 
@@ -199,7 +222,8 @@ class Vocabulary:
         words = []
         for idx in indices:
             word = self.idx2word.get(idx, self.UNK)
-            if word in (self.BOS, self.EOS, self.PAD):
+            if word in (self.BOS, self.EOS, self.PAD, self.SENT):
+                # v17.4: Also suppress SENT in decoded output
                 continue
             words.append(word)
         return " ".join(words)

@@ -75,7 +75,11 @@ class TopicAssigner:
         print(f"    [1/4] Building document-term matrix ({n_docs} docs, {vocab_size} vocab)...")
         doc_vectors = np.zeros((n_docs, vocab_size), dtype=np.int32)
         for d, text in enumerate(cluster_texts):
-            for w in text.split():
+            # v17.4 FIX: Use vocab._tokenize() instead of text.split()
+            # text.split() misses lowercasing, punctuation stripping, and contraction splitting.
+            # This caused massive lookup failures (e.g., "The" never matched "the").
+            tokens = vocab._tokenize(text)
+            for w in tokens:
                 idx = vocab.word2idx.get(w)
                 if idx is not None:
                     doc_vectors[d, idx] += 1
@@ -146,7 +150,9 @@ class TopicAssigner:
                 chunk = remaining[chunk_start:chunk_start + CHUNK]
                 chunk_vecs = np.zeros((len(chunk), vocab_size), dtype=np.int64)
                 for d, text in enumerate(chunk):
-                    for w in text.split():
+                    # v17.4 FIX: Use vocab._tokenize() instead of text.split()
+                    tokens = vocab._tokenize(text)
+                    for w in tokens:
                         idx = vocab.word2idx.get(w)
                         if idx is not None:
                             chunk_vecs[d, idx] += 1

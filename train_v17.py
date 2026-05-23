@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-v17.3 Training Script — Multi-Scale Abstract Recall + Evolving Document State
+v17.4 Training Script — Tokenizer & Vocabulary Fixes + Sentence Boundaries
 
-v17.3 CHANGES (from v17.2 — PPL dropped from 50 to expected ~20-30):
-  - CRITICAL FIX: interpolated=True and kn_backoff=True were NEVER forwarded
-    from EnergyComputer to MultiScaleRecall. The model built KN-smoothed
-    indexes but used raw frequency fallback during ALL energy computations
-    (generation + PPL). This caused ~2x PPL inflation.
-  - Removed recent-5 repetition penalty from PPL computation (was inflating
-    PPL by penalizing legitimate word repetitions like "the cat sat on the")
-  - Removed frequency-based candidate filter — use ALL words of the target
-    POS type. The filter was excluding recall-relevant words.
-  - Generation: replaced aggressive recent-5 penalty with soft anti-stutter
-    (only penalizes 3x consecutive same word)
+v17.4 CHANGES (from v17.3 — PPL=21.11 but incoherent generation):
+  - CRITICAL FIX: TopicAssigner used text.split() instead of vocab._tokenize().
+    Capitalized words ("The") never matched vocab ("the"), corrupting topic clustering.
+  - CRITICAL FIX: Generator prompt used text.split() instead of vocab.encode().
+    Contractions and punctuation in prompts didn't resolve correctly.
+  - CRITICAL FIX: Each word was assigned to only ONE POS type bucket (primary).
+    Words like "run" (NOUN+VERB) could only be generated in one context.
+    Now words appear in ALL their allowed type buckets.
+  - FIX: Exponential context_weight_factor scaling capped at 16 (was 2^(k-1)=512
+    for 10-gram matches, completely dominating all other energy signals).
+  - NEW: Sentence boundary marker <S> inserted after '.', '!', '?'.
+    Prevents cross-sentence n-gram contamination.
+  - INCREASED: Vocab from 4000 to 8000, min_freq from 25 to 15.
 
 ARCHITECTURE:
   Word n-gram (5) + POS n-gram (10) + Topic n-gram (10) + Document State (7 vars)
@@ -20,6 +22,7 @@ ARCHITECTURE:
 Usage:
   python -u train_v17.py                          # Default: 500K samples
   python -u train_v17.py --samples 1000000         # 1M samples
+  python -u train_v17.py --vocab 8000               # Custom vocab size
   python -u train_v17.py --no-pos-recall            # Ablation: without POS n-gram
   python -u train_v17.py --no-topic-recall          # Ablation: without topic n-gram
   python -u train_v17.py --no-state                 # Ablation: without document state
@@ -45,7 +48,8 @@ from pathlib import Path
 # --- Configuration ---
 
 DEFAULT_SAMPLES = 500000
-DEFAULT_VOCAB = 4000
+DEFAULT_VOCAB = 8000
+DEFAULT_MIN_FREQ = 15  # v17.4: Lowered from 25 to improve vocab coverage with 8000 words
 DEFAULT_RECALL_SCALE = 1600
 DEFAULT_POS_RECALL_SCALE = 800   # v17.2: increased from 400
 DEFAULT_TOPIC_RECALL_SCALE = 400  # v17.2: increased from 200
@@ -346,7 +350,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v17.3 MULTI-SCALE ABSTRACT RECALL", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v17.4 TOKENIZER + VOCAB FIXES", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()}", flush=True)
@@ -362,7 +366,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v17.3 — Multi-Scale Abstract Recall + Document State")
+    print(f"CONFIG: v17.4 — Tokenizer & Vocabulary Fixes + Sentence Boundaries")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -381,7 +385,13 @@ def main():
     print(f"    same_word_penalty={args.same_word_penalty}")
     print(f"    n_topics={args.n_topics}")
     print(f"    n_samples={n_texts:,}")
-    print(f"  v17.3 FIXES:")
+    print(f"  v17.4 FIXES:")
+    print(f"    tokenizer: TopicAssigner now uses vocab._tokenize() (was text.split())")
+    print(f"    tokenizer: Generator prompt now uses vocab.encode() (was text.split())")
+    print(f"    candidates: Multi-type words in ALL allowed POS buckets (was primary-only)")
+    print(f"    context_weight: Capped at 16 (was exponential 2^(k-1))")
+    print(f"    sentence_boundaries: <S> token prevents cross-sentence n-grams")
+    print(f"    vocab: 8000 words, min_freq=15 (was 4000, 25)")
     print(f"    no_freq_filter=True (all type words as candidates)")
     print(f"    no_recent5_penalty_in_PPL=True")
     print(f"{'=' * 70}")
@@ -391,7 +401,7 @@ def main():
 
     model = IsingLMModel(
         # Vocabulary
-        vocab_min_freq=25,
+        vocab_min_freq=15,
         vocab_max_size=args.vocab,
         # Word N-gram
         ngram_max_n=5,
@@ -525,7 +535,7 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "v17.3",
+        "version": "v17.4",
         "architecture": "Multi-Scale Abstract Recall + Evolving Document State",
         "timestamp": timestamp,
         "config": {
@@ -568,7 +578,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v17.3 Multi-Scale Abstract Recall + Document State")
+    print(f"DONE — v17.4 Tokenizer & Vocabulary Fixes + Sentence Boundaries")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

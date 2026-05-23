@@ -128,8 +128,8 @@ class IsingLMModel:
     def __init__(
         self,
         # Vocabulary
-        vocab_min_freq: int = 25,
-        vocab_max_size: int = 4000,
+        vocab_min_freq: int = 15,
+        vocab_max_size: int = 8000,
         # N-gram
         ngram_max_n: int = 5,
         ngram_min_count: int = 2,
@@ -220,9 +220,10 @@ class IsingLMModel:
         three scales + document state + hard constraints.
         """
         print("=" * 70)
-        print("ISING SPIN GLASS LANGUAGE MODEL v17.3 — MULTI-SCALE ABSTRACT RECALL")
+        print("ISING SPIN GLASS LANGUAGE MODEL v17.4 — TOKENIZER + VOCAB FIXES")
         print("=" * 70)
         print(f"\n  Architecture: 3-Scale Recall (word+POS+topic) + Document State")
+        print(f"  v17.4 fixes: tokenizer, multi-type candidates, sentence boundaries")
         print(f"  Word n-gram:  max_n={self.ngram_max_n}, scale={self.recall_scale}")
         print(f"  POS n-gram:   max_n={self.pos_ngram_max_n}, scale={self.pos_recall_scale}")
         print(f"  Topic n-gram: max_n={self.topic_ngram_max_n}, scale={self.topic_recall_scale}")
@@ -593,19 +594,13 @@ class IsingLMModel:
 
     @property
     def _type_words(self) -> Dict[int, List[int]]:
-        """Build type→words mapping (lazy)."""
+        """Build type→words mapping (lazy). v17.4: Multi-type — words in ALL allowed buckets."""
         if not hasattr(self, '_type_words_cache') or self._type_words_cache is None:
             tw: Dict[int, List[int]] = {t: [] for t in range(N_POS)}
             for w, allowed in self.pos_system.allowed_types.items():
                 if allowed:
-                    primary = min(allowed, key=lambda t: {
-                        POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
-                        POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
-                        POS2IDX["PREP"]: 6, POS2IDX["NUM"]: 7, POS2IDX["ADV"]: 8,
-                        POS2IDX["ADJ"]: 9, POS2IDX["NOUN"]: 10, POS2IDX["VERB"]: 11,
-                        POS2IDX["X"]: 12,
-                    }.get(t, 99))
-                    tw[primary].append(w)
+                    for t in allowed:
+                        tw[t].append(w)
             self._type_words_cache = tw
         return self._type_words_cache
 
@@ -678,7 +673,7 @@ class IsingLMModel:
                     n_prep_non_noun += 1
 
         for i in range(len(words) - 1):
-            if words[i] == words[i + 1] and words[i] >= 4:
+            if words[i] == words[i + 1] and words[i] >= 5:
                 n_repeated += 1
 
         return {

@@ -43,6 +43,11 @@ class WordNgramIndex(AbstractRecallIndex):
     Extracted from model.py NGramIndex (v1-v16) for v17 modular architecture.
     """
 
+    # v17.4: Number of special tokens (UNK=0, BOS=1, EOS=2, PAD=3, SENT=4)
+    # Tokens with index < N_SPECIALS are excluded from n-gram contexts and continuations.
+    # SENT acts as a sentence boundary — n-grams cannot span across it.
+    N_SPECIALS = 5
+
     def __init__(self, max_n: int = 5, min_count: int = 1):
         self.max_n = max_n
         self.min_count = min_count
@@ -68,20 +73,32 @@ class WordNgramIndex(AbstractRecallIndex):
 
     def build(self, sequences: List[List[int]], **kwargs) -> None:
         """Build n-gram index from tokenized sequences. Integer counting only."""
+        NS = self.N_SPECIALS  # v17.4: threshold for special tokens
         for seq in sequences:
-            start = 0
+            # v17.4: Track sentence boundaries dynamically.
+            # When we encounter <S> (index 4), it resets the context start,
+            # preventing n-grams from spanning across sentences.
+            eff_start = 0
             for i, w in enumerate(seq):
-                if w >= 4:
-                    start = i
+                if w >= NS:
+                    eff_start = i
                     break
+                elif w == 4:  # <S> token — reset start
+                    eff_start = i + 1
 
-            for t in range(start, len(seq)):
+            for t in range(eff_start, len(seq)):
+                # v17.4: If current token is <S>, reset effective start for next tokens
+                if seq[t] < NS:
+                    if seq[t] == 4:  # <S> — sentence boundary
+                        eff_start = t + 1
+                    continue
+
                 for k in range(1, self.max_n + 1):
-                    if t - k < start:
+                    if t - k < eff_start:
                         break
                     context = tuple(seq[t - k:t])
                     continuation = seq[t]
-                    if any(w < 4 for w in context) or continuation < 4:
+                    if any(w < NS for w in context) or continuation < NS:
                         continue
                     if context not in self.index[k]:
                         self.index[k][context] = Counter()
@@ -149,19 +166,29 @@ class WordNgramIndex(AbstractRecallIndex):
 
             # Count n-grams for this batch
             for seq in batch:
+                # v17.4: Handle <S> sentence boundaries
+                NS = self.N_SPECIALS
                 s_start = 0
                 for i, w in enumerate(seq):
-                    if w >= 4:
+                    if w >= NS:
                         s_start = i
                         break
+                    elif w == 4:  # <S> token
+                        s_start = i + 1
 
+                eff_start = s_start
                 for t in range(s_start, len(seq)):
+                    if seq[t] < NS:
+                        if seq[t] == 4:  # <S> — sentence boundary
+                            eff_start = t + 1
+                        continue
+
                     for k in range(1, self.max_n + 1):
-                        if t - k < s_start:
+                        if t - k < eff_start:
                             break
                         context = tuple(seq[t - k:t])
                         continuation = seq[t]
-                        if any(w < 4 for w in context) or continuation < 4:
+                        if any(w < NS for w in context) or continuation < NS:
                             continue
                         if context not in self.index[k]:
                             self.index[k][context] = Counter()
@@ -278,6 +305,16 @@ class WordNgramIndex(AbstractRecallIndex):
 
     def lookup(self, context_words: List[int]) -> Dict[int, List[Tuple[int, int, int]]]:
         """Look up n-gram continuations. Returns {k: [(word, count, total), ...]}."""
+        # v17.4: Truncate context at the last <S> (sentence boundary).
+        # This prevents cross-sentence n-gram lookups during generation.
+        SENT_IDX = 4  # <S> token index
+        last_sent = -1
+        for i, w in enumerate(context_words):
+            if w == SENT_IDX:
+                last_sent = i
+        if last_sent >= 0:
+            context_words = context_words[last_sent + 1:]
+
         results = {}
         for k in range(min(self.max_n, len(context_words)), 0, -1):
             context = tuple(context_words[-k:])
@@ -374,7 +411,12 @@ class WordNgramIndex(AbstractRecallIndex):
             matches = {best_k: matches[best_k]}
 
         for k, continuations in matches.items():
-            context_weight = context_weight_factor ** (k - 1)
+            # v17.4 FIX: Cap context_weight to prevent exponential energy blowup.
+            # With factor=2, a 10-gram match got 2^9=512× the base scale, completely
+            # dominating all other signals. Cap at 2^4=16 so high-order matches still
+            # get significant weight but don't overwhelm the energy landscape.
+            raw_weight = context_weight_factor ** (k - 1)
+            context_weight = min(raw_weight, 16)
             cont_lookup = {}
             for word, count, total in continuations:
                 if count > 0 and total > 0:
