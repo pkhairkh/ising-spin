@@ -1,10 +1,17 @@
 """
-Sparse Long-Range Word-Word Coupling for Ising Spin Glass LM — v16
-====================================================================
+Sparse Long-Range Word-Word Coupling for Ising Spin Glass LM — v16.1
+=====================================================================
 
-v16 ARCHITECTURE: DIRECT WORD-WORD COUPLING (NO CLUSTERS)
-For each target word, store top-200 context words with their PMI.
-At inference: sum PMI contributions from last 30 tokens → per-word energy.
+v16.1 FIX: Memory-efficient incremental COO construction.
+v16 had OOM on Pi 16GB because it collected ALL (target, context) pairs
+into giant numpy arrays before building the sparse matrix:
+  27M tokens × 30 offsets ≈ 810M pairs × 16 bytes = 13GB intermediates!
+
+v16.1 FIX:
+  - Process each batch, convert to CSR immediately, add to accumulator
+  - Never hold more than one batch of pairs in memory
+  - Peak intermediate memory: ~1 batch × 30 offsets instead of all batches
+  - Also fixed boundary detection bug (boundary_within_d was computed but unused)
 
 KEY DIFFERENCE from v15:
   v15: context → cluster histogram → H2W cluster→word → per-word (DILUTED)
@@ -38,7 +45,7 @@ def build_decay_table(window: int = 30) -> np.ndarray:
 
 class LongRangeCouplingLayer:
     """
-    v16: Sparse Long-Range Word-Word Coupling Layer.
+    v16.1: Sparse Long-Range Word-Word Coupling Layer.
     
     Computes per-word energy from long-range context (30 tokens)
     using direct word→word PMI couplings. No cluster routing.
@@ -89,12 +96,14 @@ class LongRangeCouplingLayer:
         """
         Build the long-range coupling matrix from training sequences.
         
-        Uses scipy.sparse COO construction for fast co-occurrence counting.
+        v16.1: Memory-efficient incremental CSR construction.
+        Each batch is converted to CSR and summed into an accumulator
+        immediately — never holds all pairs in memory at once.
         """
-        print(f"\n  [v16] Building Long-Range Coupling Layer...")
-        print(f"  [v16]   vocab_size={vocab_size}, window={self.window}")
-        print(f"  [v16]   top_k={self.top_k}, longrange_weight={self.longrange_weight}")
-        print(f"  [v16]   pmi_cap={self.pmi_cap}, min_count={self.min_count}")
+        print(f"\n  [v16.1] Building Long-Range Coupling Layer...")
+        print(f"  [v16.1]   vocab_size={vocab_size}, window={self.window}")
+        print(f"  [v16.1]   top_k={self.top_k}, longrange_weight={self.longrange_weight}")
+        print(f"  [v16.1]   pmi_cap={self.pmi_cap}, min_count={self.min_count}")
         
         self.vocab_size = vocab_size
         t0 = time.time()
@@ -106,89 +115,109 @@ class LongRangeCouplingLayer:
         print(f"  [LR16]   Total tokens: {total_tokens:,}")
         print(f"  [LR16]   Non-zero words: {np.count_nonzero(wf):,}")
         
-        # ─── Phase 2: Count co-occurrences using COO sparse ──────
-        # Key insight: build all (target, context) pairs as COO arrays,
-        # then let scipy sum duplicates automatically.
-        print("  [LR16] Phase 2: Counting co-occurrences (COO sparse)...")
+        # ─── Phase 2: Count co-occurrences INCREMENTALLY ─────────
+        # v16.1 FIX: Process each batch, convert to CSR, add to accumulator.
+        # Peak memory: one batch of pairs + CSR accumulator.
+        print("  [LR16] Phase 2: Counting co-occurrences (incremental CSR)...")
         
         import scipy.sparse as sp
         
-        # Collect all (target, context) pairs across all sequences and offsets
-        all_targets = []
-        all_contexts = []
-        
-        # Process sequences in batches to manage memory
+        cooc_accumulator = None  # Will be a CSR matrix
+        total_pairs = 0
         batch_size = 50000
         
         for batch_start in range(0, len(sequences), batch_size):
             batch_end = min(batch_start + batch_size, len(sequences))
-            if batch_start > 0:
-                print(f"  [LR16]     Processing sequence {batch_start}...")
+            t_batch = time.time()
             
             # Concatenate sequences with -1 separators
             parts = []
-            seq_starts = []
-            pos = 0
             for seq in sequences[batch_start:batch_end]:
-                seq_starts.append(pos)
                 parts.append(seq)
-                parts.append([-1])  # Separator
-                pos += len(seq) + 1
+                parts.append([-1])
             
             concat = np.concatenate([np.array(p, dtype=np.int64) for p in parts])
+            n_concat = len(concat)
             
-            # Build boundary mask: True where we should NOT cross
-            is_boundary = np.zeros(len(concat), dtype=bool)
+            # Build boundary positions: True where we should NOT cross
+            is_boundary = np.zeros(n_concat, dtype=bool)
             is_boundary[0] = True
             is_boundary[concat == -1] = True
             
-            # For each offset d=1..window, collect valid (target, context) pairs
-            for d in range(1, min(self.window + 1, len(concat))):
+            # Pre-compute cumulative boundary flag for efficient range checks.
+            # cbf[i] = number of boundaries in [0, i] (inclusive)
+            # Then: boundary between positions i and i+d (exclusive of i)
+            #       iff cbf[i+d] - cbf[i] > 0
+            cbf = np.cumsum(is_boundary.astype(np.int32))
+            
+            # Collect pairs for THIS BATCH ONLY
+            batch_targets = []
+            batch_contexts = []
+            
+            for d in range(1, min(self.window + 1, n_concat)):
                 # target at position i+d, context at position i
-                ctx = concat[:len(concat)-d]
+                ctx = concat[:n_concat - d]
                 tgt = concat[d:]
                 
-                # Valid: both in vocab range, no boundary between them
+                # Valid: both in vocab range
                 valid = (ctx >= 0) & (ctx < vocab_size) & (tgt >= 0) & (tgt < vocab_size)
                 
                 if d > 1:
-                    # Check no boundary between i and i+d
-                    # A boundary at position j means we can't have a pair crossing it
-                    # Use cumulative boundary detection
-                    # For offset d: check that none of positions i+1..i+d have boundary
-                    # Pre-compute: for each position, is there a boundary within d positions before?
-                    boundary_within_d = np.zeros(len(concat), dtype=bool)
-                    for dd in range(1, d + 1):
-                        boundary_within_d[dd:] |= is_boundary[:-dd] if dd < len(is_boundary) else False
-                    # Simpler: check that position i+d doesn't have boundary flag
-                    # (meaning there's a separator right before it)
+                    # Check no boundary between position i and position i+d
+                    # Boundary in (i, i+d] iff cbf[i+d] - cbf[i] > 0
+                    boundary_between = cbf[d:] - cbf[:n_concat - d]
+                    has_boundary = boundary_between > 0
+                    valid = valid & ~has_boundary
+                else:
+                    # d=1: just check that position i+1 is not a boundary start
+                    # (i.e., not a separator position)
                     valid = valid & ~is_boundary[d:]
                 
                 if valid.any():
-                    all_targets.append(tgt[valid])
-                    all_contexts.append(ctx[valid])
+                    batch_targets.append(tgt[valid])
+                    batch_contexts.append(ctx[valid])
+            
+            # Free concat immediately
+            del concat, is_boundary, cbf
+            
+            if batch_targets:
+                bt = np.concatenate(batch_targets)
+                bc = np.concatenate(batch_contexts)
+                del batch_targets, batch_contexts
+                
+                n_pairs = len(bt)
+                total_pairs += n_pairs
+                
+                # Build COO for this batch and convert to CSR immediately
+                batch_coo = sp.coo_matrix(
+                    (np.ones(n_pairs, dtype=np.int64), (bt, bc)),
+                    shape=(vocab_size, vocab_size)
+                )
+                batch_csr = batch_coo.tocsr()
+                del batch_coo, bt, bc
+                
+                # Accumulate into global CSR
+                if cooc_accumulator is None:
+                    cooc_accumulator = batch_csr
+                else:
+                    cooc_accumulator = cooc_accumulator + batch_csr
+                del batch_csr
+            
+            elapsed = time.time() - t_batch
+            if batch_start > 0 or batch_end < len(sequences):
+                print(f"  [LR16]     Batch {batch_start//batch_size + 1}: "
+                      f"seqs {batch_start}-{batch_end}, "
+                      f"pairs={total_pairs:,}, "
+                      f"elapsed={elapsed:.1f}s")
         
-        if not all_targets:
+        if cooc_accumulator is None:
             print("  [LR16]   No co-occurrences found!")
             self._built = True
             return
         
-        # Concatenate all pairs
-        all_targets = np.concatenate(all_targets)
-        all_contexts = np.concatenate(all_contexts)
-        
-        print(f"  [LR16]   Total pairs before dedup: {len(all_targets):,}")
-        
-        # Build sparse COO matrix — scipy automatically sums duplicates!
-        cooc_sparse = sp.coo_matrix(
-            (np.ones(len(all_targets), dtype=np.int64), (all_targets, all_contexts)),
-            shape=(vocab_size, vocab_size)
-        )
-        # Convert to CSR for efficient row access
-        cooc_csr = cooc_sparse.tocsr()
-        
-        n_nz = cooc_csr.nnz
-        print(f"  [LR16]   Non-zero co-occurrence pairs: {n_nz:,}")
+        n_nz = cooc_accumulator.nnz
+        print(f"  [LR16]   Total pairs processed: {total_pairs:,}")
+        print(f"  [LR16]   Non-zero co-occurrence pairs (after dedup): {n_nz:,}")
         
         # ─── Phase 3: Compute PMI and keep top-K per target ──────
         print("  [LR16] Phase 3: Computing PMI and sparsifying...")
@@ -201,14 +230,14 @@ class LongRangeCouplingLayer:
             if wf[target_word] < self.min_count:
                 continue
             
-            row_start = cooc_csr.indptr[target_word]
-            row_end = cooc_csr.indptr[target_word + 1]
+            row_start = cooc_accumulator.indptr[target_word]
+            row_end = cooc_accumulator.indptr[target_word + 1]
             
             if row_start == row_end:
                 continue
             
-            context_words = cooc_csr.indices[row_start:row_end]
-            context_counts = cooc_csr.data[row_start:row_end]
+            context_words = cooc_accumulator.indices[row_start:row_end]
+            context_counts = cooc_accumulator.data[row_start:row_end]
             
             pmi_scores = {}
             for idx in range(len(context_words)):
@@ -238,6 +267,9 @@ class LongRangeCouplingLayer:
             if pmi_scores:
                 top_items = sorted(pmi_scores.items(), key=lambda x: -x[1])[:self.top_k]
                 self.J_lr[target_word] = dict(top_items)
+        
+        # Free the big CSR matrix — we don't need it anymore
+        del cooc_accumulator
         
         # ─── Phase 4: Build reverse index for fast inference ─────
         print("  [LR16] Phase 4: Building reverse index for inference...")
@@ -274,7 +306,7 @@ class LongRangeCouplingLayer:
         
         t_build = time.time() - t0
         print(f"  [LR16]   Build time: {t_build:.1f}s")
-        print(f"  [v16] Long-Range Coupling Layer built successfully.")
+        print(f"  [v16.1] Long-Range Coupling Layer built successfully.")
         
         self._built = True
     
@@ -330,23 +362,26 @@ class LongRangeCouplingLayer:
                             candidate_energy[target_word] = contribution
         
         # Scale: longrange_weight × Q11 / 2048
-        # Simple approach: give a BONUS to words predicted by long-range context.
+        # Give a BONUS to words predicted by long-range context.
         # No penalty for unmatched words (recall already handles that).
         # No centering (that was causing problems).
-        # The key is keeping the weight small enough that LR is a perturbation
-        # that helps select between recall's top candidates, not override recall.
+        # v16.1: Cap at 4× weight so LR can actually compete with recall.
+        # With 5 context words × PMI 5 × decay 0.5 × weight 800:
+        #   raw ≈ 25600, scaled ≈ 10000, cap = 3200 → most signal preserved
+        # Recall swings ±32000, so ±3200 LR = 10% of recall — significant!
         scale_divisor = 2048
         
         lr_hits = 0
         lr_energy_sum = 0
+        
+        max_lr = self.longrange_weight * 4  # 4× cap: allows LR to matter
         
         for i, w in enumerate(candidate_words):
             w_int = int(w)
             if w_int in candidate_energy:
                 raw = candidate_energy[w_int]
                 scaled = (raw * self.longrange_weight) // scale_divisor
-                # Cap to prevent extreme values
-                max_lr = self.longrange_weight
+                # Cap to prevent extreme values (but allow up to 4× weight)
                 scaled = min(max_lr, max(-max_lr, scaled))
                 energies[i] = -scaled  # Negative = more likely
                 lr_hits += 1

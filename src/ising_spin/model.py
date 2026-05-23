@@ -4245,7 +4245,7 @@ class IsingLM:
             if ca_stats.get('spin3_hits', 0) > 0:
                 self._stats['caf_spin3_hits'] = self._stats.get('caf_spin3_hits', 0) + 1
 
-        # === LONG-RANGE COUPLING ENERGY (v16: direct word→word PMI) ===
+        # === LONG-RANGE COUPLING ENERGY (v16.1: direct word→word PMI, incremental build) ===
         # THE KEY DIFFERENCE from v15: NO cluster routing. Direct word→word PMI.
         # With 5 active context words × PMI 5 × decay ~128/256 × weight 800:
         #   E_lr ≈ 5 × 5 × 0.5 × 800 = 10,000 — COMPETES with recall's ±32,000
@@ -5753,7 +5753,7 @@ class IsingLMModel:
             print("\n[11c/13] Skipping Context Accumulator Layer (disabled)")
             self.context_accumulator_layer = None
 
-        # Step 11d: Build Long-Range Coupling Layer (v16: direct word→word PMI)
+        # Step 11d: Build Long-Range Coupling Layer (v16.1: incremental CSR build)
         if self.longrange_enabled:
             print("\n[11d/13] Building Long-Range Coupling Layer (v16)...")
             # Reuse word_freq from context accumulator build, or compute it

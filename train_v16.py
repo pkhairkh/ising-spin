@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-v16.0 Training Script — Sparse Long-Range Word-Word Coupling
+v16.1 Training Script — Sparse Long-Range Word-Word Coupling (Memory-Fixed)
 
 WHY v15 FAILED
 --------------
@@ -8,6 +8,15 @@ Context Accumulator routed through 64 clusters → diluted signal:
   H2W per-word energy: ±63 (0.3% of recall's ±32000)
   3-Spin per-word energy: ±828 (4.3% of recall)
   PPL = 50.35 (no improvement over v12.1's 50.53)
+
+v16.0 OOM BUG (FIXED in v16.1)
+-------------------------------
+Phase 2 collected ALL (target, context) pairs into giant arrays:
+  27M tokens × 30 offsets ≈ 810M pairs × 16 bytes = 13GB intermediates
+  With 6GB already used by n-gram index → OOM even on 16GB Pi!
+v16.1 FIX: Incremental CSR construction — each batch converted to CSR
+  immediately and summed into accumulator. Peak memory: ~1 batch only.
+Also fixed boundary detection bug (boundary_within_d computed but never used).
 
 v16 ARCHITECTURE: DIRECT WORD-WORD COUPLING (NO CLUSTERS)
 ----------------------------------------------------------
@@ -263,7 +272,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v16.0 LONG-RANGE COUPLING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v16.1 LONG-RANGE COUPLING (MEMORY-FIXED)", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Workers: {os.cpu_count()}", flush=True)
