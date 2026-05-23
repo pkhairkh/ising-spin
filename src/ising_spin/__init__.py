@@ -1,58 +1,38 @@
 """
-Ising Spin Glass Language Model — v12.0
+Ising Spin Glass Language Model — v17.0
 
-Integer-only Boltzmann sampling with recall-primary energy model.
+Multi-Scale Abstract Recall + Evolving Document State.
 
 Architecture:
-    - Recall-primary: E = log2(1/P) * recall_scale
-    - Kneser-Ney backoff for unseen n-grams
-    - Interpolated smoothing (product of experts across n-gram levels)
-    - Potts topic spin coherence engine
+    - Word-level n-gram recall (5-gram) — exact word context
+    - POS-level n-gram recall (15-gram) — abstract syntactic generalization
+    - Topic-level n-gram recall (10-gram) — discourse coherence
+    - Document state (7 evolving integer variables) — full-document context
+    - Product of Experts fusion — each scale vetoes the others' mistakes
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
-    - FineWeb-Edu training corpus
 
-PPL progression:
-    v8.1 (50K, 5K vocab, recall-only):  PPL = 124
-    v9.0 (50K, fine-grained log2):      PPL = 98
-    v10.0 (KN backoff experiments):      PPL = 79
-    v11.0 (PMI backoff, 2K vocab):      PPL = 52
-    v11.7 (200K, 2K vocab, PMI=5):      PPL = 51.54
-    v12.0 (1M, 4K vocab, KN+interp):    PPL = TBD
-
-Entry points:
-    run.py        — Full train + eval + generate (best config)
-    eval.py       — Standalone PPL evaluation with β sweep
-    generate.py   — Text generation
-    train_v12.py  — v12 training with KN + interpolated + topic spin
-    cache_200k.py — Download and cache FineWeb-Edu data
+v17 Key Insight:
+    v1-v16 had recall + weak perturbation layers → recall dominated everything.
+    v17 has recall at MULTIPLE SCALES → each scale independently constrains
+    predictions. No single scale dominates. They VETO each other's mistakes.
+    
+    When the 5-word n-gram is unseen, the POS 10-gram IS seen (thousands of
+    times). When the POS n-gram is ambiguous, the topic n-gram disambiguates.
+    When all n-grams miss, the document state carries discourse coherence
+    across the entire document.
 """
 
-from .model import (
-    Vocabulary,
-    POSTypeSystem,
-    IntegerBoltzmannSampler,
-    NGramIndex,
-    IsingLM,
-    IsingLMModel,
-    KnowledgeLayer,
-    CategoryLayer,
-    MarkovLogicLayer,
-    WalshSpectralLayer,
-    GradedCouplings,
-    compute_log_floor_pmi,
-    compute_pmi_couplings,
-    compute_skip_pmi_couplings,
-    fetch_conceptnet_triples,
-    COARSE_POS_TAGS,
-    POS2IDX,
-    IDX2POS,
-    N_POS,
-    load_fineweb_edu,
-    tokenize_texts,
-    truncate_sequences,
-    LN2_NUM,
-    LN2_DEN,
-    LOG2_SCALE,
+from .vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
+from .vocabulary.pos import (
+    COARSE_POS_TAGS, POS2IDX, IDX2POS, N_POS,
+    NOUN_LIKE, VERB_LIKE, OPEN_CLASS, CLOSED_CLASS,
 )
+from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
+from .recall import (
+    WordNgramIndex, PosNgramIndex, TopicNgramIndex, MultiScaleRecall,
+)
+from .state import DocumentState
+from .energy import EnergyComputer
+from .model_v17 import IsingLMModel
 
-__version__ = "12.0.0"
+__version__ = "17.0.0"
