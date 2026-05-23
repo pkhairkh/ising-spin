@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-v18.0 Training Script — VSA Binding + State Scale Rebalance
+v18.1 Training Script — Dense AM + VSA Binding + State Scale Rebalance
+
+v18.1 CHANGES (from v18.0):
+  - NEW: Dense Associative Memory module (E_dense_am energy term)
+    Nonlinear F(x)=x^2 energy creates sharper basins, capacity ~N instead of ~0.14N
+    Random feature pre-aggregation: O(D) per candidate instead of O(N*D)
+  - NEW: --dense-am-dim (default 256), --dense-am-degree (default 2), --no-dense-am
+  - CHANGED: Dense AM replaces linear n-gram for word-level matching
 
 v18.0 CHANGES (from v17.4 — PPL=19.19 best but incoherent generation):
   - NEW: VSA qFHRR binding module (E_vsa_bind energy term)
@@ -12,13 +19,17 @@ v18.0 CHANGES (from v17.4 — PPL=19.19 best but incoherent generation):
 
 ARCHITECTURE:
   Word n-gram (5) + POS n-gram (10) + Topic n-gram (10)
-  + VSA Binding (512-dim qFHRR) + Document State (7 vars, scale=400)
+  + Dense AM (256-dim random features, degree=2) + VSA Binding (512-dim qFHRR)
+  + Document State (7 vars, scale=400)
 
 Usage:
   python -u train_v18.py                          # Default: 500K samples
   python -u train_v18.py --samples 1000000         # 1M samples
   python -u train_v18.py --vocab 49000              # Custom vocab size
   python -u train_v18.py --no-vsa                   # Ablation: without VSA binding
+  python -u train_v18.py --no-dense-am              # Ablation: without Dense AM
+  python -u train_v18.py --dense-am-degree 1        # Linear Dense AM (recalls standard)
+  python -u train_v18.py --dense-am-dim 512         # Larger feature dimension
   python -u train_v18.py --vsa-scale 400            # Custom VSA energy scale
   python -u train_v18.py --state-scale 400          # Custom state scale
 """
@@ -48,9 +59,13 @@ DEFAULT_MIN_FREQ = 15
 DEFAULT_RECALL_SCALE = 1600
 DEFAULT_POS_RECALL_SCALE = 800
 DEFAULT_TOPIC_RECALL_SCALE = 400
-DEFAULT_STATE_SCALE = 400   # v18: increased from 50
-DEFAULT_VSA_SCALE = 800     # v18 NEW
-DEFAULT_VSA_DIMENSION = 512 # v18 NEW
+DEFAULT_STATE_SCALE = 400   # v18.0: increased from 50
+DEFAULT_VSA_SCALE = 800     # v18.0 NEW
+DEFAULT_VSA_DIMENSION = 512 # v18.0 NEW
+DEFAULT_DENSE_AM_SCALE = 1200  # v18.1 NEW
+DEFAULT_DENSE_AM_DIM = 256     # v18.1 NEW
+DEFAULT_DENSE_AM_DEGREE = 2    # v18.1 NEW
+DEFAULT_DENSE_AM_HASH_DIM = 32 # v18.1 NEW
 DEFAULT_POS_NGRAM_MAX_N = 10
 DEFAULT_TOPIC_NGRAM_MAX_N = 10
 
@@ -204,7 +219,7 @@ def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="v18.0 Training — VSA Binding + State Scale Rebalance"
+        description="v18.1 Training — Dense AM + VSA Binding + State Scale Rebalance"
     )
 
     # Core parameters
@@ -223,6 +238,16 @@ def main():
     parser.add_argument("--vsa-dimension", type=int, default=DEFAULT_VSA_DIMENSION,
                         help="VSA vector dimension (default: 512)")
 
+    # Dense AM parameters (v18.1 NEW)
+    parser.add_argument("--dense-am-scale", type=int, default=DEFAULT_DENSE_AM_SCALE,
+                        help="Dense AM energy scale (default: 1200)")
+    parser.add_argument("--dense-am-dim", type=int, default=DEFAULT_DENSE_AM_DIM,
+                        help="Dense AM random feature dimension (default: 256)")
+    parser.add_argument("--dense-am-degree", type=int, default=DEFAULT_DENSE_AM_DEGREE,
+                        help="Dense AM polynomial degree: 1=linear, 2=Dense AM (default: 2)")
+    parser.add_argument("--dense-am-hash-dim", type=int, default=DEFAULT_DENSE_AM_HASH_DIM,
+                        help="Dense AM context hash dimension (default: 32)")
+
     # POS and Topic n-gram sizes
     parser.add_argument("--pos-ngram-max-n", type=int, default=DEFAULT_POS_NGRAM_MAX_N)
     parser.add_argument("--topic-ngram-max-n", type=int, default=DEFAULT_TOPIC_NGRAM_MAX_N)
@@ -236,6 +261,8 @@ def main():
                         help="Ablation: disable document state")
     parser.add_argument("--no-vsa", action="store_true",
                         help="Ablation: disable VSA binding module")
+    parser.add_argument("--no-dense-am", action="store_true",
+                        help="Ablation: disable Dense AM module (v18.1)")
 
     # Standard n-gram parameters
     parser.add_argument("--no-kn-backoff", action="store_true")
@@ -253,6 +280,7 @@ def main():
     topic_recall_scale = 0 if args.no_topic_recall else args.topic_recall_scale
     state_scale = 0 if args.no_state else args.state_scale
     vsa_enabled = not args.no_vsa
+    dense_am_enabled = not args.no_dense_am
 
     kn_backoff = not args.no_kn_backoff
     interpolated = not args.no_interpolated
@@ -263,7 +291,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — v18.0 VSA BINDING", flush=True)
+    print("ISING SPIN GLASS LANGUAGE MODEL — v18.1 DENSE AM + VSA BINDING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -278,7 +306,7 @@ def main():
 
     # --- Config ---
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: v18.0 — VSA Binding + State Scale Rebalance")
+    print(f"CONFIG: v18.1 — Dense AM + VSA Binding + State Scale Rebalance")
     print(f"  WORD RECALL:")
     print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
@@ -287,7 +315,11 @@ def main():
     print(f"  TOPIC RECALL:")
     print(f"    topic_ngram_max_n={args.topic_ngram_max_n}, topic_recall_scale={topic_recall_scale}"
           f"{' [DISABLED]' if args.no_topic_recall else ''}")
-    print(f"  VSA BINDING (v18 NEW):")
+    print(f"  DENSE AM (v18.1 NEW):")
+    print(f"    enabled={dense_am_enabled}, D={args.dense_am_dim}, degree={args.dense_am_degree}, "
+          f"scale={args.dense_am_scale}, hash_dim={args.dense_am_hash_dim}"
+          f"{' [DISABLED --no-dense-am]' if args.no_dense_am else ''}")
+    print(f"  VSA BINDING (v18.0):")
     print(f"    enabled={vsa_enabled}, dimension={args.vsa_dimension}, vsa_scale={args.vsa_scale}"
           f"{' [DISABLED --no-vsa]' if args.no_vsa else ''}")
     print(f"  DOCUMENT STATE:")
@@ -325,10 +357,17 @@ def main():
         topic_recall_scale=topic_recall_scale,
         state_scale=state_scale,
         vsa_scale=args.vsa_scale,
+        dense_am_scale=args.dense_am_scale,
         # VSA
         vsa_enabled=vsa_enabled,
         vsa_dimension=args.vsa_dimension,
         vsa_seed=42,
+        # Dense AM
+        dense_am_enabled=dense_am_enabled,
+        dense_am_dim=args.dense_am_dim,
+        dense_am_degree=args.dense_am_degree,
+        dense_am_seed=42,
+        dense_am_hash_dim=args.dense_am_hash_dim,
         # Hard constraints
         same_word_penalty=args.same_word_penalty,
         max_closed_class_run=2,
@@ -415,8 +454,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "v18.0",
-        "architecture": "Multi-Scale Recall + VSA Binding + Document State",
+        "version": "v18.1",
+        "architecture": "Multi-Scale Recall + Dense AM + VSA Binding + Document State",
         "timestamp": timestamp,
         "config": {
             "recall_scale": args.recall_scale,
@@ -426,6 +465,11 @@ def main():
             "vsa_scale": args.vsa_scale,
             "vsa_dimension": args.vsa_dimension,
             "vsa_enabled": vsa_enabled,
+            "dense_am_scale": args.dense_am_scale,
+            "dense_am_dim": args.dense_am_dim,
+            "dense_am_degree": args.dense_am_degree,
+            "dense_am_hash_dim": args.dense_am_hash_dim,
+            "dense_am_enabled": dense_am_enabled,
             "vocab_max_size": args.vocab,
             "kn_backoff": kn_backoff,
             "interpolated": interpolated,
@@ -450,7 +494,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — v18.0 VSA Binding + State Scale Rebalance")
+    print(f"DONE — v18.1 Dense AM + VSA Binding + State Scale Rebalance")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

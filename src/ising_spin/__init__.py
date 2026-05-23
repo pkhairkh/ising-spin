@@ -1,16 +1,24 @@
 """
-Ising Spin Glass Language Model — v18.0
+Ising Spin Glass Language Model — v18.1
 
-Multi-Scale Abstract Recall + VSA Binding + Evolving Document State.
+Multi-Scale Abstract Recall + Dense AM + VSA Binding + Evolving Document State.
 
 Architecture:
     - Word-level n-gram recall (5-gram) — exact word context
     - POS-level n-gram recall (10-gram) — abstract syntactic generalization
     - Topic-level n-gram recall (10-gram) — discourse coherence
-    - VSA qFHRR binding (v18 NEW) — compositional word+POS+topic encoding
+    - Dense AM (v18.1 NEW) — nonlinear pattern matching with random features
+    - VSA qFHRR binding (v18.0) — compositional word+POS+topic encoding
     - Document state (7 evolving integer variables) — full-document context
     - ADDITIVE energy fusion — all scales reinforce each other
     - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
+
+v18.1 Changes:
+    - Added Dense Associative Memory module with polynomial nonlinearity
+    - E_dense_am energy term creates sharper energy basins (capacity ~N)
+    - Random feature pre-aggregation: O(D) per candidate instead of O(N*D)
+    - Degree parameter: degree=1 (linear) or degree=2 (Dense AM, sharper)
+    - Pre-aggregated Phi matrix: (V, 256) int16, ~25 MB for V=49K
 
 v18.0 Changes:
     - Added VSA qFHRR binding module for compositional token encoding
@@ -42,6 +50,7 @@ from .recall import (
 from .state import DocumentState
 from .energy import EnergyComputer
 from .vsa import QFHRRVectors, VSAEncoder
+from .dense_am import RandomFeatureProjector, DenseAMEnergy
 from .model_v17 import IsingLMModel
 
-__version__ = "18.0.0"
+__version__ = "18.1.0"
