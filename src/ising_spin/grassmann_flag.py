@@ -638,8 +638,10 @@ class WedgeCoupling:
         C = self.n_clusters
         
         for d in range(1, self.max_distance + 1):
-            fwd_counts = np.zeros((C, C), dtype=np.int64)
-            bwd_counts = np.zeros((C, C), dtype=np.int64)
+            # Count cluster pairs at distance d
+            # counts[c1, c2] = number of times cluster c1 at position i
+            #                  is followed by cluster c2 at position i+d
+            pair_counts = np.zeros((C, C), dtype=np.int64)
             
             for seq in sequences:
                 for i in range(len(seq) - d):
@@ -649,57 +651,70 @@ class WedgeCoupling:
                         continue
                     c1 = int(flag_state.word_to_cluster[w1])
                     c2 = int(flag_state.word_to_cluster[w2])
-                    fwd_counts[c1, c2] += 1
-                    bwd_counts[c2, c1] += 1
+                    pair_counts[c1, c2] += 1
             
-            # Convert to PMI-like integer coupling
-            total = max(1, int(fwd_counts.sum()))
-            fwd_c1_marginal = fwd_counts.sum(axis=1)
-            fwd_c2_marginal = fwd_counts.sum(axis=0)
-            bwd_c1_marginal = bwd_counts.sum(axis=1)  # Compute ONCE outside inner loop
-            bwd_c2_marginal = bwd_counts.sum(axis=0)
+            # Compute DIRECTIONAL PMI
+            # PMI(c1→c2) = log2(count(c1,c2) / expected(c1,c2))
+            #   where expected = left_marginal(c1) * right_marginal(c2) / total
+            # PMI(c2→c1) = log2(count(c2,c1) / expected(c2,c1))
+            #   where count(c2,c1) = how often c2 is LEFT context and c1 is RIGHT context
+            #   i.e., c2 appears d positions BEFORE c1
+            #   expected = left_marginal(c2) * right_marginal(c1) / total
+            #
+            # KEY: count(c1,c2) ≠ count(c2,c1) because language is ORDERED
+            # e.g., count(DET,NOUN) >> count(NOUN,DET)
+            # The WEDGE coupling is: PMI(c1→c2) - PMI(c2→c1)
+            # This is ANTISYMMETRIC: wedge[c1,c2] = -wedge[c2,c1]
             
-            fwd_pmi = np.zeros((C, C), dtype=np.int16)
-            bwd_pmi = np.zeros((C, C), dtype=np.int16)
+            total = max(1, int(pair_counts.sum()))
+            left_marginal = pair_counts.sum(axis=1)   # Row sums: c1 as left context
+            right_marginal = pair_counts.sum(axis=0)   # Col sums: c2 as right context
+            
+            fwd_pmi = np.zeros((C, C), dtype=np.int16)  # PMI(c1→c2)
+            rev_pmi = np.zeros((C, C), dtype=np.int16)  # PMI(c2→c1) stored at [c1,c2]
             
             for c1 in range(C):
-                if fwd_c1_marginal[c1] == 0:
+                if left_marginal[c1] == 0:
                     continue
                 for c2 in range(C):
-                    if fwd_c2_marginal[c2] == 0:
+                    if right_marginal[c2] == 0:
                         continue
                     
-                    # Forward PMI — fine-grained quantization
-                    if fwd_counts[c1, c2] > 0:
-                        expected = int(fwd_c1_marginal[c1] * fwd_c2_marginal[c2]) // int(total)
+                    # Forward PMI: P(c2|c1) vs P(c2)
+                    if pair_counts[c1, c2] > 0:
+                        expected = int(left_marginal[c1]) * int(right_marginal[c2]) // total
                         if expected > 0:
-                            ratio = int(fwd_counts[c1, c2]) * 256 // expected
+                            ratio = int(pair_counts[c1, c2]) * 256 // expected
                             if ratio > 1:
                                 log_val = (int(ratio).bit_length() - 1 - 8) * 4
                                 fwd_pmi[c1, c2] = max(0, min(63, log_val))
                     
-                    # Backward PMI — fine-grained quantization
-                    if bwd_counts[c1, c2] > 0 and bwd_c1_marginal[c1] > 0 and bwd_c2_marginal[c2] > 0:
-                        expected = int(bwd_c1_marginal[c1] * bwd_c2_marginal[c2]) // int(total)
+                    # Reverse PMI: P(c1|c2) vs P(c1) — stored at [c2,c1]
+                    # This is: how often is c2 LEFT context followed by c1?
+                    if pair_counts[c2, c1] > 0 and left_marginal[c2] > 0 and right_marginal[c1] > 0:
+                        expected = int(left_marginal[c2]) * int(right_marginal[c1]) // total
                         if expected > 0:
-                            ratio = int(bwd_counts[c1, c2]) * 256 // expected
+                            ratio = int(pair_counts[c2, c1]) * 256 // expected
                             if ratio > 1:
                                 log_val = (int(ratio).bit_length() - 1 - 8) * 4
-                                bwd_pmi[c1, c2] = max(0, min(63, log_val))
+                                rev_pmi[c1, c2] = max(0, min(63, log_val))
             
             self.J_fwd_dist[d] = fwd_pmi
-            self.J_bwd_dist[d] = bwd_pmi
+            self.J_bwd_dist[d] = rev_pmi  # Now stores PMI(c2→c1) at [c1,c2]
             
-            # Net wedge coupling: J_wedge = fwd - bwd^T
-            # This is ANTISYMMETRIC: J_wedge[i,j] = -J_wedge[j,i]
-            wedge = fwd_pmi.astype(np.int16) - bwd_pmi.T.astype(np.int16)
+            # Net wedge coupling: PMI(c1→c2) - PMI(c2→c1)
+            # ANTISYMMETRIC by construction:
+            #   wedge[c1,c2] = PMI(c1→c2) - PMI(c2→c1)
+            #   wedge[c2,c1] = PMI(c2→c1) - PMI(c1→c2) = -wedge[c1,c2]
+            wedge = fwd_pmi.astype(np.int16) - rev_pmi.astype(np.int16)
             self.J_wedge[d] = wedge
             
             n_pos = int(np.sum(wedge > 0))
             n_neg = int(np.sum(wedge < 0))
             n_zero = int(np.sum(wedge == 0))
-            print(f"  [WEDGE]   distance={d}: fwd_max={fwd_pmi.max()}, bwd_max={bwd_pmi.max()}, "
-                  f"wedge: +{n_pos}/-{n_neg}/0={n_zero}")
+            max_abs = int(np.max(np.abs(wedge))) if n_pos + n_neg > 0 else 0
+            print(f"  [WEDGE]   distance={d}: fwd_max={fwd_pmi.max()}, rev_max={rev_pmi.max()}, "
+                  f"wedge: +{n_pos}/-{n_neg}/0={n_zero}, max_abs={max_abs}")
         
         self._built = True
         print(f"  [WEDGE] Wedge couplings built successfully.")
