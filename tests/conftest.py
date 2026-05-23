@@ -13,7 +13,7 @@ import pytest
 from ising_spin.vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
 from ising_spin.vocabulary.pos import POS2IDX, N_POS
 from ising_spin.vsa import VSAEncoder
-from ising_spin.model_v18 import IsingLMModelV18
+from ising_spin.model import IsingLMModel, ModelConfig
 
 
 # ===================================================================
@@ -137,8 +137,8 @@ def small_vocab():
 
 @pytest.fixture(scope="session")
 def small_model(small_vocab):
-    """Fully trained v18 model with 200-word vocab on 100 texts."""
-    model = IsingLMModelV18(
+    """Fully trained model with 200-word vocab on 100 texts."""
+    config = ModelConfig(
         vocab_min_freq=1,
         vocab_max_size=200,
         ngram_max_n=3,
@@ -174,6 +174,7 @@ def small_model(small_vocab):
         kn_backoff=True,
         max_seq_len=30,
     )
+    model = IsingLMModel(config=config)
     # Train with the synthetic texts
     model.train(texts=_SYNTHETIC_TEXTS)
     return model

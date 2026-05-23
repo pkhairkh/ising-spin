@@ -331,12 +331,13 @@ class DenseAMEnergy:
 
         # Count-normalize: Phi_norm = Phi_sum * Q / max(1, count)
         # This gives Q8 * mean(phi) per word
-        Phi_norm = np.zeros((V, D), dtype=np.int16)
-        for w in range(V):
-            if word_counts[w] > 0:
-                # Q8 normalization: multiply by 256, then divide by count
-                normalized = Phi_sum[w] * self.COUNT_NORM_Q // word_counts[w]
-                Phi_norm[w] = np.clip(normalized, -32768, 32767).astype(np.int16)
+        # Vectorized: avoid Python for-loop over V words
+        counts_safe = np.maximum(word_counts, 1)[:, np.newaxis]  # (V, 1) — avoid div-by-zero
+        normalized = (Phi_sum * self.COUNT_NORM_Q) // counts_safe  # (V, D) int32
+        Phi_norm = np.clip(normalized, -32768, 32767).astype(np.int16)
+        # Zero out rows with no counts
+        zero_mask = word_counts == 0
+        Phi_norm[zero_mask] = 0
 
         self.Phi = Phi_norm
         self._word_counts = word_counts

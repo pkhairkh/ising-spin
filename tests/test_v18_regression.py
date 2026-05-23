@@ -22,7 +22,7 @@ from ising_spin.recall import WordNgramIndex, MultiScaleRecall
 from ising_spin.state import DocumentState
 from ising_spin.energy import EnergyComputer
 from ising_spin.sampling import IntegerBoltzmannSampler
-from ising_spin.model_v18 import IsingLMModelV18
+from ising_spin.model import IsingLMModel, ModelConfig
 
 
 # ===================================================================
@@ -95,7 +95,7 @@ class TestInterpolatedSmoothing:
 
     def test_interpolated_enabled_by_default(self, small_model):
         """Model has interpolated=True by default."""
-        assert small_model.interpolated is True
+        assert small_model.config.interpolated is True
 
 
 # ===================================================================
@@ -260,7 +260,7 @@ class TestClosedClassRunLimit:
     def test_closed_class_run_limit(self, small_model):
         """Generator has max_closed_class_run configured."""
         gen = small_model.generator
-        assert gen.max_closed_class_run == small_model.max_closed_class_run
+        assert gen.max_closed_class_run == small_model.config.max_closed_class_run
         assert gen.max_closed_class_run >= 1
 
     def test_closed_class_penalty_in_energy(self, small_model):

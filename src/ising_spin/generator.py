@@ -24,6 +24,7 @@ from .state import DocumentState
 from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 from .reservoir import IntegerESN  # v18.2
+from .errors import InferenceError, ValidationError
 
 
 class IsingLMGenerator:
@@ -272,6 +273,9 @@ class IsingLMGenerator:
 
         All energy computation and sampling is integer-only.
         """
+        if length <= 0:
+            raise ValidationError(f"length must be > 0, got {length}")
+
         # Resolve prompt — v17.4 FIX: Use vocab.encode() instead of text.split()
         # The old code did prompt.split() + manual .lower() fallback, which missed:
         # - Contraction splitting ("don't" → "do" + "n't")

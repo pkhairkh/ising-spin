@@ -39,6 +39,8 @@ Computation per token:
 import numpy as np
 from typing import Optional, List
 
+from ising_spin.errors import ValidationError
+
 
 class IntegerESN:
     """
@@ -160,6 +162,8 @@ class IntegerESN:
         Returns:
             Updated reservoir state, int16, shape (D,).
         """
+        if word_id < 0:
+            return self.h.copy()  # Ignore invalid word IDs
         # Decay: alpha_q15 * h(t-1) >> 15
         # h is int16, alpha is int, product fits in int32
         # Shift right by 15 brings it back to int16 scale
@@ -246,11 +250,12 @@ class IntegerESN:
                 self.step(word_id)
 
         # Count-normalize: R[w] = R_sum[w] * Q8 / max(1, count[w])
-        R_norm = np.zeros((V, D), dtype=np.int16)
-        for w in range(V):
-            if word_counts[w] > 0:
-                normalized = (R_sum[w] * self.COUNT_NORM_Q) // word_counts[w]
-                R_norm[w] = np.clip(normalized, -32768, 32767).astype(np.int16)
+        # Vectorized: avoid Python for-loop over V words
+        counts_safe = np.maximum(word_counts, 1)[:, np.newaxis]  # (V, 1)
+        normalized = (R_sum * self.COUNT_NORM_Q) // counts_safe   # (V, D) int32
+        R_norm = np.clip(normalized, -32768, 32767).astype(np.int16)
+        zero_mask = word_counts == 0
+        R_norm[zero_mask] = 0
 
         self.R = R_norm
         self._word_counts = word_counts

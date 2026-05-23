@@ -21,7 +21,7 @@ Test categories:
 
 import numpy as np
 import pytest
-from ising_spin.model_v18 import IsingLMModelV18
+from ising_spin.model import IsingLMModel, ModelConfig
 from ising_spin.vocabulary.pos import POS2IDX, N_POS
 
 
@@ -70,7 +70,8 @@ def _make_model(**overrides):
     defaults.update(overrides)
 
     from tests.conftest import _SYNTHETIC_TEXTS
-    model = IsingLMModelV18(**defaults)
+    config = ModelConfig(**defaults)
+    model = IsingLMModel(config=config)
     model.train(texts=_SYNTHETIC_TEXTS)
     return model
 
@@ -274,7 +275,7 @@ class TestKNBackoff:
 
     def test_kn_backoff_enabled(self, small_model):
         """KN backoff is enabled in the small model."""
-        assert small_model.kn_backoff is True
+        assert small_model.config.kn_backoff is True
 
     def test_kn_backoff_produces_energy(self, small_model):
         """KN backoff produces energy for unseen n-grams."""

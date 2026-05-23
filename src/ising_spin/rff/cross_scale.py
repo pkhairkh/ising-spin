@@ -369,12 +369,12 @@ class CrossScaleRFF:
 
         # Count-normalize: Theta_norm = Theta_sum * Q7 / max(1, count)
         # This gives Q7 * mean(phi) per word
-        Theta_norm = np.zeros((V, D), dtype=np.int8)
-        for w in range(V):
-            if word_counts[w] > 0:
-                # Q7 normalization: multiply by 128, then divide by count
-                normalized = Theta_sum[w] * self.COUNT_NORM_Q // word_counts[w]
-                Theta_norm[w] = np.clip(normalized, -127, 127).astype(np.int8)
+        # Vectorized: avoid Python for-loop over V words
+        counts_safe = np.maximum(word_counts, 1)[:, np.newaxis]  # (V, 1)
+        normalized = (Theta_sum * self.COUNT_NORM_Q) // counts_safe  # (V, D) int32
+        Theta_norm = np.clip(normalized, -127, 127).astype(np.int8)
+        zero_mask = word_counts == 0
+        Theta_norm[zero_mask] = 0
 
         self.Theta = Theta_norm
         self._word_counts = word_counts

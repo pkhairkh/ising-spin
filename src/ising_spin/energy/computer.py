@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Dict, List, Optional
+from ising_spin.errors import EnergyError, ValidationError
 from ising_spin.recall import MultiScaleRecall
 from ising_spin.state import DocumentState
 from ising_spin.vocabulary.pos import POSTypeSystem, CLOSED_CLASS, POS2IDX
@@ -118,6 +119,13 @@ class EnergyComputer:
 
         Returns energies array (int64), LOWER = more likely.
         """
+        # --- Input validation ---
+        if len(candidate_words) == 0:
+            raise ValidationError("candidate_words must not be empty")
+        if not context_words:
+            # No context — return zeros (all candidates equally likely)
+            return np.zeros(len(candidate_words), dtype=np.int64)
+
         n_candidates = len(candidate_words)
         energies = np.zeros(n_candidates, dtype=np.int64)
 
