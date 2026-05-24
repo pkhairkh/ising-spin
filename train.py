@@ -410,6 +410,8 @@ def main():
     parser.add_argument("--no-kn-backoff", action="store_true")
     parser.add_argument("--no-interpolated", action="store_true")
     parser.add_argument("--ngram-min-count", type=int, default=2)
+    parser.add_argument("--ngram-max-n", type=int, default=5,
+                        help="Maximum word n-gram order (default: 5, try 8 for more context)")
     parser.add_argument("--ngram-max-seqs", type=int, default=1000000)
     parser.add_argument("--max-seq-len", type=int, default=30)
     parser.add_argument("--same-word-penalty", type=int, default=200)
@@ -526,7 +528,7 @@ def main():
         mem_adjustments = auto_tune_for_memory(
             budget_mb=args.memory_budget,
             n_samples=args.samples,
-            word_ngram_max_n=5,
+            word_ngram_max_n=args.ngram_max_n,
             pos_ngram_max_n=args.pos_ngram_max_n,
             topic_ngram_max_n=args.topic_ngram_max_n,
             ngram_max_seqs=args.ngram_max_seqs,
@@ -538,7 +540,7 @@ def main():
         print(f"{'=' * 70}")
         for key, val in mem_adjustments.items():
             orig = {
-                'ngram_max_n': 5, 'pos_ngram_max_n': args.pos_ngram_max_n,
+                'ngram_max_n': args.ngram_max_n, 'pos_ngram_max_n': args.pos_ngram_max_n,
                 'topic_ngram_max_n': args.topic_ngram_max_n,
                 'ngram_max_seqs': args.ngram_max_seqs,
                 'reservoir_dim': args.reservoir_dim, 'vsa_dim': args.vsa_dim,
@@ -547,7 +549,7 @@ def main():
         print(f"{'=' * 70}")
 
     # Apply memory adjustments
-    effective_ngram_max_n = mem_adjustments.get('ngram_max_n', 5)
+    effective_ngram_max_n = mem_adjustments.get('ngram_max_n', args.ngram_max_n)
     effective_pos_ngram_max_n = mem_adjustments.get('pos_ngram_max_n', args.pos_ngram_max_n)
     effective_topic_ngram_max_n = mem_adjustments.get('topic_ngram_max_n', args.topic_ngram_max_n)
     effective_ngram_max_seqs = mem_adjustments.get('ngram_max_seqs', args.ngram_max_seqs)
@@ -670,7 +672,7 @@ def main():
         # Copy mechanism
         copy_enabled=True,
         copy_min_context=3,
-        copy_min_confidence=0.65,  # Raised from 0.4 — high copy rate caused repetition loops
+        copy_min_confidence=0.90,  # Raised from 0.65 — copy bypasses spin dynamics, must be very confident
         # Misc
         max_seq_len=args.max_seq_len,
         # v18 modules

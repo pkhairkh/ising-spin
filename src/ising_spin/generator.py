@@ -109,7 +109,7 @@ class IsingLMGenerator:
 
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
-        self.copy_min_confidence = copy_min_confidence  # Raised from 0.4 → 0.65 to reduce forced-copy streaks
+        self.copy_min_confidence = copy_min_confidence  # Raised from 0.65 → 0.90 to force spin-mediated selection
         self.same_word_penalty = same_word_penalty
         self.max_closed_class_run = max_closed_class_run
         self.interpolated = interpolated
@@ -407,7 +407,7 @@ class IsingLMGenerator:
                             # Don't copy same word twice
                             if len(words) >= 1 and copy_word_idx == words[-1]:
                                 copy_word_idx = None
-                            elif consecutive_copies >= 3:  # Was 6, reduced to prevent repetition loops
+                            elif consecutive_copies >= 2:  # Was 3, reduced to prevent bypassing spin dynamics
                                 copy_word_idx = None
                             else:
                                 copy_word = copy_word_idx

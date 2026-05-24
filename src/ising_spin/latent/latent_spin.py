@@ -129,7 +129,9 @@ class LatentSpinGlass:
     DEFAULT_ETA_EPISODIC = 2
 
     # Number of mean-field sweeps per step
-    DEFAULT_N_MF_SWEEPS = 2
+    # More sweeps = more relaxation toward energy minimum = more coherent
+    # spin state. 4 sweeps gives better attractor formation than 2.
+    DEFAULT_N_MF_SWEEPS = 4
 
     # Maximum absolute value for J_episodic (prevents unbounded growth)
     J_EPISODIC_CLIP = 200
@@ -170,7 +172,7 @@ class LatentSpinGlass:
         D: int = 256,
         alpha_q8: int = 128,
         eta_episodic: int = 2,
-        n_mf_sweeps: int = 2,
+        n_mf_sweeps: int = 4,
         latent_scale: int = 1200,
         coupling_scale: int = 800,
         temperature: int = 0,
@@ -189,7 +191,7 @@ class LatentSpinGlass:
             D: Spin dimension (default 256).
             alpha_q8: External field strength in Q8 (default 128 ≈ 0.5).
             eta_episodic: Hebbian learning rate for J_episodic (default 2).
-            n_mf_sweeps: Mean-field sweeps per step (default 2).
+            n_mf_sweeps: Mean-field sweeps per step (default 4).
             latent_scale: Energy scale for direct alignment (default 1200).
             coupling_scale: Energy scale for coupling-mediated alignment (default 800).
             temperature: Metropolis temperature for spin flips (default 0).
@@ -412,12 +414,30 @@ class LatentSpinGlass:
               f"({total_positions} positions)")
 
         # ---------------------------------------------------------------
-        # PHASE 2: Learn coupling matrix via Hopfield storage
+        # PHASE 2: Learn coupling matrix via CONDITION-RESPONSE
         # ---------------------------------------------------------------
-        print(f"    Phase 2: Learning coupling matrix (sampling {self.n_j_windows} windows)...")
+        # ARCHITECTURAL CHANGE: Replace Hopfield auto-association
+        #   J = S_context^T @ S_context / N
+        # with CONDITION-RESPONSE:
+        #   J = S_context^T @ sigma_next / N
+        #
+        # WHY: Hopfield auto-association stores patterns for RECALL, but
+        #   with N_patterns >> capacity (130K >> 36), it produces a
+        #   meaningless near-zero average. The condition-response approach
+        #   directly captures the PREDICTIVE relationship: "when context
+        #   spin looks like X, the next word's spin should look like Y."
+        #
+        # This is a linear predictor from context spin state to next-word
+        # spin pattern. In the energy function:
+        #   E_coupling(w) = -(sigma_w . (J @ sigma_doc))
+        # J @ sigma_doc gives the PREDICTED next-word spin pattern, and
+        # sigma_w . (J @ sigma_doc) measures how well word w matches this
+        # prediction. This creates genuine long-range dependencies because
+        # sigma_doc encodes the entire document history.
+        #
+        print(f"    Phase 2: Learning coupling matrix via CONDITION-RESPONSE "
+              f"(sampling {self.n_j_windows} windows)...")
 
-        # Sample random context windows from training data
-        # For each window, compute the aggregated spin pattern
         rng2 = np.random.RandomState(seed + 100)
 
         # Collect all (seq_idx, position) pairs
@@ -436,89 +456,80 @@ class LatentSpinGlass:
         else:
             sampled_windows = all_windows
 
-        # Compute spin patterns for each sampled window
-        # sigma_ctx = sign(sum of sigma_w for words in window)
-        window_size = 5  # ±2 words around center
-        S = np.zeros((len(sampled_windows), D), dtype=np.int32)
+        # Compute context spin patterns AND next-word spin vectors
+        # S_context[i] = sign(sum of sigma_w for context words)
+        # sigma_next[i] = spin vector of the word at position pos
+        window_size = 10  # Wider window: 10 words of context
+        S_context = np.zeros((len(sampled_windows), D), dtype=np.int8)
+        S_next = np.zeros((len(sampled_windows), D), dtype=np.int8)
+        valid_mask = np.zeros(len(sampled_windows), dtype=bool)
 
         for i, (seq_idx, pos) in enumerate(sampled_windows):
             seq = sequences[seq_idx]
-            # Words BEFORE position pos (context for predicting pos)
+            # Context: words BEFORE position pos
             start = max(0, pos - window_size)
-            end = pos  # up to but not including pos
+            end = pos
             context_words = seq[start:end]
+            # Target: the word AT position pos
+            next_word = seq[pos] if pos < len(seq) else -1
 
-            if not context_words:
+            if not context_words or next_word < 0 or next_word >= V:
                 continue
 
-            # Sum spin vectors of context words
+            # Accumulate context spin vectors
             acc = np.zeros(D, dtype=np.int32)
             for w in context_words:
                 if 0 <= w < V:
                     acc += spin_vectors[w].astype(np.int32)
 
-            S[i] = acc
+            # Store sign of accumulated context (binary pattern)
+            s_ctx = np.sign(acc).astype(np.int8)
+            zero_mask = acc == 0
+            s_ctx[zero_mask] = 1  # Default to +1 when no evidence
 
-        # Compute J_learned via Hopfield storage: J = S^T @ S / N
-        # This is equivalent to: J = sum_sigma sigma * sigma^T / N
-        # which stores the average correlation structure.
-        print(f"      Computing J_learned via Hopfield storage "
-              f"({len(sampled_windows)} patterns x {D} dims)...")
+            S_context[i] = s_ctx
+            S_next[i] = spin_vectors[next_word]  # Next word's spin vector
+            valid_mask[i] = True
 
-        # Only use patterns with nonzero norm (skip empty windows)
-        norms = np.sum(S * S, axis=1)
-        nonzero_mask = norms > 0
-        S_nz = S[nonzero_mask]
-        n_patterns = len(S_nz)
+        n_valid = int(np.sum(valid_mask))
+        print(f"      Valid context-next pairs: {n_valid}/{len(sampled_windows)}")
 
-        if n_patterns > 0:
-            # Binary patterns for J computation: take sign first
-            S_binary = np.sign(S_nz).astype(np.int8)
+        if n_valid > 0:
+            S_ctx_valid = S_context[valid_mask]  # (n_valid, D) int8
+            S_next_valid = S_next[valid_mask]     # (n_valid, D) int8
 
-            # J = S_binary^T @ S_binary / N  (integer matrix multiply)
-            # S_binary is int8, so the product fits in int32
-            J_int = S_binary.astype(np.int32).T @ S_binary.astype(np.int32)
+            # CONDITION-RESPONSE: J = S_context^T @ sigma_next / N
+            # This captures: "if context spin dimension j is +1, how does
+            # it predict next-word spin dimension i?"
+            # J[i,j] = (1/N) * sum_k S_context[k,j] * sigma_next[k,i]
+            #
+            # Unlike Hopfield (S^T @ S which is auto-correlation), this
+            # is a CROSS-correlation between context and next-word. It
+            # directly captures the predictive relationship.
+            print(f"      Computing J_learned via condition-response "
+                  f"({n_valid} pairs x {D} dims)...")
 
-            # Scale to int16: normalize by number of patterns and scale
-            # J_learned[i,j] = J_int[i,j] * 256 / n_patterns
-            # This gives a reasonable int16 range
-            if n_patterns > 0:
-                J_scaled = (J_int * 256 // n_patterns).astype(np.int16)
-            else:
-                J_scaled = np.zeros((D, D), dtype=np.int16)
+            J_int = S_ctx_valid.astype(np.int32).T @ S_next_valid.astype(np.int32)
+
+            # Scale to int16: normalize by number of valid pairs
+            # J_learned[i,j] = J_int[i,j] * 256 / n_valid
+            J_scaled = (J_int * 256 // n_valid).astype(np.int16)
 
             # Zero diagonal (no self-coupling)
             np.fill_diagonal(J_scaled, 0)
 
-            # --- Top-K Sparsification of J_learned ---
-            #
-            # ROOT CAUSE of 99.4% dense, frustrated J:
-            #   The Hopfield storage rule J = S^T @ S with N_patterns >> D
-            #   produces a dense matrix. With 200K patterns in 256 dimensions
-            #   (capacity ~ 36 patterns), J is essentially the average outer
-            #   product — a rank-deficient correlation matrix with no useful
-            #   attractor structure.
-            #
-            # FIX: Keep only the strongest K% of couplings by absolute value.
-            #   The strongest couplings capture the REAL dependency structure
-            #   between spin dimensions. The weak couplings are noise from
-            #   storing far more patterns than capacity.
-            #
-            #   A sparse J has:
-            #   - Clear attractor basins (strong couplings create energy wells)
-            #   - Low frustration (the dominant couplings are self-consistent)
-            #   - Efficient computation (fewer multiply-accumulates)
-            #
+            # --- Top-K Sparsification ---
+            # Keep only the strongest K% of couplings by absolute value.
+            # This removes noise and creates structural sparsity with
+            # clear directional signals.
             if 0 < self.j_sparsity < 1.0:
                 abs_J = np.abs(J_scaled)
-                # Only consider off-diagonal elements for threshold
                 off_diag_mask = ~np.eye(D, dtype=bool)
                 off_diag_abs = abs_J[off_diag_mask]
-                if len(off_diag_abs) > 0 and np.any(off_diag_abs > 0):
-                    # Compute threshold: keep top j_sparsity fraction
+                nonzero_off = off_diag_abs[off_diag_abs > 0]
+                if len(nonzero_off) > 0:
                     percentile = (1.0 - self.j_sparsity) * 100
-                    threshold = int(np.percentile(off_diag_abs[off_diag_abs > 0], percentile))
-                    # Apply: zero out weak couplings
+                    threshold = int(np.percentile(nonzero_off, percentile))
                     weak_mask = (abs_J < threshold) & off_diag_mask
                     J_scaled[weak_mask] = 0
 
@@ -541,7 +552,7 @@ class LatentSpinGlass:
                   f"positive={n_pos}, negative={n_neg}")
         else:
             self.J_learned = np.zeros((D, D), dtype=np.int16)
-            print(f"      WARNING: No valid patterns found, J_learned is zero")
+            print(f"      WARNING: No valid pairs found, J_learned is zero")
 
         # Free projection matrix (not needed at inference)
         self._R = None

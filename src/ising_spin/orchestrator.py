@@ -137,7 +137,7 @@ class IsingLMModel:
         latent_spin_dim: int = 256,
         latent_spin_alpha_q8: int = 128,
         latent_spin_eta_episodic: int = 2,
-        latent_spin_n_mf_sweeps: int = 2,
+        latent_spin_n_mf_sweeps: int = 4,
         latent_spin_scale: int = 1200,
         latent_spin_coupling_scale: int = 800,
         latent_spin_temperature: int = 0,
