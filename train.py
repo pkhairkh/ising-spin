@@ -410,8 +410,8 @@ def main():
     parser.add_argument("--no-kn-backoff", action="store_true")
     parser.add_argument("--no-interpolated", action="store_true")
     parser.add_argument("--ngram-min-count", type=int, default=2)
-    parser.add_argument("--ngram-max-n", type=int, default=5,
-                        help="Maximum word n-gram order (default: 5, try 8 for more context)")
+    parser.add_argument("--ngram-max-n", type=int, default=6,
+                        help="Maximum word n-gram order (default: 6, was 5)")
     parser.add_argument("--ngram-max-seqs", type=int, default=1000000)
     parser.add_argument("--max-seq-len", type=int, default=30)
     parser.add_argument("--same-word-penalty", type=int, default=200)
@@ -460,12 +460,12 @@ def main():
                         help="Enable v20 Semantic Spin Resonance (EMERGENT understanding via frustrated dynamics)")
     parser.add_argument("--ssr-dim", type=int, default=256,
                         help="SSR spin dimension (default: 256)")
-    parser.add_argument("--ssr-alpha", type=int, default=128,
-                        help="SSR external field strength in Q8 (default: 128 ≈ 0.5)")
+    parser.add_argument("--ssr-alpha", type=int, default=255,
+                        help="SSR external field strength in Q8 (default: 255 ≈ 1.0)")
     parser.add_argument("--ssr-eta", type=int, default=2,
                         help="SSR Hebbian learning rate for episodic memory (default: 2)")
-    parser.add_argument("--ssr-scale", type=int, default=1200,
-                        help="SSR energy scale (default: 1200)")
+    parser.add_argument("--ssr-scale", type=int, default=400,
+                        help="SSR energy scale (default: 400, reduced from 1200 — SSR has random J_struct so should be minor bias)")
     parser.add_argument("--ssr-temperature", type=int, default=50,
                         help="SSR Metropolis temperature for spin dynamics (default: 50)")
 
@@ -474,14 +474,14 @@ def main():
                         help="Enable v21 Learned Latent Spin Glass (EMERGENT understanding from LEARNED physics)")
     parser.add_argument("--latent-spin-dim", type=int, default=256,
                         help="Latent spin dimension (default: 256)")
-    parser.add_argument("--latent-spin-alpha", type=int, default=128,
-                        help="Latent spin external field strength in Q8 (default: 128)")
+    parser.add_argument("--latent-spin-alpha", type=int, default=255,
+                        help="Latent spin external field strength in Q8 (default: 255 ≈ 1.0, was 128)")
     parser.add_argument("--latent-spin-eta", type=int, default=2,
                         help="Latent spin Hebbian learning rate (default: 2)")
-    parser.add_argument("--latent-spin-scale", type=int, default=1200,
-                        help="Latent spin direct alignment energy scale (default: 1200)")
-    parser.add_argument("--latent-spin-coupling-scale", type=int, default=800,
-                        help="Latent spin coupling-mediated alignment energy scale (default: 800)")
+    parser.add_argument("--latent-spin-scale", type=int, default=4000,
+                        help="Latent spin direct alignment energy scale (default: 4000, was 1200)")
+    parser.add_argument("--latent-spin-coupling-scale", type=int, default=3000,
+                        help="Latent spin coupling-mediated alignment energy scale (default: 3000, was 800)")
     parser.add_argument("--latent-spin-temperature", type=int, default=0,
                         help="Latent spin Metropolis temperature (default: 0, deterministic)")
     parser.add_argument("--latent-spin-context-window", type=int, default=5,
@@ -672,7 +672,7 @@ def main():
         # Copy mechanism
         copy_enabled=True,
         copy_min_context=3,
-        copy_min_confidence=0.90,  # Raised from 0.65 — copy bypasses spin dynamics, must be very confident
+        copy_min_confidence=0.95,  # v22: raised from 0.90 — copy is now soft bias, threshold is for identification only
         # Misc
         max_seq_len=args.max_seq_len,
         # v18 modules
@@ -822,8 +822,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "21.0.0",
-        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (Learned)",
+        "version": "22.0.0",
+        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (Learned, v22 expressivity fix)",
         "dataset": args.dataset,
         "curriculum": args.curriculum,
         "timestamp": timestamp,

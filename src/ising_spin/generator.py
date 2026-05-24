@@ -319,7 +319,6 @@ class IsingLMGenerator:
 
         words = list(prompt_tokens)
         types_list = [self._get_word_type(w) for w in words]
-        consecutive_copies = 0
         diagnostics = []
 
         # Initialize document state from prompt
@@ -391,6 +390,10 @@ class IsingLMGenerator:
             chosen_type = valid_types[self.type_sampler.sample(type_energies)]
 
             # === STEP 2: Check copy mechanism ===
+            # v22: Copy is now a soft energy bonus, not a hard override.
+            # We still identify high-confidence n-gram candidates, but instead
+            # of bypassing energy computation, we add a strong energy bonus
+            # in STEP 5 so that spin dynamics can still influence selection.
             copy_word = None
             if self.copy_enabled and len(words) >= self.copy_min_context and self.word_index is not None:
                 copy_candidate = self.word_index.get_best_copy_candidate(
@@ -406,16 +409,9 @@ class IsingLMGenerator:
                         if chosen_type in allowed or not allowed:
                             # Don't copy same word twice
                             if len(words) >= 1 and copy_word_idx == words[-1]:
-                                copy_word_idx = None
-                            elif consecutive_copies >= 2:  # Was 3, reduced to prevent bypassing spin dynamics
-                                copy_word_idx = None
+                                copy_word = None
                             else:
                                 copy_word = copy_word_idx
-                                consecutive_copies += 1
-                                self._stats['copy_used'] += 1
-
-            if copy_word is None:
-                consecutive_copies = 0
 
             # === STEP 3: Get candidate words ===
             candidate_list = self.type_words.get(chosen_type, [])
@@ -487,12 +483,27 @@ class IsingLMGenerator:
 
             # === STEP 5: Boltzmann sample ===
             chosen_energy = 0
+            # v22 FIX: Copy mechanism is now a SOFT energy bonus instead of
+            # hard override. Previously, copy bypassed the energy computation
+            # entirely (~25% of positions), preventing spin dynamics from
+            # influencing word selection. Now, the copy word gets a strong
+            # energy bonus but must still win through Boltzmann sampling,
+            # allowing spin alignment to override when it disagrees.
             if copy_word is not None:
-                chosen_word = copy_word
-            else:
-                word_idx = self.word_sampler.sample(word_energies)
-                chosen_word = int(candidate_words[word_idx])
-                chosen_energy = int(word_energies[word_idx])
+                # Find copy_word in candidates and give it a strong energy bonus
+                copy_idx = np.where(candidate_words == copy_word)[0]
+                if len(copy_idx) > 0:
+                    # Strong bonus: recall_scale * 3 ≈ 4800 with default scale
+                    # This makes the copy word ~95% likely but spin can override
+                    # if alignment strongly disagrees (spin energy > 4800)
+                    copy_bonus = self.recall_scale * 3
+                    word_energies[copy_idx[0]] -= copy_bonus
+                    self._stats['copy_used'] += 1
+                # If copy_word not in candidates (rare), fall through to sampling
+
+            word_idx = self.word_sampler.sample(word_energies)
+            chosen_word = int(candidate_words[word_idx])
+            chosen_energy = int(word_energies[word_idx])
 
             words.append(chosen_word)
             types_list.append(chosen_type)

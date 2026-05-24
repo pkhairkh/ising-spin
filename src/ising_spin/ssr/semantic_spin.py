@@ -73,10 +73,10 @@ class SemanticSpinResonance:
 
     # Q8 fixed-point for external field strength
     # alpha controls how strongly the current word influences the spin state.
-    # alpha_q8 = 128 means alpha ≈ 0.5 (moderate influence).
-    # Too high: sigma just tracks the current word (no memory).
-    # Too low: sigma ignores the current word (no feedback).
-    DEFAULT_ALPHA_Q8 = 128
+    # alpha_q8 = 255 means alpha ≈ 1.0 (strong influence, sigma tracks current word).
+    # With normalized coupling field, alpha=1.0 gives balanced dynamics
+    # where the current word's pattern competes equally with coupling structure.
+    DEFAULT_ALPHA_Q8 = 255
 
     # Episodic Hebbian learning rate
     # eta_episodic controls how strongly the episodic memory forms.
@@ -295,8 +295,15 @@ class SemanticSpinResonance:
             # Internal field from coupling: J_total @ sigma
             h_internal = J_total @ self.sigma.astype(np.int32)  # (D,) int32
 
-            # Total field: internal + external (scaled by alpha)
-            h_total = h_internal + ((self.alpha_q8 * h_ext) >> 8)  # (D,) int32
+            # v22 FIX: Normalize coupling field so it's comparable to the
+            # external field (same fix as latent_spin.py). Without this,
+            # the coupling field (~hundreds) completely dominates the
+            # external field (~1), making sigma unresponsive to new words.
+            h_norm = max(self.D, int(np.sum(np.abs(h_internal))))
+            h_internal_normalized = (h_internal.astype(np.int64) * self.D) // h_norm
+
+            # Total field: normalized internal + external (scaled by alpha)
+            h_total = h_internal_normalized.astype(np.int32) + ((self.alpha_q8 * h_ext) >> 8)  # (D,) int32
 
             # Mean-field update: sigma_i = sign(h_i)
             # If h_i > 0: sigma_i = +1; if h_i < 0: sigma_i = -1; if h_i == 0: keep current
@@ -412,17 +419,21 @@ class SemanticSpinResonance:
         """
         Compute SSR energy for candidate words.
 
-        E_ssr(w) = -(sigma . W_readout[w]) * ssr_scale / max(1, max_abs_dot)
+        E_ssr(w) = -(sigma . W_readout[w]) * ssr_scale / R_L1[w]
+
+        where R_L1[w] = sum(|W_readout[w,d]|) is the L1 norm of the readout
+        vector, used as per-word normalization. This ensures:
+          E_ssr ∈ [-ssr_scale, +ssr_scale] for each word
+        regardless of the readout vector magnitude.
+
+        NORMALIZATION FIX (v22): Replaced Q10 max_abs normalization with
+        per-word L1 normalization. The Q10 approach compressed all candidates
+        to the same range regardless of their readout magnitude, destroying
+        the discriminative power. L1 normalization preserves the relative
+        alignment signal while keeping the energy scale fixed.
 
         Words whose readout vector ALIGNS with the current spin state
         get lower energy (more likely under Boltzmann sampling).
-
-        The key difference from ESN/MTR energy:
-        - ESN: linear dot product between int16 reservoir state and int16 readout
-        - SSR: dot product between BINARY spin state and int16 readout
-          The binary nature creates SHARP energy differences — a spin
-          configuration either aligns with a word's readout or it doesn't,
-          with no middle ground. This creates DISCRETE attractor basins.
 
         Args:
             candidate_words: Array of candidate word IDs, shape (n,).
@@ -441,18 +452,15 @@ class SemanticSpinResonance:
 
         # Dot product: sigma . W_readout[w] for each candidate
         # sigma is {-1, +1} int8, W_readout is int16
-        # Product range: int8 * int16 -> int32 per element
         dots = R_candidates.astype(np.int32) @ self.sigma.astype(np.int32)  # (n,)
 
-        # Normalize to Q10 fixed point
-        max_abs_dot = max(self.DOT_FLOOR, int(np.max(np.abs(dots))))
-        Q = self.DOT_NORM_Q
+        # Per-word L1 normalization: E = -(dot * ssr_scale) / R_L1
+        # R_L1[w] = sum(|W_readout[w,d]|) = maximum possible dot for word w
+        # This gives E ∈ [-ssr_scale, +ssr_scale] for each word
+        R_L1 = np.sum(np.abs(R_candidates), axis=1).astype(np.int64)  # (n,)
+        R_L1 = np.maximum(R_L1, 1)  # Avoid division by zero for unseen words
 
-        norm_dots = (dots.astype(np.int64) * Q) // max_abs_dot  # (n,) int64
-
-        # Energy = -(norm_dot * ssr_scale) / Q
-        # Higher dot product -> lower energy -> more likely
-        energies = -(norm_dots * self.ssr_scale) // Q
+        energies = -(dots.astype(np.int64) * self.ssr_scale) // R_L1
 
         return energies.astype(np.int64)
 

@@ -122,7 +122,7 @@ class LatentSpinGlass:
 
     # Q8 fixed-point for external field strength
     # alpha controls how strongly the current word influences the spin state.
-    DEFAULT_ALPHA_Q8 = 128  # ≈ 0.5
+    DEFAULT_ALPHA_Q8 = 255  # ≈ 1.0 — max Q8, ensures sigma_doc strongly tracks current word
 
     # Episodic Hebbian learning rate
     # Each token update adds eta_episodic to the coupling of aligned spins.
@@ -134,7 +134,10 @@ class LatentSpinGlass:
     DEFAULT_N_MF_SWEEPS = 4
 
     # Maximum absolute value for J_episodic (prevents unbounded growth)
-    J_EPISODIC_CLIP = 200
+    # Reduced from 200 to 120: prevents old episodic memories from
+    # overwhelming the learned coupling structure, allowing sigma_doc
+    # to remain responsive to the current semantic state.
+    J_EPISODIC_CLIP = 120
 
     # Context window for spin vector learning (±context_window tokens)
     DEFAULT_CONTEXT_WINDOW = 5
@@ -142,9 +145,13 @@ class LatentSpinGlass:
     # Number of training windows to sample for J_learned
     DEFAULT_N_J_WINDOWS = 200000
 
-    # Q10 normalization for energy dot products
-    DOT_NORM_Q = 1024
-    DOT_FLOOR = 100
+    # Normalization for energy dot products
+    # FIXED normalization: use D (spin dimension) and h_norm (coupling field L1)
+    # instead of Q10 per-candidate max_abs which compressed dynamic range
+    # and made spin energy 10-25x weaker than recall energy.
+    # With D-based normalization:
+    #   E_direct ∈ [-latent_scale, +latent_scale] (perfect alignment to anti-alignment)
+    #   E_coupling ∈ [-coupling_scale, +coupling_scale] (same)
 
     # Metropolis temperature for spin dynamics
     DEFAULT_TEMPERATURE = 0  # Deterministic by default for clean dynamics
@@ -693,8 +700,19 @@ class LatentSpinGlass:
             # Internal field from coupling: J_total @ sigma_doc
             h_internal = J_total @ self.sigma_doc.astype(np.int32)  # (D,) int32
 
-            # Total field: internal + external (scaled by alpha)
-            h_total = h_internal + ((self.alpha_q8 * h_ext) >> 8)  # (D,) int32
+            # v22 FIX: Normalize coupling field so it's comparable to the
+            # external field. Without normalization, h_internal values are
+            # ~10K (from summing ~40 non-zero J entries of magnitude ~243),
+            # while h_ext is ~1 (binary ±1). The coupling completely dominates,
+            # making sigma_doc unresponsive to new words (avg alignment was -112
+            # instead of positive). Now we normalize h_internal so its L1 norm
+            # equals D (same as the energy computation normalization), bringing
+            # both fields to comparable magnitude (~±1 per dimension).
+            h_norm = max(self.D, int(np.sum(np.abs(h_internal))))
+            h_internal_normalized = (h_internal.astype(np.int64) * self.D) // h_norm
+
+            # Total field: normalized internal + external (scaled by alpha)
+            h_total = h_internal_normalized.astype(np.int32) + ((self.alpha_q8 * h_ext) >> 8)  # (D,) int32
 
             # Mean-field update: sigma_doc_i = sign(h_i)
             new_sigma = np.sign(h_total).astype(np.int8)
@@ -786,20 +804,21 @@ class LatentSpinGlass:
 
         1. DIRECT ALIGNMENT: How well does the candidate word's spin vector
            align with the current document state?
-           E_direct(w) = -(sigma_w . sigma_doc) * latent_scale / norm
+           E_direct(w) = -(sigma_w . sigma_doc) * latent_scale / D
 
         2. COUPLING-MEDIATED ALIGNMENT: How well does the candidate word's
            spin vector align with the LEARNED-COUPLING-mediated field?
-           E_coupling(w) = -(sigma_w . (J_total @ sigma_doc)) * coupling_scale / norm
+           E_coupling(w) = -(sigma_w . h_coupling) * coupling_scale / h_norm
 
-        The coupling-mediated term is the KEY for long-range dependencies.
-        It measures: "Given the learned dependency structure J and the current
-        document state sigma_doc, does this word COMPLETE THE PATTERN?"
+        NORMALIZATION FIX (v22): Replaced Q10 normalization (dividing by
+        max_abs_dot per call) with FIXED normalization:
+          - Direct: divide by D (spin dimension) → range [-latent_scale, +latent_scale]
+          - Coupling: divide by L1 norm of h_coupling → range [-coupling_scale, +coupling_scale]
 
-        This is Hopfield pattern completion. The document state is a partial
-        pattern, and J encodes which patterns are stable. Words whose spin
-        vectors align with the J-mediated field have low energy — they are
-        the correct completion of the current pattern.
+        The Q10 normalization compressed all dot products to [-1024, +1024]
+        before scaling, making spin energy 10-25x weaker than recall energy.
+        With fixed normalization, the spin terms have a guaranteed energy range
+        that is competitive with recall, enabling genuine spin→word influence.
 
         Args:
             candidate_words: Array of candidate word IDs, shape (n,).
@@ -817,14 +836,15 @@ class LatentSpinGlass:
         S_candidates = self.spin_vectors[safe_candidates]  # (n, D) int8
 
         # --- Direct alignment energy ---
-        # E_direct(w) = -(sigma_w . sigma_doc) * latent_scale / norm
+        # E_direct(w) = -(sigma_w . sigma_doc) * latent_scale / D
+        # dot ∈ [-D, +D], so E_direct ∈ [-latent_scale, +latent_scale]
         direct_dots = S_candidates.astype(np.int32) @ self.sigma_doc.astype(np.int32)  # (n,)
-        max_abs_direct = max(self.DOT_FLOOR, int(np.max(np.abs(direct_dots))))
-        norm_direct = (direct_dots.astype(np.int64) * self.DOT_NORM_Q) // max_abs_direct
-        E_direct = -(norm_direct * self.latent_scale) // self.DOT_NORM_Q
+        E_direct = -(direct_dots.astype(np.int64) * self.latent_scale) // self.D
 
         # --- Coupling-mediated alignment energy ---
-        # E_coupling(w) = -(sigma_w . (J_total @ sigma_doc)) * coupling_scale / norm
+        # E_coupling(w) = -(sigma_w . h_coupling) * coupling_scale / h_norm
+        # where h_coupling = J_total @ sigma_doc and h_norm = L1(h_coupling)
+        # This ensures E_coupling ∈ [-coupling_scale, +coupling_scale]
         J_total = np.zeros((self.D, self.D), dtype=np.int32)
         if self.J_learned is not None:
             J_total += self.J_learned.astype(np.int32)
@@ -833,11 +853,14 @@ class LatentSpinGlass:
         # Compute coupling-mediated field: h = J_total @ sigma_doc
         h_coupling = J_total @ self.sigma_doc.astype(np.int32)  # (D,) int32
 
+        # L1 norm of h_coupling for normalization
+        # Floor at D to prevent division by very small numbers when
+        # coupling is weak (early in generation)
+        h_norm = max(self.D, int(np.sum(np.abs(h_coupling))))
+
         # Dot product: sigma_w . h_coupling for each candidate
         coupling_dots = S_candidates.astype(np.int32) @ h_coupling  # (n,) int32
-        max_abs_coupling = max(self.DOT_FLOOR, int(np.max(np.abs(coupling_dots))))
-        norm_coupling = (coupling_dots.astype(np.int64) * self.DOT_NORM_Q) // max_abs_coupling
-        E_coupling = -(norm_coupling * self.coupling_scale) // self.DOT_NORM_Q
+        E_coupling = -(coupling_dots.astype(np.int64) * self.coupling_scale) // h_norm
 
         # Total energy: ADDITIVE (Ising model physics: E = sum E_i)
         return (E_direct + E_coupling).astype(np.int64)

@@ -74,7 +74,7 @@ class IsingLMModel:
         vocab_min_freq: int = 25,
         vocab_max_size: int = 4000,
         # N-gram
-        ngram_max_n: int = 5,
+        ngram_max_n: int = 6,
         ngram_min_count: int = 2,
         ngram_max_sequences: int = 1000000,
         # POS
@@ -127,19 +127,19 @@ class IsingLMModel:
         # v20: Semantic Spin Resonance (EMERGENT understanding via frustrated dynamics)
         enable_ssr: bool = False,
         ssr_dim: int = 256,
-        ssr_alpha_q8: int = 128,
+        ssr_alpha_q8: int = 255,
         ssr_eta_episodic: int = 2,
         ssr_n_mf_sweeps: int = 2,
-        ssr_scale: int = 1200,
+        ssr_scale: int = 400,
         ssr_temperature: int = 50,
         # v21: Learned Latent Spin Glass (GENUINE understanding from learned physics)
         enable_latent_spin: bool = False,
         latent_spin_dim: int = 256,
-        latent_spin_alpha_q8: int = 128,
+        latent_spin_alpha_q8: int = 255,
         latent_spin_eta_episodic: int = 2,
         latent_spin_n_mf_sweeps: int = 4,
-        latent_spin_scale: int = 1200,
-        latent_spin_coupling_scale: int = 800,
+        latent_spin_scale: int = 4000,
+        latent_spin_coupling_scale: int = 3000,
         latent_spin_temperature: int = 0,
         latent_spin_context_window: int = 5,
         latent_spin_n_j_windows: int = 200000,

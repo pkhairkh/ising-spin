@@ -66,17 +66,16 @@ class IntegerBoltzmannSampler:
         self.scale = scale
         # For accurate PPL computation, max_delta must cover the full energy
         # range. With recall_scale=1600 and 5K vocab, max delta ≈ 32K.
-        # Memory: 25001 × 8 bytes ≈ 200KB — very affordable.
+        # With v22 spin energy fixes (latent_scale=4000, coupling_scale=3000),
+        # total energy range is wider, so we need a larger cap.
+        # Memory: 50001 × 8 bytes ≈ 400KB — still very affordable.
         #
-        # v12.3: Keeping 25K cap. Tested 50K cap and PPL REGRESSED from 50→53.
-        # The 25K cap acts as implicit regularization: words with delta > 25K
-        # all get the same weight (table[25000]), which inflates Z and prevents
-        # the distribution from becoming too peaked at high β. This is similar
-        # to label smoothing / temperature scaling. Removing the cap makes the
-        # Boltzmann distribution too sharp at high β, hurting PPL on uncertain
-        # positions. A principled smoothing mechanism could replace this, but
-        # for now the 25K cap is battle-tested and works.
-        fine_max = min(max_delta, 25000)
+        # v22: Increased from 25K to 50K. The previous 25K cap was tested
+        # before spin energy was properly normalized and scaled. With the new
+        # energy landscape (spin terms competitive with recall), the wider
+        # range allows the Boltzmann distribution to express sharper
+        # preferences when spin alignment strongly favors a candidate.
+        fine_max = min(max_delta, 50000)
         self.table = np.zeros(fine_max + 1, dtype=np.int64)
 
         # INTEGER-ONLY TABLE CONSTRUCTION
