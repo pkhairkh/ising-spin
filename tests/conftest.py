@@ -48,7 +48,7 @@ def small_vocab():
 
 @pytest.fixture
 def small_model():
-    """Build a small IsingLMModel with v18 modules for integration/property tests."""
+    """Build a small IsingLMModel with all modules for integration/property tests."""
     from ising_spin.orchestrator import IsingLMModel
 
     model = IsingLMModel(

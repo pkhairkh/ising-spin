@@ -1,15 +1,15 @@
 """
-Integration tests for ISG-LM v18 — all energy experts working together.
+Integration tests for ISG-LM — all energy experts working together.
 
 NOTE: These tests require a full model build which is expensive.
 They are marked as slow and skipped by default. Run manually with:
-    pytest tests/test_v18_integration.py -v -s --runslow
+    pytest tests/test_integration.py -v -s --runslow
 
 Test categories:
   IT-01: VSA energy term integrated
   IT-02: Dense AM energy term integrated
   IT-03: Reservoir energy term integrated
-  IT-04: RFF energy term integrated (v18.3)
+  IT-04: RFF energy term integrated
   IT-05: Factorial state energy integrated
   IT-06: All experts together (no overflow)
   IT-07: KN backoff still works
@@ -20,7 +20,7 @@ Test categories:
   IT-12: Ablation --no-vsa
   IT-13: Ablation --no-dense-am
   IT-14: Ablation --no-reservoir
-  IT-15: Ablation --no-rff (v18.3)
+  IT-15: Ablation --no-rff
 """
 
 import numpy as np

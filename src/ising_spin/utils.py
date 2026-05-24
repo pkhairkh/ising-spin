@@ -1,17 +1,17 @@
 """
 Shared utilities for the Ising Spin Glass Language Model.
 
-Single source of truth for constants and helpers that were previously
-duplicated across multiple modules:
-  - TAG_PRIORITY: word→POS disambiguation priority (was copy-pasted 5 times)
+Single source of truth for constants and helpers:
+  - TAG_PRIORITY: word→POS disambiguation priority
   - primary_pos_tag(): select primary POS from allowed set
-  - get_rss_mb(): process memory measurement (was copy-pasted 4 times)
+  - get_rss_mb(): process memory measurement
   - validate_array(): common input validation for numpy arrays
   - validate_nonempty(): common validation for sequences
   - validate_positive() / validate_non_negative(): scalar validation
-  - load_fineweb_edu(): corpus loading from HuggingFace (from helpers.py)
-  - tokenize_texts(): tokenize texts using vocab (from helpers.py)
-  - truncate_sequences(): truncate/filter sequences (from helpers.py)
+  - Dataset loaders: load_fineweb_edu, load_tinystories, load_tiny_textbooks,
+    load_writingprompts — all return List[str]
+  - tokenize_texts(): tokenize texts using vocab
+  - truncate_sequences(): truncate/filter sequences
 """
 
 from __future__ import annotations
@@ -131,39 +131,48 @@ def validate_non_negative(value: int, name: str = "value") -> None:
 
 # ── CORPUS LOADING ──────────────────────────────────────────────────────
 
-def load_fineweb_edu(
-    n_samples: int = 50000,
+# ── GENERIC HF STREAMING LOADER ───────────────────────────────────────
+
+def _load_hf_streaming(
+    repo_name: str,
+    n_samples: int,
+    text_column: str = "text",
+    *,
+    subset: str | None = None,
     split: str = "train",
-    subset: str = "sample-10BT",
     min_length: int = 20,
-    max_length: int = 2000,
+    max_length: int = 10000,
+    alt_repos: list[str] | None = None,
+    label: str | None = None,
 ) -> List[str]:
-    """Load text samples from the fineweb-edu dataset on HuggingFace."""
+    """Generic streaming loader for any HuggingFace text dataset.
+
+    Tries repo_name first (with optional subset), then alt_repos in order.
+    Filters texts by character length and collects up to n_samples.
+    """
     from datasets import load_dataset
 
-    print(f"Loading fineweb-edu ({subset}, split={split})...")
+    label = label or repo_name
+    subset_str = f", subset={subset}" if subset else ""
+    print(f"Loading {label} ({repo_name}{subset_str}, split={split})...")
 
     dataset = None
-    for name in ["HuggingFaceFW/fineweb-edu", "HuggingFW/fineweb-edu"]:
+    repos_to_try = [repo_name] + (alt_repos or [])
+
+    for name in repos_to_try:
         try:
-            dataset = load_dataset(name, name=subset, split=split, streaming=True)
-            print(f"  Loaded from '{name}' with subset '{subset}'")
+            if subset:
+                dataset = load_dataset(name, name=subset, split=split, streaming=True)
+            else:
+                dataset = load_dataset(name, split=split, streaming=True)
+            print(f"  Loaded from '{name}'" f" with subset '{subset}'" if subset else "")
             break
         except Exception:
             continue
 
     if dataset is None:
-        for name in ["HuggingFaceFW/fineweb-edu", "HuggingFW/fineweb-edu"]:
-            try:
-                dataset = load_dataset(name, split=split, streaming=True)
-                print(f"  Loaded from '{name}' without subset")
-                break
-            except Exception:
-                continue
-
-    if dataset is None:
         raise CorpusError(
-            "Could not load fineweb-edu. Check internet and HuggingFace access."
+            f"Could not load {label}. Check internet and HuggingFace access."
         )
 
     texts: List[str] = []
@@ -172,7 +181,9 @@ def load_fineweb_edu(
         scanned += 1
         if len(texts) >= n_samples:
             break
-        text = example.get("text", "").strip()
+        text = example.get(text_column, "").strip()
+        if not text:
+            continue
         if min_length <= len(text) <= max_length:
             texts.append(text)
         if scanned % 10000 == 0:
@@ -180,8 +191,151 @@ def load_fineweb_edu(
         if scanned > n_samples * 5:
             break
 
-    print(f"Loaded {len(texts)} texts from fineweb-edu (scanned {scanned}).")
+    print(f"Loaded {len(texts)} texts from {label} (scanned {scanned}).")
     return texts
+
+
+# ── DATASET-SPECIFIC LOADERS ───────────────────────────────────────────
+
+def load_fineweb_edu(
+    n_samples: int = 50000,
+    split: str = "train",
+    subset: str = "sample-10BT",
+    min_length: int = 20,
+    max_length: int = 2000,
+) -> List[str]:
+    """Load text samples from the FineWeb-Edu dataset."""
+    return _load_hf_streaming(
+        "HuggingFaceFW/fineweb-edu",
+        n_samples,
+        text_column="text",
+        subset=subset,
+        split=split,
+        min_length=min_length,
+        max_length=max_length,
+        alt_repos=["HuggingFW/fineweb-edu"],
+        label="fineweb-edu",
+    )
+
+
+def load_tinystories(
+    n_samples: int = 50000,
+    split: str = "train",
+    min_length: int = 20,
+    max_length: int = 5000,
+) -> List[str]:
+    """Load text samples from the TinyStories dataset.
+
+    TinyStories contains ~2.14M synthetic children's stories written by
+    GPT-3.5/GPT-4 using only preschool-level vocabulary (~1.5K-2K words).
+    Stories are typically 50-200 tokens, providing multi-sentence narrative
+    discourse ideal for learning grammar and coherence.
+
+    HF: roneneldan/TinyStories
+    Paper: Eldan & Millin 2023 (arXiv:2305.07759)
+    """
+    return _load_hf_streaming(
+        "roneneldan/TinyStories",
+        n_samples,
+        text_column="text",
+        split=split,
+        min_length=min_length,
+        max_length=max_length,
+        label="TinyStories",
+    )
+
+
+def load_tiny_textbooks(
+    n_samples: int = 50000,
+    split: str = "train",
+    min_length: int = 50,
+    max_length: int = 10000,
+) -> List[str]:
+    """Load text samples from the tiny-textbooks dataset.
+
+    Tiny-textbooks contains ~420K synthetic textbook-quality documents
+    generated by Nous-Hermes-Llama2-13B. Documents are typically 200-800
+    tokens, providing coherent multi-paragraph expository text.
+
+    HF: nampdn-ai/tiny-textbooks
+    Philosophy: 'Textbooks Are All You Need' — quality over quantity.
+    """
+    return _load_hf_streaming(
+        "nampdn-ai/tiny-textbooks",
+        n_samples,
+        text_column="text",
+        split=split,
+        min_length=min_length,
+        max_length=max_length,
+        label="tiny-textbooks",
+    )
+
+
+def load_writingprompts(
+    n_samples: int = 50000,
+    split: str = "train",
+    min_length: int = 100,
+    max_length: int = 20000,
+) -> List[str]:
+    """Load story texts from the WritingPrompts dataset.
+
+    WritingPrompts contains ~300K human-written stories from creative
+    writing prompts. Stories range from 500-2000 tokens, making this
+    ideal for training coherent long-form generation.
+
+    HF: euclaise/writingprompts
+    Note: The dataset has 'prompt' and 'story' columns; we load stories.
+    """
+    from datasets import load_dataset
+
+    print(f"Loading WritingPrompts (euclaise/writingprompts, split={split})...")
+
+    dataset = None
+    for name in ["euclaise/writingprompts", "WritingPrompts/writingprompts"]:
+        try:
+            dataset = load_dataset(name, split=split, streaming=True)
+            print(f"  Loaded from '{name}'")
+            break
+        except Exception:
+            continue
+
+    if dataset is None:
+        raise CorpusError(
+            "Could not load WritingPrompts. Check internet and HuggingFace access."
+        )
+
+    texts: List[str] = []
+    scanned = 0
+    for example in dataset:
+        scanned += 1
+        if len(texts) >= n_samples:
+            break
+        # WritingPrompts has both 'prompt' and 'story' columns
+        # We want the story (long-form text), not the short prompt
+        text = example.get("story", example.get("text", "")).strip()
+        if not text:
+            continue
+        if min_length <= len(text) <= max_length:
+            texts.append(text)
+        if scanned % 10000 == 0:
+            print(f"  Scanned {scanned} examples, collected {len(texts)} texts...")
+        if scanned > n_samples * 5:
+            break
+
+    print(f"Loaded {len(texts)} texts from WritingPrompts (scanned {scanned}).")
+    return texts
+
+
+# ── DATASET REGISTRY ────────────────────────────────────────────────────
+
+DATASET_LOADERS = {
+    "fineweb-edu": load_fineweb_edu,
+    "tinystories": load_tinystories,
+    "tiny-textbooks": load_tiny_textbooks,
+    "writingprompts": load_writingprompts,
+}
+
+DEFAULT_DATASET = "tinystories"
 
 
 # ── TEXT / SEQUENCE UTILITIES ───────────────────────────────────────────

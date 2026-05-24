@@ -1,5 +1,5 @@
 """
-Regression tests for ISG-LM v18 — verify specific behaviors are preserved.
+Regression tests for ISG-LM — verify specific behaviors are preserved.
 
 Test categories:
   RT-01: KN backoff energy computed correctly

@@ -37,7 +37,11 @@ from .exceptions import (
     ValidationError, VocabularyError, POSValidationError,
     StateValidationError, ConfigError, ConfigurationError,
 )
-from .utils import get_rss_mb, TAG_PRIORITY, primary_pos_tag
+from .utils import (
+    get_rss_mb, TAG_PRIORITY, primary_pos_tag,
+    load_fineweb_edu, load_tinystories, load_tiny_textbooks,
+    load_writingprompts, DATASET_LOADERS, DEFAULT_DATASET,
+)
 
 # v18 modules
 from .reservoir import IntegerESN

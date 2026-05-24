@@ -38,7 +38,8 @@ from pathlib import Path
 # --- Configuration ---
 
 DEFAULT_SAMPLES = 500000
-DEFAULT_VOCAB = 4000
+DEFAULT_VOCAB = 2000  # TinyStories vocabulary ~2K; was 4000 for FineWeb-Edu
+DEFAULT_DATASET = "tinystories"
 DEFAULT_RECALL_SCALE = 1600
 DEFAULT_POS_RECALL_SCALE = 800
 DEFAULT_TOPIC_RECALL_SCALE = 400
@@ -57,12 +58,15 @@ def get_rss_mb() -> int:
     return _get_rss_mb()
 
 
-def find_cache_file(n_samples: int) -> str:
+def find_cache_file(n_samples: int, dataset_name: str = "fineweb") -> str:
     """Find the best cache file for the requested number of samples."""
     cache_files = {}
-    for f in CACHE_DIR.glob("cached_fineweb_*.json"):
+    glob_pattern = f"cached_{dataset_name}_*.json"
+    for f in CACHE_DIR.glob(glob_pattern):
         name = f.stem
-        size_str = name.split("_")[-1]
+        # Extract size from filename: cached_tinystories_500k.json → 500k
+        parts = name.split("_")
+        size_str = parts[-1]
         try:
             if size_str.endswith("k"):
                 size = int(size_str[:-1]) * 1000
@@ -85,9 +89,22 @@ def find_cache_file(n_samples: int) -> str:
     return None
 
 
-def load_data(n_samples: int) -> list:
-    """Load or download FineWeb-Edu data with proper cache handling."""
-    cache_path = find_cache_file(n_samples)
+def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
+    """Load or download data with proper cache handling.
+
+    Supported datasets: tinystories, tiny-textbooks, writingprompts, fineweb-edu
+    """
+    from ising_spin.utils import DATASET_LOADERS, DEFAULT_DATASET as _DEF
+
+    # Resolve dataset name
+    dataset_name = dataset_name or _DEF
+    if dataset_name not in DATASET_LOADERS:
+        print(f"  Unknown dataset '{dataset_name}', falling back to {_DEF}")
+        dataset_name = _DEF
+
+    # Sanitize dataset name for cache filenames
+    cache_dataset = dataset_name.replace("-", "_")
+    cache_path = find_cache_file(n_samples, cache_dataset)
 
     if cache_path:
         print(f"Loading cache: {cache_path}")
@@ -102,18 +119,18 @@ def load_data(n_samples: int) -> list:
         else:
             print(f"  Cache has {len(texts):,} texts but need {n_samples:,}")
 
-    print("No cached data found. Downloading from HuggingFace...")
-    from ising_spin.utils import load_fineweb_edu
+    print(f"No cached data found. Downloading {dataset_name} from HuggingFace...")
+    loader = DATASET_LOADERS[dataset_name]
     t0 = time.time()
-    texts = load_fineweb_edu(n_samples=n_samples)
+    texts = loader(n_samples=n_samples)
     print(f"  Downloaded {len(texts):,} texts in {time.time()-t0:.1f}s")
 
     if n_samples >= 1000000 and n_samples % 1000000 == 0:
-        cache_name = f"cached_fineweb_{n_samples // 1000000}m.json"
+        cache_name = f"cached_{cache_dataset}_{n_samples // 1000000}m.json"
     elif n_samples >= 1000 and n_samples % 1000 == 0:
-        cache_name = f"cached_fineweb_{n_samples // 1000}k.json"
+        cache_name = f"cached_{cache_dataset}_{n_samples // 1000}k.json"
     else:
-        cache_name = f"cached_fineweb_{n_samples}.json"
+        cache_name = f"cached_{cache_dataset}_{n_samples}.json"
 
     cache_file = CACHE_DIR / cache_name
     print(f"  Saving cache to: {cache_file}")
@@ -293,11 +310,11 @@ def main():
 
     # v18 module flags
     parser.add_argument("--enable-reservoir", action="store_true",
-                        help="Enable Integer ESN Reservoir (v18)")
+                        help="Enable Integer ESN Reservoir")
     parser.add_argument("--enable-coupling", action="store_true",
-                        help="Enable Factorial State Coupling (v18)")
+                        help="Enable Factorial State Coupling")
     parser.add_argument("--enable-vsa", action="store_true",
-                        help="Enable VSA/qFHRR compositional binding (v18)")
+                        help="Enable VSA/qFHRR compositional binding")
     parser.add_argument("--enable-all-v18", action="store_true",
                         help="Enable all v18 modules (reservoir + coupling + VSA)")
     parser.add_argument("--reservoir-dim", type=int, default=512,
@@ -310,6 +327,15 @@ def main():
                         help="VSA energy scale (default: 800)")
     parser.add_argument("--vsa-dim", type=int, default=512,
                         help="VSA phase vector dimension (default: 512)")
+
+    # Dataset selection
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
+                        choices=["tinystories", "tiny-textbooks", "writingprompts", "fineweb-edu"],
+                        help=f"Dataset to train on (default: {DEFAULT_DATASET})")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Curriculum: TinyStories → tiny-textbooks → WritingPrompts")
+    parser.add_argument("--vocab-min-freq", type=int, default=5,
+                        help="Min word frequency for vocab (default: 5, was 25 for FineWeb)")
 
     args = parser.parse_args()
 
@@ -342,7 +368,14 @@ def main():
     print("=" * 70, flush=True)
 
     # --- Load Data ---
-    texts = load_data(args.samples)
+    if args.curriculum:
+        # Curriculum learning: TinyStories → tiny-textbooks → WritingPrompts
+        print("\n" + "=" * 70, flush=True)
+        print("CURRICULUM LEARNING: Phase 1 — TinyStories (grammar)", flush=True)
+        print("=" * 70, flush=True)
+        texts = load_data(args.samples, dataset_name="tinystories")
+    else:
+        texts = load_data(args.samples, dataset_name=args.dataset)
     n_texts = len(texts)
     print(f"Using {n_texts:,} texts for training")
 
@@ -361,7 +394,10 @@ def main():
     print(f"    state_scale={state_scale}"
           f"{' [DISABLED]' if args.no_state else ''}")
     print(f"  STANDARD:")
+    print(f"    dataset={args.dataset}")
+    print(f"    curriculum={args.curriculum}")
     print(f"    vocab_max_size={args.vocab}")
+    print(f"    vocab_min_freq={args.vocab_min_freq}")
     print(f"    kn_backoff={kn_backoff}")
     print(f"    interpolated={interpolated}")
     print(f"    same_word_penalty={args.same_word_penalty}")
@@ -381,7 +417,7 @@ def main():
 
     model = IsingLMModel(
         # Vocabulary
-        vocab_min_freq=25,
+        vocab_min_freq=args.vocab_min_freq,
         vocab_max_size=args.vocab,
         # Word N-gram
         ngram_max_n=5,
@@ -519,6 +555,8 @@ def main():
     results = {
         "version": "18.0.0",
         "architecture": "Multi-Scale Abstract Recall + Document State + v18 Extensions",
+        "dataset": args.dataset,
+        "curriculum": args.curriculum,
         "timestamp": timestamp,
         "config": {
             "recall_scale": args.recall_scale,

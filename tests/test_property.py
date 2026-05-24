@@ -1,5 +1,5 @@
 """
-Property-based tests for ISG-LM v18.3 — invariants, contract, and monotonicity.
+Property-based tests for ISG-LM — invariants, contract, and monotonicity.
 
 Test categories:
   PT-INT-01: No float in energy hot path

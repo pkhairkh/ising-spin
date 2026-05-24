@@ -38,7 +38,9 @@ from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 from .utils import (
     get_rss_mb, primary_pos_tag, TAG_PRIORITY,
-    load_fineweb_edu, tokenize_texts, truncate_sequences,
+    load_fineweb_edu, load_tinystories, load_tiny_textbooks,
+    load_writingprompts, DATASET_LOADERS, DEFAULT_DATASET,
+    tokenize_texts, truncate_sequences,
 )
 from .exceptions import BuildError, ConfigurationError
 
@@ -202,8 +204,9 @@ class IsingLMModel:
         # Step 1: Load corpus
         # ------------------------------------------------------------------
         if texts is None:
-            print("[1/14] Loading corpus...")
-            texts = load_fineweb_edu(n_samples=n_samples)
+            print(f"[1/14] Loading corpus (default: {DEFAULT_DATASET})...")
+            loader = DATASET_LOADERS[DEFAULT_DATASET]
+            texts = loader(n_samples=n_samples)
             print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
         else:
             print(f"[1/14] Using provided texts ({len(texts)} texts)")
