@@ -152,9 +152,12 @@ class IsingLMGenerator:
         self._stats = {
             'total_positions': 0,
             'recall_hit': 0,
+            'pos_recall_hit': 0,
+            'topic_recall_hit': 0,
             'copy_used': 0,
             'same_word_blocked': 0,
             'closed_loop_blocked': 0,
+            'state_energy_sum': 0,
         }
 
     # ===================================================================
@@ -396,6 +399,34 @@ class IsingLMGenerator:
                 closed_class_run=closed_run,
             )
 
+            # Track per-scale recall diagnostics
+            recall_hit = False
+            pos_hit = False
+            topic_hit = False
+            if self.multiscale_recall is not None:
+                if self.multiscale_recall.word_index is not None:
+                    word_matches = self.multiscale_recall.word_index.lookup(words)
+                    if word_matches:
+                        recall_hit = True
+                        self._stats['recall_hit'] += 1
+                if self.multiscale_recall.pos_index is not None:
+                    pos_matches = self.multiscale_recall.pos_index.lookup(words)
+                    if pos_matches:
+                        pos_hit = True
+                        self._stats['pos_recall_hit'] += 1
+                if self.multiscale_recall.topic_index is not None:
+                    topic_matches = self.multiscale_recall.topic_index.lookup(words)
+                    if topic_matches:
+                        topic_hit = True
+                        self._stats['topic_recall_hit'] += 1
+
+            # Track state energy
+            if self.document_state is not None and self.document_state._built:
+                state_e = self.document_state.compute_energy(
+                    candidate_words, state_scale=self.state_scale
+                )
+                self._stats['state_energy_sum'] += int(state_e.sum())
+
             # Additional penalties that depend on context
             # Vectorised repetition penalty for recent words
             if len(words) > 0:
@@ -431,12 +462,7 @@ class IsingLMGenerator:
 
             # Track diagnostics
             self._stats['total_positions'] += 1
-            recall_hit = False
-            if self.word_index is not None:
-                recall_matches = self.word_index.lookup(words[:-1])
-                recall_hit = bool(recall_matches)
-            if recall_hit:
-                self._stats['recall_hit'] += 1
+            # recall_hit, pos_hit, topic_hit were tracked in STEP 4
 
             diagnostics.append({
                 'pos': pos,

@@ -57,6 +57,9 @@ class EnergyComputer:
         same_word_penalty: int = 200,
         closed_class_double_penalty: int = 50000,
         max_closed_class_run: int = 2,
+        # Recall interpolation settings (CRITICAL: must match training)
+        interpolated: bool = True,
+        kn_backoff: bool = True,
         # v18 energy scales
         coupling_scale: int = 200,
         reservoir_scale: int = 800,
@@ -75,6 +78,10 @@ class EnergyComputer:
         self.same_word_penalty = same_word_penalty
         self.closed_class_double_penalty = closed_class_double_penalty
         self.max_closed_class_run = max_closed_class_run
+
+        # Recall interpolation settings
+        self.interpolated = interpolated
+        self.kn_backoff = kn_backoff
 
         # v18 energy scales
         self.coupling_scale = coupling_scale
@@ -141,11 +148,17 @@ class EnergyComputer:
         energies = np.zeros(n_candidates, dtype=np.int64)
 
         # 1. Multi-scale recall energy (PRIMARY)
+        # CRITICAL: Forward interpolated and kn_backoff settings
+        # These MUST match the training configuration, otherwise POS/topic
+        # recall is severely weakened during generation.
         recall_energy = self.multiscale_recall.compute_energy(
             context_words, candidate_words,
             word_scale=self.recall_scale,
             pos_scale=self.pos_recall_scale,
             topic_scale=self.topic_recall_scale,
+            longest_only=not self.interpolated,
+            interpolated=self.interpolated,
+            kn_backoff=self.kn_backoff,
         )
         energies += recall_energy
 

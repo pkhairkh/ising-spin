@@ -457,6 +457,9 @@ class IsingLMModel:
             state_scale=self.state_scale,
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
+            # Recall interpolation settings (CRITICAL: must match training)
+            interpolated=self.interpolated,
+            kn_backoff=self.kn_backoff,
             # v18 energy scales
             coupling_scale=self.coupling_scale,
             reservoir_scale=self.reservoir_scale,

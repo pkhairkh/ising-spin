@@ -208,36 +208,33 @@ def print_recall_diagnostics(model):
 
     # Word recall diagnostics
     if model.word_index is not None:
-        word_stats = model.word_index.get_stats() if hasattr(model.word_index, 'get_stats') else {}
-        n_word_entries = getattr(model.word_index, 'n_entries', 0)
-        n_word_sequences = getattr(model.word_index, 'n_sequences', 0)
+        n_word_entries = sum(len(model.word_index.index[k]) for k in range(1, model.word_index.max_n + 1))
+        n_word_sequences = sum(
+            sum(len(v) for v in model.word_index.index[k].values())
+            for k in range(1, model.word_index.max_n + 1)
+        )
         print(f"  WORD n-gram index:")
         print(f"    entries={n_word_entries:,}, sequences={n_word_sequences:,}")
-        if word_stats:
-            for k, v in word_stats.items():
-                print(f"    {k}={v}")
 
     # POS recall diagnostics
     if model.pos_index is not None:
-        pos_stats = model.pos_index.get_stats() if hasattr(model.pos_index, 'get_stats') else {}
-        n_pos_entries = getattr(model.pos_index, 'n_entries', 0)
-        n_pos_sequences = getattr(model.pos_index, 'n_sequences', 0)
+        n_pos_entries = sum(len(model.pos_index.index[k]) for k in range(1, model.pos_index.max_n + 1))
+        n_pos_sequences = sum(
+            sum(len(v) for v in model.pos_index.index[k].values())
+            for k in range(1, model.pos_index.max_n + 1)
+        )
         print(f"  POS n-gram index:")
         print(f"    entries={n_pos_entries:,}, sequences={n_pos_sequences:,}")
-        if pos_stats:
-            for k, v in pos_stats.items():
-                print(f"    {k}={v}")
 
     # Topic recall diagnostics
     if model.topic_index is not None:
-        topic_stats = model.topic_index.get_stats() if hasattr(model.topic_index, 'get_stats') else {}
-        n_topic_entries = getattr(model.topic_index, 'n_entries', 0)
-        n_topic_sequences = getattr(model.topic_index, 'n_sequences', 0)
+        n_topic_entries = sum(len(model.topic_index.index[k]) for k in range(1, model.topic_index.max_n + 1))
+        n_topic_sequences = sum(
+            sum(len(v) for v in model.topic_index.index[k].values())
+            for k in range(1, model.topic_index.max_n + 1)
+        )
         print(f"  TOPIC n-gram index:")
         print(f"    entries={n_topic_entries:,}, sequences={n_topic_sequences:,}")
-        if topic_stats:
-            for k, v in topic_stats.items():
-                print(f"    {k}={v}")
 
     # Multi-scale recall summary
     if model.multiscale_recall is not None:
@@ -664,7 +661,9 @@ def main():
     print(f"GENERATION (PPL={full_ppl:.2f})")
     print(f"{'=' * 70}")
 
-    prompts = ["the history of", "science and technology", "research shows that"]
+    prompts = ["once upon a time", "there was a little", "the little girl"]
+    if args.dataset == "fineweb-edu" or (not args.curriculum and args.dataset != "tinystories"):
+        prompts = ["the history of", "science and technology", "research shows that"]
     generated_texts = []
 
     for i, prompt in enumerate(prompts):
