@@ -129,6 +129,7 @@ class NgramIndexBase:
         batch_size: int = 200000,
         prune_interval: int = 1,
         adaptive_min_count: bool = True,
+        oom_threshold_mb: int = 12000,
         **kwargs,
     ) -> None:
         """
@@ -140,6 +141,15 @@ class NgramIndexBase:
           3. Auto-scales min_count with corpus size
           4. Uses gc.collect() after each batch — returns memory to OS
           5. Memory monitoring with OOM early warning
+
+        Args:
+            sequences: Tokenized sequences.
+            batch_size: Number of sequences per batch.
+            prune_interval: Prune after this many batches.
+            adaptive_min_count: Auto-scale min_count with corpus size.
+            oom_threshold_mb: RSS threshold (MB) to trigger aggressive pruning.
+                              Default 12000; set lower for constrained devices.
+                              For 16GB Pi: 11000; for 8GB: 6000.
 
         Raises:
             IndexBuildError: if the index cannot be built.
@@ -192,19 +202,24 @@ class NgramIndexBase:
                 batch_idx, n_batches, processed, t_start
             )
 
-            # OOM early warning
+            # OOM early warning — threshold is now configurable
             rss = get_rss_mb()
-            if rss > 12000:
+            if rss > oom_threshold_mb:
                 print(
                     f"    [{self._label}] WARNING HIGH MEMORY "
-                    f"({rss:,}MB) -- aggressive pruning..."
+                    f"({rss:,}MB > {oom_threshold_mb:,}MB) -- aggressive pruning..."
                 )
-                self._prune_index(effective_min_count + 2)
-                gc.collect()
-                rss_after = get_rss_mb()
-                print(
-                    f"    [{self._label}] After aggressive prune: {rss_after:,}MB"
-                )
+                # Progressive pruning: increase min_count until under threshold
+                extra_prune = 2
+                while rss > oom_threshold_mb and extra_prune <= 8:
+                    self._prune_index(effective_min_count + extra_prune)
+                    gc.collect()
+                    rss = get_rss_mb()
+                    print(
+                        f"    [{self._label}] Prune min_count+{extra_prune}: "
+                        f"{rss:,}MB"
+                    )
+                    extra_prune += 2
 
         self._prune_index(self.min_count)
         self._built = True

@@ -113,6 +113,8 @@ class IsingLMModel:
         coupling_scale: int = 200,
         vsa_scale: int = 800,
         vsa_dim: int = 512,
+        # Memory budget
+        memory_budget_mb: int = 0,
     ):
         # Store all params
         self.vocab_min_freq = vocab_min_freq
@@ -151,6 +153,10 @@ class IsingLMModel:
         self.coupling_scale = coupling_scale
         self.vsa_scale = vsa_scale
         self.vsa_dim = vsa_dim
+
+        # Memory budget
+        self.memory_budget_mb = memory_budget_mb
+        self._oom_threshold_mb = int(memory_budget_mb * 0.80) if memory_budget_mb > 0 else 12000
 
         # Built during training
         self.vocab: Optional[Vocabulary] = None
@@ -278,6 +284,8 @@ class IsingLMModel:
         rss_pre = get_rss_mb()
         print(f"\n[7/14] Building word n-gram index..."
               f" (RSS: {rss_pre:,} MB)" if rss_pre > 0 else "\n[7/14] Building word n-gram index...")
+        if self.memory_budget_mb > 0:
+            print(f"  OOM threshold: {self._oom_threshold_mb:,} MB")
 
         # Cap n-gram sequences for OOM protection
         ngram_seqs = self.sequences
@@ -291,15 +299,32 @@ class IsingLMModel:
             max_n=self.ngram_max_n,
             min_count=self.ngram_min_count,
         )
-        if len(ngram_seqs) > 500000:
-            print(f"  Large corpus — using batched build")
-            self.word_index.build_batched(ngram_seqs, batch_size=200000)
+        # Always use batched build when memory budget is set (OOM protection)
+        use_batched = len(ngram_seqs) > 500000 or self.memory_budget_mb > 0
+        if use_batched:
+            if self.memory_budget_mb > 0:
+                print(f"  Memory budget active — using batched build (OOM threshold: {self._oom_threshold_mb:,} MB)")
+            else:
+                print(f"  Large corpus — using batched build")
+            self.word_index.build_batched(
+                ngram_seqs, batch_size=200000,
+                oom_threshold_mb=self._oom_threshold_mb,
+            )
         else:
             self.word_index.build(ngram_seqs)
 
         rss_post = get_rss_mb()
         if rss_post > 0:
             print(f"  Word index memory delta: +{rss_post - rss_pre:,} MB (RSS: {rss_post:,} MB)")
+
+        # Memory checkpoint after word index
+        if self.memory_budget_mb > 0 and rss_post > self._oom_threshold_mb:
+            print(f"  WARNING: RSS {rss_post:,} MB exceeds OOM threshold {self._oom_threshold_mb:,} MB")
+            print(f"  Forcing garbage collection...")
+            import gc
+            gc.collect()
+            rss_after_gc = get_rss_mb()
+            print(f"  After GC: {rss_after_gc:,} MB")
 
         # ------------------------------------------------------------------
         # Step 8: Build POS n-gram index
@@ -316,9 +341,12 @@ class IsingLMModel:
             min_count=self.pos_ngram_min_count,
             pos_system=self.pos_system,
         )
-        if len(ngram_seqs) > 500000:
-            print(f"  Large corpus — using batched build")
-            self.pos_index.build_batched(ngram_seqs, word_pos_tags=word_pos_tags, batch_size=200000)
+        if use_batched:
+            print(f"  POS: using batched build")
+            self.pos_index.build_batched(
+                ngram_seqs, word_pos_tags=word_pos_tags, batch_size=200000,
+                oom_threshold_mb=self._oom_threshold_mb,
+            )
         else:
             self.pos_index.build(ngram_seqs, word_pos_tags=word_pos_tags)
 
@@ -332,9 +360,12 @@ class IsingLMModel:
             n_topics=self.n_topics,
             word_topics=self.topic_assigner.word_topics,
         )
-        if len(ngram_seqs) > 500000:
-            print(f"  Large corpus — using batched build")
-            self.topic_index.build_batched(ngram_seqs, batch_size=200000)
+        if use_batched:
+            print(f"  TOPIC: using batched build")
+            self.topic_index.build_batched(
+                ngram_seqs, batch_size=200000,
+                oom_threshold_mb=self._oom_threshold_mb,
+            )
         else:
             self.topic_index.build(ngram_seqs)
 

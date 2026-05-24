@@ -46,6 +46,7 @@ DEFAULT_TOPIC_RECALL_SCALE = 400
 DEFAULT_STATE_SCALE = 200
 DEFAULT_POS_NGRAM_MAX_N = 15
 DEFAULT_TOPIC_NGRAM_MAX_N = 10
+DEFAULT_MEMORY_BUDGET = 0  # 0 = unlimited; set to MB for constrained devices (e.g. 14000 for 16GB Pi)
 
 # Cache directory
 CACHE_DIR = Path(__file__).parent
@@ -268,6 +269,105 @@ def print_recall_diagnostics(model):
         print(f"    state_energy_sum={state_energy}")
 
 
+def auto_tune_for_memory(
+    budget_mb: int,
+    n_samples: int,
+    word_ngram_max_n: int,
+    pos_ngram_max_n: int,
+    topic_ngram_max_n: int,
+    ngram_max_seqs: int,
+    reservoir_dim: int,
+    vsa_dim: int,
+) -> dict:
+    """Auto-tune parameters for a memory budget (MB).
+
+    Based on empirical memory profiling on 500K TinyStories:
+      - Tokenized data + vocab: ~2.6 GB for 500K
+      - Word 5-gram index: +6.5 GB (2M contexts, 3.2M continuations)
+      - POS 15-gram: +3-4 GB projected
+      - Topic 10-gram: +1-2 GB projected
+      - v18 modules: +0.5-1 GB
+
+    Strategy: reduce n-gram orders and cap sequences to fit budget.
+    Target RSS = budget_mb * 0.85 (leave 15% headroom for OS).
+
+    Returns dict of adjusted parameters.
+    """
+    target_mb = int(budget_mb * 0.85)
+    adjustments = {}
+
+    # Reserve for tokenization, vocab, POS system, topic, etc.
+    base_mb = 2500  # ~2.5 GB for data structures
+    if n_samples > 200000:
+        base_mb += (n_samples - 200000) // 200000 * 500  # ~500 MB per 200K extra
+    v18_mb = 0
+
+    # Estimate v18 module memory
+    if reservoir_dim > 0:
+        v18_mb += reservoir_dim * 2 // 1000  # rough estimate
+    if vsa_dim > 0:
+        v18_mb += vsa_dim * 2 // 1000
+
+    available_mb = target_mb - base_mb - v18_mb
+    if available_mb < 1000:
+        print(f"  MEMORY WARNING: Only {available_mb} MB available for indexes!")
+        available_mb = max(1000, available_mb)
+
+    # Allocate index budget: word gets 50%, POS 30%, topic 20%
+    word_budget = int(available_mb * 0.50)
+    pos_budget = int(available_mb * 0.30)
+    topic_budget = int(available_mb * 0.20)
+
+    # Word n-gram: each additional order roughly doubles contexts
+    # 5-gram on 500K = ~6.5 GB, 4-gram = ~4 GB, 3-gram = ~2 GB
+    if word_budget < 3000:
+        adjustments['ngram_max_n'] = 3
+    elif word_budget < 5000:
+        adjustments['ngram_max_n'] = 4
+    else:
+        adjustments['ngram_max_n'] = word_ngram_max_n  # keep original
+
+    # POS n-gram: 13 POS types, so contexts are smaller but max_n=15 is huge
+    # POS 7-gram: ~1.5 GB, POS 10-gram: ~2.5 GB, POS 15-gram: ~4 GB
+    if pos_budget < 1500:
+        adjustments['pos_ngram_max_n'] = 5
+    elif pos_budget < 2500:
+        adjustments['pos_ngram_max_n'] = 7
+    elif pos_budget < 3500:
+        adjustments['pos_ngram_max_n'] = 10
+    else:
+        adjustments['pos_ngram_max_n'] = pos_ngram_max_n
+
+    # Topic n-gram: 16 topics, very compact contexts
+    # Topic 5-gram: ~0.5 GB, Topic 8-gram: ~1 GB, Topic 10-gram: ~1.5 GB
+    if topic_budget < 800:
+        adjustments['topic_ngram_max_n'] = 4
+    elif topic_budget < 1200:
+        adjustments['topic_ngram_max_n'] = 6
+    else:
+        adjustments['topic_ngram_max_n'] = topic_ngram_max_n
+
+    # Cap n-gram sequences: fewer sequences = smaller indexes
+    # For 16GB Pi, 200K sequences is safe; 100K for 8GB
+    if budget_mb <= 8000:
+        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 100000)
+    elif budget_mb <= 16000:
+        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 250000)
+    elif budget_mb <= 32000:
+        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 400000)
+    # else: keep original
+
+    # Reduce reservoir/VSA dims for very constrained devices
+    if budget_mb <= 8000:
+        adjustments['reservoir_dim'] = min(reservoir_dim, 128)
+        adjustments['vsa_dim'] = min(vsa_dim, 256)
+    elif budget_mb <= 16000:
+        adjustments['reservoir_dim'] = min(reservoir_dim, 256)
+        adjustments['vsa_dim'] = min(vsa_dim, 512)
+
+    return adjustments
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="v18.0 Training — Multi-Scale Abstract Recall + v18 Extensions"
@@ -337,6 +437,11 @@ def main():
     parser.add_argument("--vocab-min-freq", type=int, default=5,
                         help="Min word frequency for vocab (default: 5, was 25 for FineWeb)")
 
+    # Memory budget
+    parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
+                        help="Memory budget in MB (0=unlimited; 14000=16GB Pi, 7000=8GB Pi). "
+                             "Auto-adjusts n-gram orders, sequence caps, and v18 dims.")
+
     args = parser.parse_args()
 
     # --- Apply ablation flags ---
@@ -351,6 +456,40 @@ def main():
     enable_reservoir = args.enable_reservoir or args.enable_all_v18
     enable_coupling = args.enable_coupling or args.enable_all_v18
     enable_vsa = args.enable_vsa or args.enable_all_v18
+
+    # --- Memory budget auto-tuning ---
+    mem_adjustments = {}
+    if args.memory_budget > 0:
+        mem_adjustments = auto_tune_for_memory(
+            budget_mb=args.memory_budget,
+            n_samples=args.samples,
+            word_ngram_max_n=5,
+            pos_ngram_max_n=args.pos_ngram_max_n,
+            topic_ngram_max_n=args.topic_ngram_max_n,
+            ngram_max_seqs=args.ngram_max_seqs,
+            reservoir_dim=args.reservoir_dim,
+            vsa_dim=args.vsa_dim,
+        )
+        print(f"\n{'=' * 70}")
+        print(f"MEMORY BUDGET: {args.memory_budget:,} MB (target RSS: {int(args.memory_budget * 0.85):,} MB)")
+        print(f"{'=' * 70}")
+        for key, val in mem_adjustments.items():
+            orig = {
+                'ngram_max_n': 5, 'pos_ngram_max_n': args.pos_ngram_max_n,
+                'topic_ngram_max_n': args.topic_ngram_max_n,
+                'ngram_max_seqs': args.ngram_max_seqs,
+                'reservoir_dim': args.reservoir_dim, 'vsa_dim': args.vsa_dim,
+            }.get(key, '?')
+            print(f"  {key}: {orig} → {val}")
+        print(f"{'=' * 70}")
+
+    # Apply memory adjustments
+    effective_ngram_max_n = mem_adjustments.get('ngram_max_n', 5)
+    effective_pos_ngram_max_n = mem_adjustments.get('pos_ngram_max_n', args.pos_ngram_max_n)
+    effective_topic_ngram_max_n = mem_adjustments.get('topic_ngram_max_n', args.topic_ngram_max_n)
+    effective_ngram_max_seqs = mem_adjustments.get('ngram_max_seqs', args.ngram_max_seqs)
+    effective_reservoir_dim = mem_adjustments.get('reservoir_dim', args.reservoir_dim)
+    effective_vsa_dim = mem_adjustments.get('vsa_dim', args.vsa_dim)
 
     # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -383,12 +522,12 @@ def main():
     print(f"\n{'=' * 70}")
     print(f"CONFIG: Multi-Scale Abstract Recall + Document State")
     print(f"  WORD RECALL:")
-    print(f"    ngram_max_n=5, recall_scale={args.recall_scale}")
+    print(f"    ngram_max_n={effective_ngram_max_n}, recall_scale={args.recall_scale}")
     print(f"  POS RECALL:")
-    print(f"    pos_ngram_max_n={args.pos_ngram_max_n}, pos_recall_scale={pos_recall_scale}"
+    print(f"    pos_ngram_max_n={effective_pos_ngram_max_n}, pos_recall_scale={pos_recall_scale}"
           f"{' [DISABLED]' if args.no_pos_recall else ''}")
     print(f"  TOPIC RECALL:")
-    print(f"    topic_ngram_max_n={args.topic_ngram_max_n}, topic_recall_scale={topic_recall_scale}"
+    print(f"    topic_ngram_max_n={effective_topic_ngram_max_n}, topic_recall_scale={topic_recall_scale}"
           f"{' [DISABLED]' if args.no_topic_recall else ''}")
     print(f"  DOCUMENT STATE:")
     print(f"    state_scale={state_scale}"
@@ -403,13 +542,16 @@ def main():
     print(f"    same_word_penalty={args.same_word_penalty}")
     print(f"    n_topics={args.n_topics}")
     print(f"    n_samples={n_texts:,}")
+    print(f"    ngram_max_seqs={effective_ngram_max_seqs:,}")
+    if args.memory_budget > 0:
+        print(f"    memory_budget={args.memory_budget:,} MB")
     print(f"  v18 EXTENSIONS:")
     print(f"    reservoir={'ENABLED' if enable_reservoir else 'DISABLED'}"
-          f" (dim={args.reservoir_dim}, scale={args.reservoir_scale})")
+          f" (dim={effective_reservoir_dim}, scale={args.reservoir_scale})")
     print(f"    coupling={'ENABLED' if enable_coupling else 'DISABLED'}"
           f" (scale={args.coupling_scale})")
     print(f"    vsa={'ENABLED' if enable_vsa else 'DISABLED'}"
-          f" (dim={args.vsa_dim}, scale={args.vsa_scale})")
+          f" (dim={effective_vsa_dim}, scale={args.vsa_scale})")
     print(f"{'=' * 70}")
 
     # --- Train ---
@@ -420,15 +562,15 @@ def main():
         vocab_min_freq=args.vocab_min_freq,
         vocab_max_size=args.vocab,
         # Word N-gram
-        ngram_max_n=5,
+        ngram_max_n=effective_ngram_max_n,
         ngram_min_count=args.ngram_min_count,
-        ngram_max_sequences=args.ngram_max_seqs,
+        ngram_max_sequences=effective_ngram_max_seqs,
         # POS N-gram
-        pos_ngram_max_n=args.pos_ngram_max_n,
+        pos_ngram_max_n=effective_pos_ngram_max_n,
         pos_ngram_min_count=2,
         # Topic
         n_topics=args.n_topics,
-        topic_ngram_max_n=args.topic_ngram_max_n,
+        topic_ngram_max_n=effective_topic_ngram_max_n,
         topic_ngram_min_count=3,
         # Energy scales
         recall_scale=args.recall_scale,
@@ -453,11 +595,13 @@ def main():
         enable_reservoir=enable_reservoir,
         enable_coupling=enable_coupling,
         enable_vsa=enable_vsa,
-        reservoir_dim=args.reservoir_dim,
+        reservoir_dim=effective_reservoir_dim,
         reservoir_scale=args.reservoir_scale,
         coupling_scale=args.coupling_scale,
         vsa_scale=args.vsa_scale,
-        vsa_dim=args.vsa_dim,
+        vsa_dim=effective_vsa_dim,
+        # Memory budget
+        memory_budget_mb=args.memory_budget,
     )
 
     t_start = time.time()
