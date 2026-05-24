@@ -435,6 +435,58 @@ def main():
     parser.add_argument("--vsa-dim", type=int, default=512,
                         help="VSA phase vector dimension (default: 512)")
 
+    # v19 macro-spin layer flags
+    parser.add_argument("--enable-macro", action="store_true",
+                        help="Enable v19 Macro-Spin Layer (entity+phase+scene coupling)")
+    parser.add_argument("--macro-entity-scale", type=int, default=800,
+                        help="Entity macro-spin energy scale (default: 800)")
+    parser.add_argument("--macro-phase-scale", type=int, default=600,
+                        help="Narrative phase energy scale (default: 600)")
+    parser.add_argument("--macro-scene-scale", type=int, default=400,
+                        help="Scene macro-spin energy scale (default: 400)")
+    parser.add_argument("--macro-scale", type=int, default=800,
+                        help="Global macro-spin scale multiplier (default: 800)")
+
+    # v19.1 Multi-Timescale Reservoir flags
+    parser.add_argument("--enable-mtr", action="store_true",
+                        help="Enable v19.1 Multi-Timescale Reservoir (EMERGENT long-range coherence)")
+    parser.add_argument("--mtr-dims", type=int, default=128,
+                        help="Per-timescale reservoir dimension (default: 128)")
+
+    # v20 Semantic Spin Resonance flags
+    parser.add_argument("--enable-ssr", action="store_true",
+                        help="Enable v20 Semantic Spin Resonance (EMERGENT understanding via frustrated dynamics)")
+    parser.add_argument("--ssr-dim", type=int, default=256,
+                        help="SSR spin dimension (default: 256)")
+    parser.add_argument("--ssr-alpha", type=int, default=128,
+                        help="SSR external field strength in Q8 (default: 128 ≈ 0.5)")
+    parser.add_argument("--ssr-eta", type=int, default=2,
+                        help="SSR Hebbian learning rate for episodic memory (default: 2)")
+    parser.add_argument("--ssr-scale", type=int, default=1200,
+                        help="SSR energy scale (default: 1200)")
+    parser.add_argument("--ssr-temperature", type=int, default=50,
+                        help="SSR Metropolis temperature for spin dynamics (default: 50)")
+
+    # v21 Learned Latent Spin Glass flags
+    parser.add_argument("--enable-latent-spin", action="store_true",
+                        help="Enable v21 Learned Latent Spin Glass (EMERGENT understanding from LEARNED physics)")
+    parser.add_argument("--latent-spin-dim", type=int, default=256,
+                        help="Latent spin dimension (default: 256)")
+    parser.add_argument("--latent-spin-alpha", type=int, default=128,
+                        help="Latent spin external field strength in Q8 (default: 128)")
+    parser.add_argument("--latent-spin-eta", type=int, default=2,
+                        help="Latent spin Hebbian learning rate (default: 2)")
+    parser.add_argument("--latent-spin-scale", type=int, default=1200,
+                        help="Latent spin direct alignment energy scale (default: 1200)")
+    parser.add_argument("--latent-spin-coupling-scale", type=int, default=800,
+                        help="Latent spin coupling-mediated alignment energy scale (default: 800)")
+    parser.add_argument("--latent-spin-temperature", type=int, default=0,
+                        help="Latent spin Metropolis temperature (default: 0, deterministic)")
+    parser.add_argument("--latent-spin-context-window", type=int, default=5,
+                        help="Context window for spin vector learning (default: 5)")
+    parser.add_argument("--latent-spin-n-j-windows", type=int, default=200000,
+                        help="Number of windows for J_learned (default: 200K)")
+
     # Dataset selection
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
                         choices=["tinystories", "tiny-textbooks", "writingprompts", "fineweb-edu"],
@@ -559,6 +611,23 @@ def main():
           f" (scale={args.coupling_scale})")
     print(f"    vsa={'ENABLED' if enable_vsa else 'DISABLED'}"
           f" (dim={effective_vsa_dim}, scale={args.vsa_scale})")
+    print(f"  v19 MACRO-SPIN LAYER:")
+    print(f"    macro={'ENABLED' if args.enable_macro else 'DISABLED'}"
+          f" (entity_scale={args.macro_entity_scale}, phase_scale={args.macro_phase_scale},"
+          f" scene_scale={args.macro_scene_scale}, global_scale={args.macro_scale})")
+    print(f"  v19.1 MULTI-TIMESCALE RESERVOIR:")
+    print(f"    mtr={'ENABLED' if args.enable_mtr else 'DISABLED'}"
+          f" (dims={args.mtr_dims}, timescales=fast+medium+slow)")
+    print(f"  v20 SEMANTIC SPIN RESONANCE:")
+    print(f"    ssr={'ENABLED' if args.enable_ssr else 'DISABLED'}"
+          f" (D={args.ssr_dim}, alpha_q8={args.ssr_alpha}, eta={args.ssr_eta},"
+          f" scale={args.ssr_scale}, temp={args.ssr_temperature})")
+    print(f"  v21 LEARNED LATENT SPIN GLASS:")
+    print(f"    latent_spin={'ENABLED' if args.enable_latent_spin else 'DISABLED'}"
+          f" (D={args.latent_spin_dim}, alpha_q8={args.latent_spin_alpha},"
+          f" eta={args.latent_spin_eta}, scale={args.latent_spin_scale},"
+          f" coupling_scale={args.latent_spin_coupling_scale},"
+          f" temp={args.latent_spin_temperature})")
     print(f"{'=' * 70}")
 
     # --- Train ---
@@ -607,6 +676,32 @@ def main():
         coupling_scale=args.coupling_scale,
         vsa_scale=args.vsa_scale,
         vsa_dim=effective_vsa_dim,
+        # v19: Macro-spin layer
+        enable_macro=args.enable_macro,
+        macro_entity_scale=args.macro_entity_scale,
+        macro_phase_scale=args.macro_phase_scale,
+        macro_scene_scale=args.macro_scene_scale,
+        macro_scale=args.macro_scale,
+        # v19.1: Multi-Timescale Reservoir
+        enable_mtr=args.enable_mtr,
+        mtr_dims=args.mtr_dims,
+        # v20: Semantic Spin Resonance
+        enable_ssr=args.enable_ssr,
+        ssr_dim=args.ssr_dim,
+        ssr_alpha_q8=args.ssr_alpha,
+        ssr_eta_episodic=args.ssr_eta,
+        ssr_scale=args.ssr_scale,
+        ssr_temperature=args.ssr_temperature,
+        # v21: Learned Latent Spin Glass
+        enable_latent_spin=args.enable_latent_spin,
+        latent_spin_dim=args.latent_spin_dim,
+        latent_spin_alpha_q8=args.latent_spin_alpha,
+        latent_spin_eta_episodic=args.latent_spin_eta,
+        latent_spin_scale=args.latent_spin_scale,
+        latent_spin_coupling_scale=args.latent_spin_coupling_scale,
+        latent_spin_temperature=args.latent_spin_temperature,
+        latent_spin_context_window=args.latent_spin_context_window,
+        latent_spin_n_j_windows=args.latent_spin_n_j_windows,
         # Memory budget
         memory_budget_mb=args.memory_budget,
     )
@@ -717,8 +812,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "18.0.0",
-        "architecture": "Multi-Scale Abstract Recall + Document State + v18 Extensions",
+        "version": "21.0.0",
+        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (Learned)",
         "dataset": args.dataset,
         "curriculum": args.curriculum,
         "timestamp": timestamp,

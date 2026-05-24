@@ -32,10 +32,12 @@ from typing import Dict, List, Optional, Tuple
 
 from .vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
 from .vocabulary.pos import COARSE_POS_TAGS, POS2IDX, IDX2POS, N_POS, CLOSED_CLASS
+from .macro.narrative_phase import N_PHASES
 from .recall import WordNgramIndex, PosNgramIndex, TopicNgramIndex, MultiScaleRecall
 from .state import DocumentState
 from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
+from .latent.latent_spin import LatentSpinGlass
 from .utils import (
     get_rss_mb, primary_pos_tag, TAG_PRIORITY,
     load_fineweb_edu, load_tinystories, load_tiny_textbooks,
@@ -113,6 +115,34 @@ class IsingLMModel:
         coupling_scale: int = 200,
         vsa_scale: int = 800,
         vsa_dim: int = 512,
+        # v19: Macro-spin layer
+        enable_macro: bool = False,
+        macro_entity_scale: int = 800,
+        macro_phase_scale: int = 600,
+        macro_scene_scale: int = 400,
+        macro_scale: int = 800,
+        # v19.1: Multi-Timescale Reservoir (EMERGENT long-range coherence)
+        enable_mtr: bool = False,
+        mtr_dims: int = 128,
+        # v20: Semantic Spin Resonance (EMERGENT understanding via frustrated dynamics)
+        enable_ssr: bool = False,
+        ssr_dim: int = 256,
+        ssr_alpha_q8: int = 128,
+        ssr_eta_episodic: int = 2,
+        ssr_n_mf_sweeps: int = 2,
+        ssr_scale: int = 1200,
+        ssr_temperature: int = 50,
+        # v21: Learned Latent Spin Glass (GENUINE understanding from learned physics)
+        enable_latent_spin: bool = False,
+        latent_spin_dim: int = 256,
+        latent_spin_alpha_q8: int = 128,
+        latent_spin_eta_episodic: int = 2,
+        latent_spin_n_mf_sweeps: int = 2,
+        latent_spin_scale: int = 1200,
+        latent_spin_coupling_scale: int = 800,
+        latent_spin_temperature: int = 0,
+        latent_spin_context_window: int = 5,
+        latent_spin_n_j_windows: int = 200000,
         # Memory budget
         memory_budget_mb: int = 0,
     ):
@@ -154,6 +184,38 @@ class IsingLMModel:
         self.vsa_scale = vsa_scale
         self.vsa_dim = vsa_dim
 
+        # v19: Macro-spin layer
+        self.enable_macro = enable_macro
+        self.macro_entity_scale = macro_entity_scale
+        self.macro_phase_scale = macro_phase_scale
+        self.macro_scene_scale = macro_scene_scale
+        self.macro_scale = macro_scale
+
+        # v19.1: Multi-Timescale Reservoir
+        self.enable_mtr = enable_mtr
+        self.mtr_dims = mtr_dims
+
+        # v20: Semantic Spin Resonance
+        self.enable_ssr = enable_ssr
+        self.ssr_dim = ssr_dim
+        self.ssr_alpha_q8 = ssr_alpha_q8
+        self.ssr_eta_episodic = ssr_eta_episodic
+        self.ssr_n_mf_sweeps = ssr_n_mf_sweeps
+        self.ssr_scale = ssr_scale
+        self.ssr_temperature = ssr_temperature
+
+        # v21: Learned Latent Spin Glass
+        self.enable_latent_spin = enable_latent_spin
+        self.latent_spin_dim = latent_spin_dim
+        self.latent_spin_alpha_q8 = latent_spin_alpha_q8
+        self.latent_spin_eta_episodic = latent_spin_eta_episodic
+        self.latent_spin_n_mf_sweeps = latent_spin_n_mf_sweeps
+        self.latent_spin_scale = latent_spin_scale
+        self.latent_spin_coupling_scale = latent_spin_coupling_scale
+        self.latent_spin_temperature = latent_spin_temperature
+        self.latent_spin_context_window = latent_spin_context_window
+        self.latent_spin_n_j_windows = latent_spin_n_j_windows
+
         # Memory budget
         self.memory_budget_mb = memory_budget_mb
         self._oom_threshold_mb = int(memory_budget_mb * 0.80) if memory_budget_mb > 0 else 12000
@@ -173,6 +235,18 @@ class IsingLMModel:
         # v18 built modules
         self.reservoir = None  # IntegerESN
         self.vsa_encoder = None  # VSAEncoder
+
+        # v19: Macro-spin layer
+        self.macro_coupling = None  # MacroSpinCoupling
+
+        # v19.1: Multi-Timescale Reservoir
+        self.mtr = None  # MultiTimescaleReservoir
+
+        # v20: Semantic Spin Resonance
+        self.ssr = None  # SemanticSpinResonance
+
+        # v21: Learned Latent Spin Glass
+        self.latent_spin = None  # LatentSpinGlass
 
         self.sequences: Optional[List[List[int]]] = None
         self.test_sequences: Optional[List[List[int]]] = None
@@ -444,7 +518,146 @@ class IsingLMModel:
             self.vsa_encoder = None
 
         # ------------------------------------------------------------------
-        # Step 12: Build energy computer (with v18 modules)
+        # Step 11e: Build macro-spin layer (v19) — LONG-RANGE COHERENCE
+        # ------------------------------------------------------------------
+        if self.enable_macro:
+            print(f"\n[11e] Building Macro-Spin Layer (v19)...")
+            from .macro import EntityTracker, NarrativePhaseTracker, SceneTracker, MacroSpinCoupling
+
+            entity_tracker = EntityTracker(
+                vocab_size=len(self.vocab),
+                entity_scale=self.macro_entity_scale,
+                idx2word=self.vocab.idx2word,
+            )
+            phase_tracker = NarrativePhaseTracker(
+                vocab_size=len(self.vocab),
+                phase_scale=self.macro_phase_scale,
+                idx2word=self.vocab.idx2word,
+            )
+            scene_tracker = SceneTracker(
+                vocab_size=len(self.vocab),
+                scene_scale=self.macro_scene_scale,
+                idx2word=self.vocab.idx2word,
+            )
+
+            self.macro_coupling = MacroSpinCoupling(
+                entity_tracker=entity_tracker,
+                phase_tracker=phase_tracker,
+                scene_tracker=scene_tracker,
+                entity_scale=self.macro_entity_scale,
+                phase_scale=self.macro_phase_scale,
+                scene_scale=self.macro_scene_scale,
+            )
+
+            # Build affinity matrices from training data
+            self.macro_coupling.build(self.sequences, idx2word=self.vocab.idx2word, raw_texts=texts)
+
+            # Print diagnostics
+            diag = self.macro_coupling.get_diagnostics()
+            print(f"  Macro-Spin Layer active:")
+            if 'entity' in diag:
+                ed = diag['entity']
+                print(f"    Entity tracker: {ed.get('stats', {}).get('entity_mentions', 0)} entity mentions in training")
+            if 'phase' in diag:
+                print(f"    Phase tracker: {N_PHASES} phases")
+            if 'scene' in diag:
+                sd = diag['scene']
+                print(f"    Scene tracker: {sd.get('stats', {}).get('scene_activations', 0)} scene activations in training")
+        else:
+            print("\n[11e] Macro-spin layer: DISABLED")
+            self.macro_coupling = None
+
+        # ------------------------------------------------------------------
+        # Step 11f: Build Multi-Timescale Reservoir (v19.1)
+        # ------------------------------------------------------------------
+        if self.enable_mtr:
+            print(f"\n[11f] Building Multi-Timescale Reservoir (v19.1)...")
+            from .reservoir.multi_timescale import MultiTimescaleReservoir
+
+            D = self.mtr_dims
+            self.mtr = MultiTimescaleReservoir(
+                vocab_size=len(self.vocab),
+                timescales=[
+                    ("fast",   27853, D, 400),   # α≈0.85, ξ≈10
+                    ("medium", 31130, D, 600),   # α≈0.95, ξ≈50
+                    ("slow",   32667, D, 1000),  # α≈0.997, ξ≈500
+                ],
+            )
+            self.mtr.build(self.sequences)
+            diag = self.mtr.get_diagnostics()
+            for name in ["fast", "medium", "slow"]:
+                if name in diag:
+                    info = diag[name]
+                    print(f"    {name}: α={info['alpha']}, ξ(95%)={info['xi_95pct']:.0f} tokens, "
+                          f"{info['n_words']} words, h_norm={info['h_norm']}")
+        else:
+            print("\n[11f] Multi-Timescale Reservoir: DISABLED")
+            self.mtr = None
+
+        # ------------------------------------------------------------------
+        # Step 11g: Build Semantic Spin Resonance (v20) — EMERGENT UNDERSTANDING
+        # ------------------------------------------------------------------
+        if self.enable_ssr:
+            print(f"\n[11g] Building Semantic Spin Resonance (v20)...")
+            from .ssr import SemanticSpinResonance
+
+            self.ssr = SemanticSpinResonance(
+                vocab_size=len(self.vocab),
+                D=self.ssr_dim,
+                alpha_q8=self.ssr_alpha_q8,
+                eta_episodic=self.ssr_eta_episodic,
+                n_mf_sweeps=self.ssr_n_mf_sweeps,
+                ssr_scale=self.ssr_scale,
+                temperature=self.ssr_temperature,
+            )
+            self.ssr.build(self.sequences)
+            diag = self.ssr.get_diagnostics()
+            print(f"    SSR: D={diag['D']}, alpha_q8={diag['alpha_q8']}, "
+                  f"eta={diag['eta_episodic']}, temp={diag['temperature']}")
+            if 'sigma_magnetization' in diag:
+                print(f"    Magnetization: {diag['sigma_magnetization']:.3f}")
+            if 'episodic_sparsity' in diag:
+                print(f"    Episodic sparsity: {diag['episodic_sparsity']:.3f}")
+            if 'avg_flips_per_step' in diag:
+                print(f"    Avg flips/step: {diag['avg_flips_per_step']:.1f}")
+            if 'avg_hamming' in diag:
+                print(f"    Avg Hamming distance: {diag['avg_hamming']:.1f}")
+        else:
+            print("\n[11g] Semantic Spin Resonance: DISABLED")
+            self.ssr = None
+
+        # ------------------------------------------------------------------
+        # Step 11h: Build Learned Latent Spin Glass (v21) — GENUINE UNDERSTANDING
+        # ------------------------------------------------------------------
+        if self.enable_latent_spin:
+            print(f"\n[11h] Building Learned Latent Spin Glass (v21)...")
+            self.latent_spin = LatentSpinGlass(
+                vocab_size=len(self.vocab),
+                D=self.latent_spin_dim,
+                alpha_q8=self.latent_spin_alpha_q8,
+                eta_episodic=self.latent_spin_eta_episodic,
+                n_mf_sweeps=self.latent_spin_n_mf_sweeps,
+                latent_scale=self.latent_spin_scale,
+                coupling_scale=self.latent_spin_coupling_scale,
+                temperature=self.latent_spin_temperature,
+                context_window=self.latent_spin_context_window,
+                n_j_windows=self.latent_spin_n_j_windows,
+            )
+            self.latent_spin.build(self.sequences)
+            diag = self.latent_spin.get_diagnostics()
+            print(f"    Latent Spin: D={diag['D']}, alpha_q8={diag['alpha_q8']}, "
+                  f"eta={diag['eta_episodic']}, temp={diag['temperature']}")
+            if 'sigma_magnetization' in diag:
+                print(f"    Magnetization: {diag['sigma_magnetization']:.3f}")
+            if 'j_learned_max' in diag:
+                print(f"    J_learned: max_abs={diag['j_learned_max']}, "
+                      f"nnz={diag['j_learned_nnz']}")
+        else:
+            print("\n[11h] Learned Latent Spin Glass: DISABLED")
+            self.latent_spin = None
+
+        # ------------------------------------------------------------------
+        # Step 12: Build energy computer (with v18+v19+v20 modules)
         # ------------------------------------------------------------------
         print("\n[12/14] Building energy computer...")
         self.energy_computer = EnergyComputer(
@@ -467,6 +680,16 @@ class IsingLMModel:
             # v18 modules
             reservoir=self.reservoir,
             vsa_encoder=self.vsa_encoder,
+            # v19: Macro-spin layer
+            macro_coupling=self.macro_coupling,
+            macro_scale=self.macro_scale,
+            # v19.1: Multi-Timescale Reservoir
+            mtr=self.mtr,
+            # v20: Semantic Spin Resonance
+            ssr=self.ssr,
+            ssr_scale=self.ssr_scale,
+            # v21: Learned Latent Spin Glass
+            latent_spin=self.latent_spin,
         )
         v18_terms = []
         if self.enable_coupling:
@@ -479,6 +702,22 @@ class IsingLMModel:
             print(f"  v18 energy terms: {', '.join(v18_terms)}")
         else:
             print(f"  v18 energy terms: NONE (base model)")
+        if self.enable_macro:
+            print(f"  v19 macro-spin: entity+phase+scene (scale={self.macro_scale})")
+        else:
+            print(f"  v19 macro-spin: DISABLED")
+        if self.enable_mtr:
+            print(f"  v19.1 MTR: fast+medium+slow reservoirs (EMERGENT coherence)")
+        else:
+            print(f"  v19.1 MTR: DISABLED")
+        if self.enable_ssr:
+            print(f"  v20 SSR: D={self.ssr_dim} binary spins + Hebbian episodic memory (EMERGENT understanding)")
+        else:
+            print(f"  v20 SSR: DISABLED")
+        if self.enable_latent_spin:
+            print(f"  v21 Latent Spin: D={self.latent_spin_dim} LEARNED spins + LEARNED coupling (GENUINE understanding)")
+        else:
+            print(f"  v21 Latent Spin: DISABLED")
 
         # ------------------------------------------------------------------
         # Step 13: Auto-calibrate beta
@@ -631,6 +870,14 @@ class IsingLMModel:
             state_scale=self.state_scale,
             # v18: ESN reservoir
             reservoir=self.reservoir,
+            # v19: Macro-spin layer
+            macro_coupling=self.macro_coupling,
+            # v19.1: Multi-Timescale Reservoir
+            mtr=self.mtr,
+            # v20: Semantic Spin Resonance
+            ssr=self.ssr,
+            # v21: Learned Latent Spin Glass
+            latent_spin=self.latent_spin,
         )
 
     # ===================================================================

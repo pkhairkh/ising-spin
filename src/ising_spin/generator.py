@@ -26,10 +26,14 @@ from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 from .utils import TAG_PRIORITY, primary_pos_tag, validate_positive
 from .exceptions import ValidationError
 
-# v18 optional imports (TYPE_CHECKING only to avoid circular imports)
+# v18/v19 optional imports (TYPE_CHECKING only to avoid circular imports)
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .reservoir.integer_esn import IntegerESN
+    from .reservoir.multi_timescale import MultiTimescaleReservoir
+    from .macro import MacroSpinCoupling
+    from .ssr.semantic_spin import SemanticSpinResonance
+    from .latent.latent_spin import LatentSpinGlass
 
 
 class IsingLMGenerator:
@@ -84,6 +88,14 @@ class IsingLMGenerator:
         state_scale: int = 200,
         # v18 optional modules
         reservoir: Optional["IntegerESN"] = None,
+        # v19: Macro-spin layer for long-range coherence
+        macro_coupling: Optional["MacroSpinCoupling"] = None,
+        # v19.1: Multi-Timescale Reservoir (EMERGENT long-range coherence)
+        mtr: Optional["MultiTimescaleReservoir"] = None,
+        # v20: Semantic Spin Resonance (EMERGENT understanding)
+        ssr: Optional["SemanticSpinResonance"] = None,
+        # v21: Learned Latent Spin Glass (GENUINE understanding from learned physics)
+        latent_spin: Optional["LatentSpinGlass"] = None,
     ):
         self.vocab = vocab
         self.pos_system = pos_system
@@ -110,6 +122,18 @@ class IsingLMGenerator:
 
         # v18: ESN reservoir for long-range temporal dynamics
         self.reservoir = reservoir
+
+        # v19: Macro-spin layer for long-range coherence
+        self.macro_coupling = macro_coupling
+
+        # v19.1: Multi-Timescale Reservoir
+        self.mtr = mtr
+
+        # v20: Semantic Spin Resonance
+        self.ssr = ssr
+
+        # v21: Learned Latent Spin Glass
+        self.latent_spin = latent_spin
 
         # Build type→words index from POS system (using shared primary_pos_tag)
         self.type_words: Dict[int, List[int]] = {t: [] for t in range(N_POS)}
@@ -303,12 +327,36 @@ class IsingLMGenerator:
         # v18: Reset reservoir state for new document
         if self.reservoir is not None:
             self.reservoir.reset()
+        # v19: Reset macro-spin layer for new document
+        if self.macro_coupling is not None:
+            self.macro_coupling.reset()
+        # v19.1: Reset MTR for new document
+        if self.mtr is not None:
+            self.mtr.reset()
+        # v20: Reset SSR for new document
+        if self.ssr is not None:
+            self.ssr.reset()
+        # v21: Reset Latent Spin Glass for new document
+        if self.latent_spin is not None:
+            self.latent_spin.reset()
         for w in words:
             word_str = self.vocab.idx2word.get(w, "")
             self.document_state.update(w, word_str=word_str)
             # v18: Advance reservoir state with each prompt word
             if self.reservoir is not None:
                 self.reservoir.step(w)
+            # v19: Update macro-spin state with each prompt word
+            if self.macro_coupling is not None:
+                self.macro_coupling.update(w, word_str=word_str)
+            # v19.1: Advance MTR with each prompt word
+            if self.mtr is not None:
+                self.mtr.step(w)
+            # v20: Advance SSR with each prompt word
+            if self.ssr is not None:
+                self.ssr.step(w)
+            # v21: Advance Latent Spin Glass with each prompt word
+            if self.latent_spin is not None:
+                self.latent_spin.step(w)
 
         for pos in range(len(words), length):
             # === STEP 1: Choose POS type (BOLTZMANN) ===
@@ -450,7 +498,7 @@ class IsingLMGenerator:
             types_list.append(chosen_type)
 
             # Track state energy of chosen word (after selection)
-            if self.document_state is not None and self.document_state._built:
+            if self.state_scale > 0 and self.document_state is not None and self.document_state._built:
                 chosen_idx_arr = np.array([chosen_word], dtype=np.int64)
                 state_e = self.document_state.compute_energy(
                     chosen_idx_arr, state_scale=self.state_scale
@@ -473,6 +521,19 @@ class IsingLMGenerator:
             # v18: Advance ESN reservoir state
             if self.reservoir is not None:
                 self.reservoir.step(chosen_word)
+
+            # v19: Update macro-spin layer
+            if self.macro_coupling is not None:
+                self.macro_coupling.update(chosen_word, word_str=word_str)
+            # v19.1: Advance MTR
+            if self.mtr is not None:
+                self.mtr.step(chosen_word)
+            # v20: Advance SSR (spin dynamics + Hebbian episodic update)
+            if self.ssr is not None:
+                self.ssr.step(chosen_word)
+            # v21: Advance Latent Spin Glass (Ising dynamics + Hebbian episodic update)
+            if self.latent_spin is not None:
+                self.latent_spin.step(chosen_word)
 
             # Track diagnostics
             self._stats['total_positions'] += 1
@@ -555,6 +616,18 @@ class IsingLMGenerator:
             # v18: Reset reservoir for each new sequence
             if self.reservoir is not None:
                 self.reservoir.reset()
+            # v19: Reset macro-spin layer for each new sequence
+            if self.macro_coupling is not None:
+                self.macro_coupling.reset()
+            # v19.1: Reset MTR for each new sequence
+            if self.mtr is not None:
+                self.mtr.reset()
+            # v20: Reset SSR for each new sequence
+            if self.ssr is not None:
+                self.ssr.reset()
+            # v21: Reset Latent Spin Glass for each new sequence
+            if self.latent_spin is not None:
+                self.latent_spin.reset()
 
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
@@ -647,6 +720,19 @@ class IsingLMGenerator:
                     self.document_state.run_mean_field()
                 if self.reservoir is not None:
                     self.reservoir.step(target_word)
+                # v19: Update macro-spin layer
+                if self.macro_coupling is not None:
+                    word_str = self.vocab.idx2word.get(target_word, "")
+                    self.macro_coupling.update(target_word, word_str=word_str)
+                # v19.1: Advance MTR
+                if self.mtr is not None:
+                    self.mtr.step(target_word)
+                # v20: Advance SSR
+                if self.ssr is not None:
+                    self.ssr.step(target_word)
+                # v21: Advance Latent Spin Glass
+                if self.latent_spin is not None:
+                    self.latent_spin.step(target_word)
 
         if total_tokens == 0:
             return float('inf')

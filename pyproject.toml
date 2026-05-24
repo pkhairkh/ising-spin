@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ising-spin"
-version = "17.1.0"
-description = "Ising Spin Glass Language Model — Integer-only Boltzmann sampling, Multi-Scale Abstract Recall, Evolving Document State"
+version = "21.0.0"
+description = "Ising Spin Glass Language Model — Integer-only Boltzmann sampling, Multi-Scale Abstract Recall, Learned Latent Spin Glass"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

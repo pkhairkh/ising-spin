@@ -49,4 +49,9 @@ from .vsa import QFHRRVectors, VSAEncoder
 from .dense_am import RandomFeatureProjector, DenseAMEnergy
 from .rff import CrossScaleRFF
 
-__version__ = "18.0.0"
+# v19+ modules
+from .macro import EntityTracker, NarrativePhaseTracker, SceneTracker, MacroSpinCoupling
+from .ssr import SemanticSpinResonance
+from .latent import LatentSpinGlass
+
+__version__ = "21.0.0"
