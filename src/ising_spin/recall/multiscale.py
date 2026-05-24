@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .base import AbstractRecallIndex
+from .base import NgramIndexBase
 from .word_index import WordNgramIndex
 from .pos_index import PosNgramIndex
 from .topic_index import TopicNgramIndex

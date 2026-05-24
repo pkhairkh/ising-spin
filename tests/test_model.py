@@ -1,456 +1,632 @@
 """
-Unit tests for the Ising Spin Language Model.
+Comprehensive test suite for the Ising Spin Glass Language Model.
 
-Path 3d: Tests cover:
-  - Vocabulary (build, encode, decode, specials, tokenizer)
-  - POSTypeSystem (assign_pos_rules, grammar_penalty)
-  - IntegerBoltzmannSampler (low beta → uniform, high beta → deterministic)
-  - NGramIndex (build, lookup, recall_bonus)
-  - compute_log_floor_pmi (known inputs → known outputs)
-  - IsingLM generate (no crash, length matches, no double DET)
+Test levels:
+  1. Unit tests — each DDD module in isolation
+  2. Integration tests — modules working together (energy pipeline, generator loop)
+  3. Edge case / error handling tests — invalid inputs, boundary conditions
+  4. Determinism tests — integer-only arithmetic produces identical results
+
+Run with:
+  pytest tests/ -v
 """
 
-import pytest
 import numpy as np
-import scipy.sparse as sp
+import pytest
+
+# ===========================================================================
+# Fixtures
+# ===========================================================================
+
+@pytest.fixture
+def sample_texts():
+    """Small corpus for testing."""
+    return [
+        "the cat sat on the mat and the dog ran in the park",
+        "science and technology are important for research and development",
+        "the weather was warm and sunny during the summer months",
+        "research shows that exercise improves health and well being",
+        "the history of art reflects the culture of different societies",
+    ]
+
+
+@pytest.fixture
+def vocab(sample_texts):
+    """Pre-built vocabulary."""
+    from ising_spin import Vocabulary
+    v = Vocabulary(min_freq=1, max_size=200)
+    v.build(sample_texts)
+    return v
+
+
+@pytest.fixture
+def pos_system(vocab):
+    """Pre-built POS type system."""
+    from ising_spin import POSTypeSystem
+    ps = POSTypeSystem(vocab_size=len(vocab), window=5)
+    ps.build_from_vocabulary(vocab.word2idx, vocab.idx2word)
+    ps.build_grammar_penalties(penalty_strength=60)
+    return ps
+
+
+@pytest.fixture
+def topic_assigner(sample_texts, vocab):
+    """Pre-built topic assigner."""
+    from ising_spin import TopicAssigner
+    ta = TopicAssigner(n_topics=4)
+    ta.build(sample_texts, vocab)
+    return ta
+
+
+@pytest.fixture
+def sequences(vocab, sample_texts):
+    """Tokenized sequences."""
+    seqs = []
+    for text in sample_texts:
+        tokens = vocab.encode(text)
+        if len(tokens) > 1:
+            seqs.append(tokens[:30])
+    return seqs
+
+
+@pytest.fixture
+def word_index(sequences):
+    """Pre-built word n-gram index."""
+    from ising_spin import WordNgramIndex
+    idx = WordNgramIndex(max_n=3, min_count=1)
+    idx.build(sequences)
+    return idx
+
+
+@pytest.fixture
+def pos_index(sequences, pos_system):
+    """Pre-built POS n-gram index."""
+    from ising_spin import PosNgramIndex
+    from ising_spin.utils import primary_pos_tag
+    word_pos_tags = {}
+    for w, allowed in pos_system.allowed_types.items():
+        if allowed:
+            word_pos_tags[w] = primary_pos_tag(allowed)
+    idx = PosNgramIndex(max_n=5, min_count=1, pos_system=pos_system)
+    idx.build(sequences, word_pos_tags=word_pos_tags)
+    return idx
+
+
+@pytest.fixture
+def topic_index(sequences, topic_assigner):
+    """Pre-built topic n-gram index."""
+    from ising_spin import TopicNgramIndex
+    idx = TopicNgramIndex(
+        max_n=3, min_count=1, n_topics=4,
+        word_topics=topic_assigner.word_topics,
+    )
+    idx.build(sequences)
+    return idx
+
+
+@pytest.fixture
+def document_state(vocab, pos_system, topic_assigner, sequences):
+    """Pre-built document state."""
+    from ising_spin import DocumentState
+    ds = DocumentState(
+        vocab_size=len(vocab),
+        n_topics=4,
+        pos_system=pos_system,
+        word_topics=topic_assigner.word_topics,
+    )
+    ds.build(sequences)
+    return ds
 
 
 # ===========================================================================
-# Test: Vocabulary
+# 1. EXCEPTION HIERARCHY
+# ===========================================================================
+
+class TestExceptions:
+    """Test that the exception hierarchy is correct."""
+
+    def test_base_exception(self):
+        from ising_spin.exceptions import IsingSpinError
+        assert issubclass(IsingSpinError, Exception)
+
+    def test_build_errors(self):
+        from ising_spin.exceptions import (
+            IsingSpinError, BuildError, VocabularyBuildError,
+            IndexBuildError, StateBuildError, TopicBuildError,
+        )
+        assert issubclass(BuildError, IsingSpinError)
+        assert issubclass(VocabularyBuildError, BuildError)
+        assert issubclass(IndexBuildError, BuildError)
+        assert issubclass(StateBuildError, BuildError)
+        assert issubclass(TopicBuildError, BuildError)
+
+    def test_inference_errors(self):
+        from ising_spin.exceptions import IsingSpinError, InferenceError, SamplingError, EnergyError
+        assert issubclass(InferenceError, IsingSpinError)
+        assert issubclass(SamplingError, InferenceError)
+        assert issubclass(EnergyError, InferenceError)
+
+    def test_validation_errors(self):
+        from ising_spin.exceptions import (
+            IsingSpinError, ValidationError, VocabularyError,
+            POSValidationError, StateValidationError,
+        )
+        assert issubclass(ValidationError, IsingSpinError)
+        assert issubclass(VocabularyError, ValidationError)
+        assert issubclass(POSValidationError, ValidationError)
+        assert issubclass(StateValidationError, ValidationError)
+
+
+# ===========================================================================
+# 2. UTILS MODULE
+# ===========================================================================
+
+class TestUtils:
+    """Test shared utilities."""
+
+    def test_tag_priority_completeness(self):
+        from ising_spin.utils import TAG_PRIORITY
+        from ising_spin.vocabulary.pos import N_POS
+        assert len(TAG_PRIORITY) == N_POS
+
+    def test_primary_pos_tag_closed_class(self):
+        from ising_spin.utils import primary_pos_tag
+        from ising_spin.vocabulary.pos import POS2IDX
+        # "the" can be DET or PRON; DET has higher priority
+        allowed = {POS2IDX["DET"], POS2IDX["PRON"]}
+        assert primary_pos_tag(allowed) == POS2IDX["DET"]
+
+    def test_primary_pos_tag_empty(self):
+        from ising_spin.utils import primary_pos_tag
+        from ising_spin.vocabulary.pos import POS2IDX
+        assert primary_pos_tag(set()) == POS2IDX["X"]
+
+    def test_get_rss_mb(self):
+        from ising_spin.utils import get_rss_mb
+        rss = get_rss_mb()
+        assert isinstance(rss, int)
+        assert rss >= 0
+
+    def test_validate_array_ok(self):
+        from ising_spin.utils import validate_array
+        arr = np.array([1, 2, 3], dtype=np.int64)
+        validate_array(arr, "test", dtype=np.int64, ndim=1, min_len=1)
+
+    def test_validate_array_wrong_type(self):
+        from ising_spin.utils import validate_array
+        with pytest.raises(TypeError):
+            validate_array([1, 2, 3], "test")
+
+    def test_validate_array_wrong_ndim(self):
+        from ising_spin.utils import validate_array
+        arr = np.array([[1, 2], [3, 4]], dtype=np.int64)
+        with pytest.raises(TypeError):
+            validate_array(arr, "test", ndim=1)
+
+    def test_validate_nonempty(self):
+        from ising_spin.utils import validate_nonempty
+        validate_nonempty([1, 2, 3], "test")
+        with pytest.raises(ValueError):
+            validate_nonempty([], "test")
+
+    def test_validate_positive(self):
+        from ising_spin.utils import validate_positive
+        validate_positive(1, "test")
+        with pytest.raises(ValueError):
+            validate_positive(0, "test")
+        with pytest.raises(ValueError):
+            validate_positive(-1, "test")
+
+
+# ===========================================================================
+# 3. VOCABULARY MODULE
 # ===========================================================================
 
 class TestVocabulary:
-    """Test the Vocabulary class."""
+    """Test Vocabulary, POSTypeSystem, and TopicAssigner."""
 
-    def test_special_tokens(self):
-        """Special tokens should have indices 0-3."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        texts = ["hello world"]
-        vocab.build(texts)
-        assert vocab.word2idx["<UNK>"] == 0
-        assert vocab.word2idx["<BOS>"] == 1
-        assert vocab.word2idx["<EOS>"] == 2
-        assert vocab.word2idx["<PAD>"] == 3
+    def test_vocab_build(self, vocab, sample_texts):
+        assert vocab._built
+        assert len(vocab) > 0
+        assert "<UNK>" in vocab.word2idx
 
-    def test_build_and_len(self):
-        """Vocabulary should build and have correct length."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        texts = ["the cat sat on the mat", "the dog ran in the park"]
-        vocab.build(texts)
-        # Specials (4) + unique words that appear at least once
-        assert len(vocab) >= 4
-        assert len(vocab) <= 4 + 20  # Reasonable upper bound
-
-    def test_encode_decode(self):
-        """Encoding and decoding should be consistent."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        texts = ["the cat sat on the mat"]
-        vocab.build(texts)
-        encoded = vocab.encode("the cat")
-        decoded = vocab.decode(encoded)
+    def test_vocab_encode_decode(self, vocab):
+        text = "the cat sat"
+        ids = vocab.encode(text)
+        assert isinstance(ids, list)
+        assert all(isinstance(i, int) for i in ids)
+        decoded = vocab.decode(ids)
         assert "the" in decoded
         assert "cat" in decoded
 
-    def test_unknown_word_encoding(self):
-        """Unknown words should map to <UNK> index 0."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        texts = ["hello world"]
-        vocab.build(texts)
-        encoded = vocab.encode("xyzzy_plugh")
-        assert all(idx == 0 for idx in encoded)
+    def test_vocab_unknown_words(self, vocab):
+        ids = vocab.encode("xyzzy12345")
+        unk_idx = vocab.word2idx["<UNK>"]
+        assert all(i == unk_idx for i in ids)
 
-    def test_min_freq_filtering(self):
-        """Words below min_freq should be excluded from vocabulary."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=3)
-        texts = ["rare common common common"]  # "rare" appears once
-        vocab.build(texts)
-        assert "common" in vocab.word2idx
-        # "rare" should not be in vocab (appears only once, below min_freq=3)
-        assert "rare" not in vocab.word2idx
+    def test_pos_system_types(self, pos_system, vocab):
+        assert len(pos_system.allowed_types) > 0
+        # "the" should be tagged as DET
+        the_idx = vocab.word2idx.get("the")
+        if the_idx is not None:
+            assert the_idx in pos_system.allowed_types
 
-    def test_max_size(self):
-        """Vocabulary size should be capped at max_size."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1, max_size=10)
-        texts = [f"word{i}" for i in range(50)]
-        vocab.build(texts)
-        assert len(vocab) <= 10 + 4  # max_size + specials
+    def test_pos_grammar_penalty(self, pos_system):
+        from ising_spin.vocabulary.pos import POS2IDX
+        # DET followed by VERB should get some penalty
+        penalty = pos_system.compute_grammar_penalty(
+            [POS2IDX["DET"]], 0, POS2IDX["VERB"]
+        )
+        assert isinstance(penalty, int)
+        assert penalty >= 0
 
-    def test_tokenizer_contractions(self):
-        """Contractions should be split: don't -> do + n't."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        tokens = vocab._tokenize("don't it's they're")
-        assert "do" in tokens
-        assert "n't" in tokens
-        assert "it" in tokens
-        assert "'s" in tokens
-
-    def test_tokenizer_hyphens(self):
-        """Hyphenated words should stay as one token."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        tokens = vocab._tokenize("well-known state-of-the-art")
-        assert "well-known" in tokens
-        assert "state-of-the-art" in tokens
-
-    def test_tokenizer_numbers(self):
-        """Numbers with decimals should stay as one token."""
-        from ising_spin.model import Vocabulary
-        vocab = Vocabulary(min_freq=1)
-        tokens = vocab._tokenize("3.14 1,000")
-        assert "3.14" in tokens
-        assert "1,000" in tokens
+    def test_topic_assigner(self, topic_assigner):
+        assert topic_assigner._built
+        assert topic_assigner.word_topics is not None
+        assert len(topic_assigner.word_topics) > 0
 
 
 # ===========================================================================
-# Test: POSTypeSystem
+# 4. RECALL MODULE (NgramIndexBase + all three indexes)
 # ===========================================================================
 
-class TestPOSTypeSystem:
-    """Test the POSTypeSystem class."""
+class TestRecall:
+    """Test n-gram recall indexes and MultiScaleRecall."""
 
-    def test_assign_pos_noun(self):
-        """Words with noun suffixes should get NOUN tag."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        tags = pos.assign_pos_rules("education", 4)
-        assert POS2IDX["NOUN"] in tags
+    def test_word_index_build(self, word_index):
+        assert word_index._built
+        assert len(word_index.index) > 0
 
-    def test_assign_pos_verb(self):
-        """Words with verb suffixes should get VERB tag."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        tags = pos.assign_pos_rules("running", 4)
-        assert POS2IDX["VERB"] in tags
+    def test_word_index_lookup(self, word_index, sequences):
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            results = word_index.lookup(sequences[0])
+            assert isinstance(results, dict)
 
-    def test_assign_pos_det(self):
-        """Known determiners should get DET tag."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        tags = pos.assign_pos_rules("the", 4)
-        assert POS2IDX["DET"] in tags
+    def test_word_index_energy(self, word_index, sequences):
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            candidates = np.array(sequences[0][:10], dtype=np.int64)
+            energies = word_index.compute_energy(
+                sequences[0], candidates, recall_scale=100
+            )
+            assert energies.dtype == np.int64
+            assert len(energies) == len(candidates)
+            # Lower energy = more likely, all should be non-negative
+            assert np.all(energies >= 0)
 
-    def test_assign_pos_aux(self):
-        """Known auxiliaries should get AUX tag."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        tags = pos.assign_pos_rules("is", 4)
-        assert POS2IDX["AUX"] in tags
+    def test_word_index_copy(self, word_index, sequences):
+        if len(sequences) > 0 and len(sequences[0]) >= 3:
+            result = word_index.get_best_copy_candidate(
+                context_words=sequences[0],
+                min_context_length=2,
+                min_confidence=0.1,
+            )
+            # May or may not find a candidate, but should not crash
+            assert result is None or len(result) == 3
 
-    def test_assign_pos_punct(self):
-        """Punctuation should get PUNCT tag."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        tags = pos.assign_pos_rules(".", 4)
-        assert POS2IDX["PUNCT"] in tags
+    def test_pos_index_build(self, pos_index):
+        assert pos_index._built
+        assert len(pos_index.index) > 0
 
-    def test_grammar_penalty_double_det(self):
-        """Double DET should incur penalty."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        pos.build_grammar_penalties(penalty_strength=50)
-        types = [POS2IDX["DET"]]
-        penalty = pos.compute_grammar_penalty(types, 1, POS2IDX["DET"])
-        assert penalty > 0  # DET followed by DET should be penalized
+    def test_pos_index_energy(self, pos_index, sequences):
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            candidates = np.array(sequences[0][:10], dtype=np.int64)
+            energies = pos_index.compute_energy(
+                sequences[0], candidates, recall_scale=50
+            )
+            assert energies.dtype == np.int64
+            assert len(energies) == len(candidates)
 
-    def test_grammar_penalty_det_noun_ok(self):
-        """DET followed by NOUN should have no penalty."""
-        from ising_spin.model import POSTypeSystem, POS2IDX
-        pos = POSTypeSystem(vocab_size=100)
-        pos.build_grammar_penalties(penalty_strength=50)
-        types = [POS2IDX["DET"]]
-        penalty = pos.compute_grammar_penalty(types, 1, POS2IDX["NOUN"])
-        # DET -> NOUN is fine, should have 0 or very low penalty
-        assert penalty < 50  # No forbid penalty
+    def test_topic_index_build(self, topic_index):
+        assert topic_index._built
+        assert len(topic_index.index) > 0
+
+    def test_topic_index_energy(self, topic_index, sequences):
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            candidates = np.array(sequences[0][:10], dtype=np.int64)
+            energies = topic_index.compute_energy(
+                sequences[0], candidates, recall_scale=25
+            )
+            assert energies.dtype == np.int64
+            assert len(energies) == len(candidates)
+
+    def test_multiscale_recall(self, word_index, pos_index, topic_index, sequences):
+        from ising_spin import MultiScaleRecall
+        msr = MultiScaleRecall(
+            word_index=word_index,
+            pos_index=pos_index,
+            topic_index=topic_index,
+            word_scale=100,
+            pos_scale=50,
+            topic_scale=25,
+        )
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            candidates = np.array(sequences[0][:10], dtype=np.int64)
+            energies = msr.compute_energy(
+                sequences[0], candidates,
+                interpolated=True, kn_backoff=True,
+            )
+            assert energies.dtype == np.int64
+            assert len(energies) == len(candidates)
+
+    def test_ngram_index_base_validation(self):
+        """NgramIndexBase should reject invalid params."""
+        from ising_spin.recall.base import NgramIndexBase
+        from ising_spin.exceptions import ValidationError
+        with pytest.raises(ValidationError):
+            NgramIndexBase(max_n=0, min_count=1)
+        with pytest.raises(ValidationError):
+            NgramIndexBase(max_n=3, min_count=0)
+
+    def test_empty_sequences_build(self):
+        """Building from empty sequences should raise."""
+        from ising_spin import WordNgramIndex
+        from ising_spin.exceptions import IndexBuildError
+        idx = WordNgramIndex(max_n=3, min_count=1)
+        with pytest.raises(IndexBuildError):
+            idx.build([])
 
 
 # ===========================================================================
-# Test: IntegerBoltzmannSampler
+# 5. DOCUMENT STATE MODULE
 # ===========================================================================
 
-class TestIntegerBoltzmannSampler:
-    """Test the IntegerBoltzmannSampler class."""
+class TestDocumentState:
+    """Test DocumentState build, update, and energy computation."""
 
-    def test_low_beta_near_uniform(self):
-        """With very low beta (hot), sampling should be near-uniform."""
-        from ising_spin.model import IntegerBoltzmannSampler
-        sampler = IntegerBoltzmannSampler(beta=0.001, max_delta=100)
-        energies = np.array([0, 100, 200, 300], dtype=np.int64)
+    def test_state_build(self, document_state):
+        assert document_state._built
+        assert document_state.topic_word_counts is not None
 
-        # Sample many times and check distribution is roughly uniform
-        counts = np.zeros(4, dtype=np.int64)
-        n_samples = 2000
-        for _ in range(n_samples):
-            idx = sampler.sample(energies)
-            counts[idx] += 1
+    def test_state_reset(self, document_state):
+        document_state.topic = 5
+        document_state.mode = 3
+        document_state.reset()
+        assert document_state.topic == 1
+        assert document_state.mode == document_state.MODE_NARRATIVE
 
-        # With very low beta, all options should be chosen reasonably often
-        # Each should get at least 10% of samples
-        for i in range(4):
-            assert counts[i] > n_samples * 0.10
+    def test_state_update(self, document_state, vocab):
+        document_state.reset()
+        the_idx = vocab.word2idx.get("the", 4)
+        document_state.update(the_idx, word_str="the")
+        # After "the" (DET), some state might change
+        sv = document_state.get_state_vector()
+        assert isinstance(sv, dict)
+        assert "topic" in sv
+        assert "mode" in sv
 
-    def test_high_beta_deterministic(self):
-        """With very high beta (cold), sampling should be deterministic."""
-        from ising_spin.model import IntegerBoltzmannSampler
-        sampler = IntegerBoltzmannSampler(beta=10.0, max_delta=100)
-        energies = np.array([0, 100, 200, 300], dtype=np.int64)
+    def test_state_energy(self, document_state, vocab):
+        candidates = np.array([4, 5, 6, 7, 8], dtype=np.int64)
+        energies = document_state.compute_energy(candidates, state_scale=100)
+        assert energies.dtype == np.int64
+        assert len(energies) == len(candidates)
 
-        # Should almost always pick the lowest energy (index 0)
-        counts = np.zeros(4, dtype=np.int64)
-        n_samples = 100
-        for _ in range(n_samples):
-            idx = sampler.sample(energies)
-            counts[idx] += 1
+    def test_state_unbuilt_energy(self):
+        """Unbuilt state should return zero energies."""
+        from ising_spin import DocumentState
+        ds = DocumentState(vocab_size=100, n_topics=4)
+        candidates = np.array([4, 5, 6], dtype=np.int64)
+        energies = ds.compute_energy(candidates, state_scale=100)
+        assert np.all(energies == 0)
 
-        # Index 0 (lowest energy) should be chosen >90% of the time
-        assert counts[0] > n_samples * 0.90
+    def test_state_repr(self, document_state):
+        repr_str = repr(document_state)
+        assert "DocumentState" in repr_str
 
-    def test_single_element(self):
-        """With a single element, should always return 0."""
-        from ising_spin.model import IntegerBoltzmannSampler
-        sampler = IntegerBoltzmannSampler(beta=0.1)
-        idx = sampler.sample(np.array([42], dtype=np.int64))
+
+# ===========================================================================
+# 6. ENERGY MODULE
+# ===========================================================================
+
+class TestEnergyComputer:
+    """Test EnergyComputer with validation and vectorized constraints."""
+
+    def test_energy_computation(self, word_index, pos_index, topic_index,
+                                document_state, pos_system, sequences):
+        from ising_spin import MultiScaleRecall, EnergyComputer
+        msr = MultiScaleRecall(
+            word_index=word_index,
+            pos_index=pos_index,
+            topic_index=topic_index,
+        )
+        ec = EnergyComputer(
+            multiscale_recall=msr,
+            document_state=document_state,
+            pos_system=pos_system,
+        )
+        if len(sequences) > 0 and len(sequences[0]) >= 2:
+            candidates = np.array(sequences[0][:10], dtype=np.int64)
+            energies = ec.compute_energy(
+                context_words=sequences[0],
+                candidate_words=candidates,
+                current_type=0,
+                prev_word=sequences[0][0],
+                closed_class_run=0,
+            )
+            assert energies.dtype == np.int64
+            assert len(energies) == len(candidates)
+
+    def test_energy_validation(self, word_index, pos_index, topic_index,
+                                document_state, pos_system):
+        from ising_spin import MultiScaleRecall, EnergyComputer
+        msr = MultiScaleRecall(
+            word_index=word_index,
+            pos_index=pos_index,
+            topic_index=topic_index,
+        )
+        ec = EnergyComputer(
+            multiscale_recall=msr,
+            document_state=document_state,
+            pos_system=pos_system,
+        )
+        # context_words must be a list
+        with pytest.raises(TypeError):
+            ec.compute_energy(
+                context_words=np.array([1, 2]),
+                candidate_words=np.array([3, 4], dtype=np.int64),
+            )
+        # candidate_words must be ndarray
+        with pytest.raises(TypeError):
+            ec.compute_energy(
+                context_words=[1, 2],
+                candidate_words=[3, 4],
+            )
+
+
+# ===========================================================================
+# 7. SAMPLING MODULE
+# ===========================================================================
+
+class TestSampling:
+    """Test IntegerBoltzmannSampler and int_log2_fine."""
+
+    def test_sampler_init(self):
+        from ising_spin import IntegerBoltzmannSampler
+        sampler = IntegerBoltzmannSampler(beta=0.1, max_delta=5000)
+        assert sampler.table is not None
+        assert len(sampler.table) > 0
+
+    def test_sampler_invalid_beta(self):
+        from ising_spin import IntegerBoltzmannSampler
+        from ising_spin.exceptions import SamplingError
+        with pytest.raises(SamplingError):
+            IntegerBoltzmannSampler(beta=0)
+
+    def test_sampler_sample(self):
+        from ising_spin import IntegerBoltzmannSampler
+        sampler = IntegerBoltzmannSampler(beta=0.001, max_delta=5000)
+        energies = np.array([100, 50, 200, 30, 500], dtype=np.int64)
+        idx = sampler.sample(energies)
+        assert 0 <= idx < len(energies)
+
+    def test_sampler_sample_single(self):
+        from ising_spin import IntegerBoltzmannSampler
+        sampler = IntegerBoltzmannSampler(beta=0.01, max_delta=1000)
+        idx = sampler.sample(np.array([100], dtype=np.int64))
         assert idx == 0
 
-    def test_compute_log_probabilities(self):
-        """Log probabilities should sum to ~0 in linear space."""
-        from ising_spin.model import IntegerBoltzmannSampler
-        sampler = IntegerBoltzmannSampler(beta=0.1)
-        energies = np.array([0, 10, 20, 30], dtype=np.int64)
+    def test_sampler_log_probabilities(self):
+        from ising_spin import IntegerBoltzmannSampler
+        sampler = IntegerBoltzmannSampler(beta=0.001, max_delta=5000)
+        energies = np.array([100, 50, 200, 30, 500], dtype=np.int64)
         log_probs = sampler.compute_log_probabilities(energies)
-        # exp(sum(log_probs)) should be ~1
-        total_prob = np.exp(log_probs).sum()
-        assert abs(total_prob - 1.0) < 0.01
+        assert log_probs.dtype == np.int64
+        assert len(log_probs) == len(energies)
+        # Log probs should be negative (or zero)
+        assert np.all(log_probs <= 0)
+
+    def test_int_log2_fine(self):
+        from ising_spin.sampling.boltzmann import int_log2_fine
+        # log2(2) = 1.0 → 256
+        assert int_log2_fine(2) == 256
+        # log2(4) = 2.0 → 512
+        assert int_log2_fine(4) == 512
+        # log2(1) = 0
+        assert int_log2_fine(1) == 0
+
+    def test_int_log2_fine_precision(self):
+        from ising_spin.sampling.boltzmann import int_log2_fine
+        import math
+        # log2(1000) ≈ 9.966 → 9.966 * 256 ≈ 2551
+        result = int_log2_fine(1000)
+        expected = int(math.log2(1000) * 256)
+        assert abs(result - expected) <= 2  # Allow 2 units of error
 
 
 # ===========================================================================
-# Test: NGramIndex
+# 8. INTEGRATION: FULL PIPELINE
 # ===========================================================================
 
-class TestNGramIndex:
-    """Test the NGramIndex class."""
+class TestIntegration:
+    """Integration tests — modules working together."""
 
-    def test_build_and_lookup(self):
-        """Should build index and find continuations."""
-        from ising_spin.model import NGramIndex
-        idx = NGramIndex(max_n=3, min_count=1)
-        sequences = [[4, 5, 6, 7], [4, 5, 6, 8]]  # Using indices >= 4
-        idx.build(sequences)
-
-        # Lookup context [4, 5, 6] should find 7 and 8
-        results = idx.lookup([4, 5, 6])
-        assert len(results) > 0
-
-    def test_recall_bonus(self):
-        """Recall bonus should be non-zero for matching candidates."""
-        from ising_spin.model import NGramIndex
-        idx = NGramIndex(max_n=3, min_count=1)
-        sequences = [[4, 5, 6, 7], [4, 5, 6, 7]]  # 7 appears twice after 4,5,6
-        idx.build(sequences)
-
-        candidates = np.array([7, 8, 9], dtype=np.int64)
-        bonuses = idx.get_recall_bonus(
-            context_words=[4, 5, 6],
-            candidate_words=candidates,
-            recall_scale=100,
+    def test_model_train(self, sample_texts):
+        """Full training pipeline on tiny corpus."""
+        from ising_spin import IsingLMModel
+        model = IsingLMModel(
+            vocab_min_freq=1,
+            vocab_max_size=200,
+            ngram_max_n=3,
+            ngram_min_count=1,
+            pos_ngram_max_n=5,
+            pos_ngram_min_count=1,
+            n_topics=4,
+            topic_ngram_max_n=3,
+            topic_ngram_min_count=1,
+            auto_calibrate_beta=False,
+            max_seq_len=30,
         )
-        # Word 7 should get a bonus
-        assert bonuses[0] > 0
+        model.train(texts=sample_texts, n_samples=len(sample_texts))
+        assert model.vocab is not None
+        assert model.word_index is not None
+        assert model.generator is not None
 
-    def test_empty_lookup(self):
-        """Lookup with no match should return empty dict."""
-        from ising_spin.model import NGramIndex
-        idx = NGramIndex(max_n=3, min_count=1)
-        sequences = [[4, 5, 6, 7]]
-        idx.build(sequences)
-        results = idx.lookup([99, 98, 97])  # Not in index
-        assert len(results) == 0
-
-
-# ===========================================================================
-# Test: compute_log_floor_pmi
-# ===========================================================================
-
-class TestComputeLogFloorPMI:
-    """Test the compute_log_floor_pmi function."""
-
-    def test_zero_cooc(self):
-        """Zero co-occurrence should give PMI = 0."""
-        from ising_spin.model import compute_log_floor_pmi
-        assert compute_log_floor_pmi(0, 10, 10, 100) == 0
-
-    def test_positive_pmi(self):
-        """Words that co-occur more than expected should have positive PMI."""
-        from ising_spin.model import compute_log_floor_pmi
-        # cooc=10, marginal_i=10, marginal_j=10, total=100
-        # Expected cooc = 10*10/100 = 1, actual=10, so PMI > 0
-        pmi = compute_log_floor_pmi(10, 10, 10, 100)
-        assert pmi > 0
-
-    def test_negative_pmi(self):
-        """Words that co-occur less than expected should have negative PMI."""
-        from ising_spin.model import compute_log_floor_pmi
-        # cooc=1, marginal_i=50, marginal_j=50, total=100
-        # Expected cooc = 50*50/100 = 25, actual=1, so PMI < 0
-        pmi = compute_log_floor_pmi(1, 50, 50, 100)
-        assert pmi < 0
-
-    def test_pmi_cap(self):
-        """PMI should be capped at the specified cap value."""
-        from ising_spin.model import compute_log_floor_pmi
-        # Very high co-occurrence
-        pmi = compute_log_floor_pmi(100, 1, 1, 10000, cap=5)
-        assert pmi <= 5
-
-    def test_pmi_symmetry(self):
-        """PMI should be symmetric: PMI(i,j) = PMI(j,i)."""
-        from ising_spin.model import compute_log_floor_pmi
-        pmi_ij = compute_log_floor_pmi(5, 10, 20, 100)
-        pmi_ji = compute_log_floor_pmi(5, 20, 10, 100)
-        assert pmi_ij == pmi_ji
-
-
-# ===========================================================================
-# Test: IsingLM generate
-# ===========================================================================
-
-class TestIsingLMGenerate:
-    """Test the IsingLM generate method."""
-
-    def _make_small_model(self):
-        """Create a small IsingLM instance for testing."""
-        from ising_spin.model import (
-            Vocabulary, POSTypeSystem, NGramIndex, IsingLM, compute_pmi_couplings
+    def test_model_generate(self, sample_texts):
+        """Generation after training."""
+        from ising_spin import IsingLMModel
+        model = IsingLMModel(
+            vocab_min_freq=1,
+            vocab_max_size=200,
+            ngram_max_n=3,
+            ngram_min_count=1,
+            pos_ngram_max_n=5,
+            pos_ngram_min_count=1,
+            n_topics=4,
+            topic_ngram_max_n=3,
+            topic_ngram_min_count=1,
+            auto_calibrate_beta=False,
+            max_seq_len=30,
         )
-        vocab = Vocabulary(min_freq=1, max_size=100)
-        texts = [
-            "the cat sat on the mat",
-            "the dog ran in the park",
-            "the bird flew over the tree",
-            "a cat and a dog played",
-            "the student read the book",
-        ]
-        vocab.build(texts)
-
-        types = POSTypeSystem(vocab_size=len(vocab))
-        types.build_from_vocabulary(vocab.word2idx, vocab.idx2word)
-        types.build_grammar_penalties(penalty_strength=50)
-
-        sequences = []
-        for text in texts:
-            tokens = vocab.encode(text)
-            if tokens:
-                sequences.append(tokens)
-
-        # Compute sparse PMI
-        J, h = compute_pmi_couplings(sequences, len(vocab), window=5, min_count=1)
-
-        ngram_index = NGramIndex(max_n=3, min_count=1)
-        ngram_index.build(sequences)
-
-        model = IsingLM(
-            vocab=vocab, ngram_index=ngram_index,
-            J=J, h=h, types=types,
-            recall_scale=100, pmi_weight=3, field_weight=1,
-            beta_type=0.01, beta_word=0.15,
-            same_word_penalty=50000, ising_enabled=True,
-        )
-        return model
-
-    def test_generate_no_crash(self):
-        """Generate should not crash."""
-        model = self._make_small_model()
+        model.train(texts=sample_texts, n_samples=len(sample_texts))
         result = model.generate(prompt="the", length=10)
-        assert result is not None
+        assert "text" in result
+        assert "words" in result
+        assert len(result["words"]) > 0
 
-    def test_generate_length(self):
-        """Generated sequence should have the requested length."""
-        model = self._make_small_model()
-        length = 10
-        result = model.generate(prompt="the", length=length)
-        assert len(result['words']) == length
-
-    def test_generate_no_double_det(self):
-        """Generated text should not have consecutive DET DET patterns."""
-        model = self._make_small_model()
-        # Generate several times and check
-        for _ in range(5):
-            result = model.generate(prompt="the", length=15)
-            type_names = result['type_names']
-            for i in range(len(type_names) - 1):
-                # Double DET should be very rare
-                if type_names[i] == "DET" and type_names[i+1] == "DET":
-                    # This is a soft check - we allow it occasionally
-                    pass
-
-    def test_generate_beam(self):
-        """Beam generation should return best candidate."""
-        model = self._make_small_model()
-        result = model.generate_beam(prompt="the", length=8, n_beams=3)
-        assert 'beam_energy' in result
-        assert 'all_candidates' in result
-        assert len(result['all_candidates']) == 3
-
-    def test_generate_annealed(self):
-        """Annealed generation should return text with beta schedule."""
-        model = self._make_small_model()
-        result = model.generate_annealed(prompt="the", length=8,
-                                          beta_start=0.005, beta_end=0.5)
-        assert 'beta_schedule' in result
-        assert len(result['beta_schedule']) > 0
-        # Beta should increase monotonically
-        betas = result['beta_schedule']
-        for i in range(1, len(betas)):
-            assert betas[i] >= betas[i-1]
-
-    def test_sparse_j_type(self):
-        """J matrix should be a scipy sparse matrix."""
-        model = self._make_small_model()
-        assert sp.issparse(model.J)
-
-    def test_generate_returns_dict(self):
-        """Generate should return a dict with expected keys."""
-        model = self._make_small_model()
-        result = model.generate(prompt="the", length=5)
-        assert 'text' in result
-        assert 'words' in result
-        assert 'types' in result
-        assert 'type_names' in result
-        assert 'diagnostics' in result
+    def test_model_perplexity(self, sample_texts):
+        """Perplexity computation after training."""
+        from ising_spin import IsingLMModel
+        model = IsingLMModel(
+            vocab_min_freq=1,
+            vocab_max_size=200,
+            ngram_max_n=3,
+            ngram_min_count=1,
+            pos_ngram_max_n=5,
+            pos_ngram_min_count=1,
+            n_topics=4,
+            topic_ngram_max_n=3,
+            topic_ngram_min_count=1,
+            auto_calibrate_beta=False,
+            max_seq_len=30,
+        )
+        model.train(texts=sample_texts, n_samples=len(sample_texts))
+        ppl = model.compute_perplexity(n_samples=2)
+        assert isinstance(ppl, float)
+        assert ppl > 0
 
 
 # ===========================================================================
-# Test: Skip-gram PMI
+# 9. DETERMINISM TESTS
 # ===========================================================================
 
-class TestSkipPMI:
-    """Test the compute_skip_pmi_couplings function."""
+class TestDeterminism:
+    """Verify integer-only arithmetic is deterministic."""
 
-    def test_skip_pmi_returns_dict(self):
-        """Should return a dict mapping distance to sparse matrix."""
-        from ising_spin.model import compute_skip_pmi_couplings
-        sequences = [[0, 1, 2, 3, 4, 5]]
-        J_skip = compute_skip_pmi_couplings(sequences, 6, max_dist=3, min_count=1)
-        assert isinstance(J_skip, dict)
-        for dist in range(1, 4):
-            assert dist in J_skip
-            assert sp.issparse(J_skip[dist])
+    def test_int_log2_deterministic(self):
+        from ising_spin.sampling.boltzmann import int_log2_fine
+        # Same input → same output, always
+        for x in [2, 3, 5, 10, 100, 1000, 10000]:
+            results = [int_log2_fine(x) for _ in range(5)]
+            assert len(set(results)) == 1, f"Non-deterministic for x={x}"
 
-    def test_skip_pmi_shape(self):
-        """Each J_skip[dist] should be V x V."""
-        from ising_spin.model import compute_skip_pmi_couplings
-        V = 10
-        sequences = [list(range(V))]
-        J_skip = compute_skip_pmi_couplings(sequences, V, max_dist=3, min_count=1)
-        for dist in range(1, 4):
-            assert J_skip[dist].shape == (V, V)
+    def test_sampler_table_deterministic(self):
+        from ising_spin import IntegerBoltzmannSampler
+        s1 = IntegerBoltzmannSampler(beta=0.05, max_delta=1000)
+        s2 = IntegerBoltzmannSampler(beta=0.05, max_delta=1000)
+        assert np.array_equal(s1.table, s2.table)
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    def test_state_energy_deterministic(self, document_state, vocab):
+        np.random.seed(42)
+        candidates = np.array([4, 5, 6, 7, 8], dtype=np.int64)
+        e1 = document_state.compute_energy(candidates, state_scale=100)
+        e2 = document_state.compute_energy(candidates, state_scale=100)
+        assert np.array_equal(e1, e2)

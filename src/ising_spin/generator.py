@@ -1,5 +1,5 @@
 """
-Ising Spin Glass Language Model v17 — Text Generator
+Ising Spin Glass Language Model — Text Generator
 
 Generation loop (per position):
   1. Choose POS type via Boltzmann sampling (grammar + recall bias)
@@ -23,32 +23,33 @@ from .recall import WordNgramIndex, MultiScaleRecall
 from .state import DocumentState
 from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
-from .reservoir import IntegerESN  # v18.2
-from .errors import InferenceError, ValidationError
+from .utils import TAG_PRIORITY, primary_pos_tag, validate_positive
+from .exceptions import ValidationError
 
 
 class IsingLMGenerator:
     """
-    v17 Text generator using Multi-Scale Recall + Document State.
+    Text generator using Multi-Scale Recall + Document State.
 
-    Much simpler than v1-v16 generator because:
-    - NO PMI couplings, knowledge layer, category layer, logic layer
-    - NO Walsh, graded couplings, Grassmann, context accumulator, long-range
-    - ALL energy comes from EnergyComputer (which uses MultiScaleRecall + DocumentState)
-    - Document state is updated per-word (deterministic rules)
-    - Copy mechanism preserved (it's a form of recall)
+    Energy computation is fully delegated to EnergyComputer, which uses
+    MultiScaleRecall and DocumentState. The generator orchestrates the
+    per-position loop:
 
-    The generation loop is:
       1. Choose POS type (Boltzmann from type energy landscape)
-      2. Check copy mechanism
+      2. Check copy mechanism (n-gram recall)
       3. Get candidate words for chosen type
       4. Compute energy via EnergyComputer
       5. Boltzmann sample word
       6. Update document state
+
+    TAG_PRIORITY and primary_pos_tag are imported from .utils to avoid
+    duplication. Repetition penalties are vectorised with NumPy.
     """
 
-    CLOSED_CLASS_IDS = {POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
-                        POS2IDX["PRON"], POS2IDX["AUX"], POS2IDX["CONJ"]}
+    CLOSED_CLASS_IDS: frozenset[int] = frozenset({
+        POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
+        POS2IDX["PRON"], POS2IDX["AUX"], POS2IDX["CONJ"],
+    })
 
     HARD_TYPE_CONSTRAINTS = {
         POS2IDX["PART"]: [POS2IDX["VERB"]],
@@ -65,7 +66,6 @@ class IsingLMGenerator:
         word_sampler: IntegerBoltzmannSampler,
         type_sampler: IntegerBoltzmannSampler,
         word_index: Optional[WordNgramIndex] = None,
-        reservoir: Optional[IntegerESN] = None,      # v18.2: ESN reservoir
         copy_enabled: bool = True,
         copy_min_context: int = 3,
         copy_min_confidence: float = 0.4,
@@ -74,9 +74,9 @@ class IsingLMGenerator:
         interpolated: bool = True,
         kn_backoff: bool = True,
         recall_scale: int = 1600,
-        pos_recall_scale: int = 800,   # v17.2: increased from 800
-        topic_recall_scale: int = 400, # v17.2: increased from 400
-        state_scale: int = 50,         # v17.2: reduced from 200
+        pos_recall_scale: int = 800,
+        topic_recall_scale: int = 400,
+        state_scale: int = 200,
     ):
         self.vocab = vocab
         self.pos_system = pos_system
@@ -86,7 +86,6 @@ class IsingLMGenerator:
         self.word_sampler = word_sampler
         self.type_sampler = type_sampler
         self.word_index = word_index  # for copy mechanism
-        self.reservoir = reservoir  # v18.2: ESN reservoir
         self.vocab_size = len(vocab)
 
         self.copy_enabled = copy_enabled
@@ -102,19 +101,12 @@ class IsingLMGenerator:
         self.topic_recall_scale = topic_recall_scale
         self.state_scale = state_scale
 
-        # Build type→words index from POS system
-        # v17.4 FIX: Each word goes into ALL its allowed type buckets, not just primary.
-        # Previously, "run" (NOUN+VERB) was only in its primary bucket (NOUN),
-        # making it impossible to generate "they run" (needs VERB bucket).
-        # Now, "run" appears in BOTH NOUN and VERB buckets.
-        # The energy computer's POS type penalty (+5000 for type mismatch) still
-        # prevents generating "the run" when VERB type is chosen, because the
-        # energy for "run" in the VERB bucket will be much lower than in NOUN.
+        # Build type→words index from POS system (using shared primary_pos_tag)
         self.type_words: Dict[int, List[int]] = {t: [] for t in range(N_POS)}
         for w, allowed in pos_system.allowed_types.items():
             if allowed:
-                for t in allowed:
-                    self.type_words[t].append(w)
+                primary = primary_pos_tag(allowed)
+                self.type_words[primary].append(w)
 
         # Pre-compute allowed POS transitions from grammar penalties
         self.allowed_transitions: Set[Tuple[int, int]] = set()
@@ -150,42 +142,19 @@ class IsingLMGenerator:
         self._stats = {
             'total_positions': 0,
             'recall_hit': 0,
-            'pos_recall_hit': 0,
-            'topic_recall_hit': 0,
             'copy_used': 0,
             'same_word_blocked': 0,
             'closed_loop_blocked': 0,
-            'state_energy_sum': 0,
-            # v17.2: Track highest n-gram order for each scale
-            'word_max_n': 0,
-            'pos_max_n': 0,
-            'topic_max_n': 0,
         }
-
-        # v17.4: Word IDs that end a sentence — used to insert <S> boundary
-        self._sent_end_word_ids = set()
-        for punct in ['.', '!', '?']:
-            idx = vocab.word2idx.get(punct)
-            if idx is not None:
-                self._sent_end_word_ids.add(idx)
 
     # ===================================================================
     # WORD TYPE HELPERS
     # ===================================================================
 
     def _get_word_type(self, word_idx: int) -> int:
-        """Get primary POS type for a word."""
-        TAG_PRIORITY = {
-            POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
-            POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
-            POS2IDX["PREP"]: 6, POS2IDX["NUM"]: 7, POS2IDX["ADV"]: 8,
-            POS2IDX["ADJ"]: 9, POS2IDX["NOUN"]: 10, POS2IDX["VERB"]: 11,
-            POS2IDX["X"]: 12,
-        }
-        if word_idx in self.pos_system.allowed_types and self.pos_system.allowed_types[word_idx]:
-            return min(self.pos_system.allowed_types[word_idx],
-                       key=lambda t: TAG_PRIORITY.get(t, 99))
-        return POS2IDX["X"]
+        """Get primary POS type for a word using shared primary_pos_tag."""
+        allowed = self.pos_system.allowed_types.get(word_idx, set())
+        return primary_pos_tag(allowed)
 
     def _get_valid_next_types(self, prev_type: int, types_history: List[int]) -> List[int]:
         """Get valid next POS types with hard constraints + anti-loop."""
@@ -225,7 +194,15 @@ class IsingLMGenerator:
           - Grammar penalty (from POSTypeSystem)
           - Same-type penalty (avoid repeating the same type)
           - Recall type bias (if recall suggests a type, give energy bonus)
+
+        Raises:
+            ValidationError: if type_idx is out of valid range [0, N_POS).
         """
+        if not (0 <= type_idx < N_POS):
+            raise ValidationError(
+                f"type_idx must be in [0, {N_POS}), got {type_idx}"
+            )
+
         energy = 0
 
         # Grammar penalty
@@ -262,29 +239,40 @@ class IsingLMGenerator:
 
     def generate(self, prompt: str = "the", length: int = 20) -> Dict:
         """
-        Generate text autoregressively — v17 Multi-Scale Recall Architecture.
+        Generate text autoregressively.
 
         At each position:
           1. Choose POS type: Boltzmann from type energy landscape
-          2. Check copy mechanism (legitimate: it's a form of recall)
+          2. Check copy mechanism (n-gram recall)
           3. Compute E(w|ctx) with multi-scale recall + document state + constraints
           4. Boltzmann sample: P(w) ~ exp(-beta * E(w))
           5. Update document state
 
         All energy computation and sampling is integer-only.
-        """
-        if length <= 0:
-            raise ValidationError(f"length must be > 0, got {length}")
 
-        # Resolve prompt — v17.4 FIX: Use vocab.encode() instead of text.split()
-        # The old code did prompt.split() + manual .lower() fallback, which missed:
-        # - Contraction splitting ("don't" → "do" + "n't")
-        # - Punctuation stripping ("hello," → "hello" + ",")
-        # - Number handling, hyphenated words
+        Args:
+            prompt: Seed text string. Must be a non-empty string.
+            length: Number of total tokens to generate (including prompt).
+                Must be positive.
+
+        Raises:
+            ValidationError: if prompt is not a string or length is not positive.
+        """
+        # --- Input validation ---
+        if not isinstance(prompt, str):
+            raise ValidationError(
+                f"prompt must be a string, got {type(prompt).__name__}"
+            )
+        validate_positive(length, name="length")
+
+        # Resolve prompt — tokenize ALL words
+        prompt_words = prompt.strip().split()
         prompt_tokens = []
-        encoded = self.vocab.encode(prompt)
-        for idx in encoded:
-            if idx >= 5:  # v17.4: Skip special tokens (UNK=0, BOS=1, EOS=2, PAD=3, SENT=4)
+        for w in prompt_words:
+            idx = self.vocab.word2idx.get(w)
+            if idx is None:
+                idx = self.vocab.word2idx.get(w.lower())
+            if idx is not None and idx >= 4:  # Skip special tokens
                 prompt_tokens.append(idx)
         # Fallback: if no words found, use "the"
         if not prompt_tokens:
@@ -298,21 +286,11 @@ class IsingLMGenerator:
 
         # Initialize document state from prompt
         self.document_state.reset()
-        # v18.2: Reset ESN reservoir for new generation
-        if self.reservoir is not None:
-            self.reservoir.reset()
         for w in words:
             word_str = self.vocab.idx2word.get(w, "")
             self.document_state.update(w, word_str=word_str)
-            # v18.2: Feed prompt words to reservoir
-            if self.reservoir is not None:
-                self.reservoir.step(w)
 
-        # v17.4: Track content positions separately, since <S> tokens
-        # inflate the words list but aren't "real" content positions.
-        n_content = len(prompt_tokens)
-
-        for pos in range(n_content, length):
+        for pos in range(len(words), length):
             # === STEP 1: Choose POS type (BOLTZMANN) ===
             valid_types = self._get_valid_next_types(types_list[-1], types_list)
 
@@ -372,13 +350,16 @@ class IsingLMGenerator:
                 consecutive_copies = 0
 
             # === STEP 3: Get candidate words ===
-            # v17.3: Use ALL words of the chosen type (no frequency filter).
-            # The frequency filter was excluding recall-relevant words.
-            # The Boltzmann sampler naturally handles the full distribution.
             candidate_list = self.type_words.get(chosen_type, [])
             if not candidate_list:
                 candidate_list = list(range(min(200, self.vocab_size)))
             candidate_words = np.array(candidate_list, dtype=np.int64)
+
+            # Top-k filtering by field strength (unigram frequency)
+            if len(candidate_words) > 300:
+                field_vals = self.h[candidate_words]
+                top_k = np.argsort(field_vals)[-300:]
+                candidate_words = candidate_words[top_k]
 
             # === STEP 4: Compute energy ===
             # Determine closed_class_run for the energy computer
@@ -399,15 +380,14 @@ class IsingLMGenerator:
                 closed_class_run=closed_run,
             )
 
-            # Repetition penalty: only penalize consecutive same word
-            # v17.3: Removed recent-5 penalty (too aggressive, hurt coherence)
-            # The same-word penalty in EnergyComputer already handles w[t]==w[t-1]
-            # Here we add a soft penalty for w[t]==w[t-2] (anti-stutter)
-            if len(words) >= 2 and words[-1] == words[-2]:
-                # Last two words are the same — penalize repeating again
-                for i, w in enumerate(candidate_words):
-                    if int(w) == words[-1]:
-                        word_energies[i] += 150  # Soft anti-stutter
+            # Additional penalties that depend on context
+            # Vectorised repetition penalty for recent words
+            if len(words) > 0:
+                recent = set(words[-5:])
+                rep_penalty = max(200, self.recall_scale // 8)
+                recent_arr = np.array(list(recent), dtype=np.int64)
+                mask = np.isin(candidate_words, recent_arr)
+                word_energies[mask] += rep_penalty
 
             # === STEP 5: Boltzmann sample ===
             chosen_energy = 0
@@ -421,53 +401,18 @@ class IsingLMGenerator:
             words.append(chosen_word)
             types_list.append(chosen_type)
 
-            # v17.4: Insert sentence boundary marker after sentence-ending punctuation.
-            # This prevents n-gram lookups from crossing sentence boundaries.
-            SENT_IDX = 4  # <S> token index in vocabulary
-            if chosen_word in self._sent_end_word_ids:
-                words.append(SENT_IDX)
-                types_list.append(0)  # PUNCT type for <S>
-
             # === STEP 6: Update document state ===
             word_str = self.vocab.idx2word.get(chosen_word, "")
             self.document_state.update(chosen_word, word_str=word_str)
 
-            # v18.2: Feed generated word to ESN reservoir
-            if self.reservoir is not None:
-                self.reservoir.step(chosen_word)
-
             # Track diagnostics
             self._stats['total_positions'] += 1
-            # Track state energy for the chosen word (cheap: single word lookup)
-            if self.document_state._built:
-                chosen_word_arr = np.array([chosen_word], dtype=np.int64)
-                state_e = self.document_state.compute_energy(
-                    chosen_word_arr, state_scale=self.state_scale
-                )
-                self._stats['state_energy_sum'] += int(state_e[0])
             recall_hit = False
             if self.word_index is not None:
                 recall_matches = self.word_index.lookup(words[:-1])
                 recall_hit = bool(recall_matches)
-                if recall_matches:
-                    best_k = max(recall_matches.keys())
-                    self._stats['word_max_n'] = max(self._stats['word_max_n'], best_k)
             if recall_hit:
                 self._stats['recall_hit'] += 1
-            # Track POS recall hits with n-gram order
-            if self.multiscale_recall.pos_index is not None:
-                pos_matches = self.multiscale_recall.pos_index.lookup(words[:-1])
-                if pos_matches:
-                    self._stats['pos_recall_hit'] += 1
-                    best_k = max(pos_matches.keys())
-                    self._stats['pos_max_n'] = max(self._stats['pos_max_n'], best_k)
-            # Track topic recall hits with n-gram order
-            if self.multiscale_recall.topic_index is not None:
-                topic_matches = self.multiscale_recall.topic_index.lookup(words[:-1])
-                if topic_matches:
-                    self._stats['topic_recall_hit'] += 1
-                    best_k = max(topic_matches.keys())
-                    self._stats['topic_max_n'] = max(self._stats['topic_max_n'], best_k)
 
             diagnostics.append({
                 'pos': pos,
@@ -517,13 +462,17 @@ class IsingLMGenerator:
         computation of the partition function.  All arithmetic is integer,
         with final PPL conversion to float for display only.
 
-        v17 adaptation: Uses EnergyComputer for energy computation instead
-        of the old _compute_word_energy method.  Document state is updated
-        per-position to track discourse context.
+        Args:
+            test_sequences: List of token-index sequences. Must not be empty.
+            n_samples: Maximum number of sequences to evaluate.
+
+        Raises:
+            ValidationError: if test_sequences is None or empty.
         """
-        if test_sequences is None:
-            print("  Warning: No test sequences. Returning inf PPL.")
-            return float('inf')
+        if test_sequences is None or len(test_sequences) == 0:
+            raise ValidationError(
+                "test_sequences must be a non-empty list of token sequences"
+            )
 
         sampler = self.word_sampler
 
@@ -539,9 +488,6 @@ class IsingLMGenerator:
 
             # Reset document state for each new sequence
             self.document_state.reset()
-            # v18.2: Reset ESN reservoir for each test sequence
-            if self.reservoir is not None:
-                self.reservoir.reset()
 
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
@@ -557,9 +503,14 @@ class IsingLMGenerator:
                     continue
                 candidate_words = np.array(candidate_list, dtype=np.int64)
 
-                # v17.3: Use ALL words of the target type for accurate PPL.
-                # No frequency filter — the full partition function gives honest PPL.
-                # Each type has <1200 words, so this is fast enough.
+                # If the candidate set is very large, limit to top-500 + target
+                if len(candidate_words) > 500:
+                    field_vals = self.h[candidate_words]
+                    top_k = np.argsort(field_vals)[-499:]
+                    candidate_words = candidate_words[top_k]
+                    # Always include target word
+                    if int(target_word) not in set(candidate_words.tolist()):
+                        candidate_words = np.append(candidate_words, target_word)
 
                 # Check if target word is in candidates
                 target_in_candidates = int(target_word) in set(candidate_words.tolist())
@@ -591,9 +542,13 @@ class IsingLMGenerator:
                     closed_class_run=closed_run,
                 )
 
-                # v17.3: NO additional repetition penalty in PPL.
-                # The recent-5 penalty was a generation heuristic that inflated PPL
-                # by penalizing legitimate word repetitions ("the cat sat on the").
+                # Vectorised repetition penalty (matches generation)
+                if len(context_words) > 0:
+                    recent = set(context_words[-5:])
+                    rep_penalty = max(200, self.recall_scale // 8)
+                    recent_arr = np.array(list(recent), dtype=np.int64)
+                    mask = np.isin(candidate_words, recent_arr)
+                    energies[mask] += rep_penalty
 
                 # Compute log2 probabilities (integer, x LOG2_SCALE)
                 log_probs = sampler.compute_log_probabilities(energies)
@@ -610,10 +565,6 @@ class IsingLMGenerator:
                 # Update document state with actual next word
                 word_str = self.vocab.idx2word.get(target_word, "")
                 self.document_state.update(target_word, word_str=word_str)
-
-                # v18.2: Feed target word to ESN reservoir
-                if self.reservoir is not None:
-                    self.reservoir.step(target_word)
 
         if total_tokens == 0:
             return float('inf')

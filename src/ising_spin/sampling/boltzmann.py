@@ -14,6 +14,8 @@ Public API:
 
 import numpy as np
 
+from ..exceptions import SamplingError
+
 # ===========================================================================
 # CONSTANTS
 # ===========================================================================
@@ -24,27 +26,7 @@ LN2_NUM = 25246
 LN2_DEN = 36417
 
 # Fixed-point scale for integer log2 computations
-LOG2_SCALE = 100000  # 5 digits of precision (was 10000 = 4 digits)
-
-
-# ===========================================================================
-# UTILITY
-# ===========================================================================
-
-def _get_rss_mb() -> int:
-    """Get current process RSS in MB (0 if unavailable)."""
-    try:
-        import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024  # KB -> MB
-    except Exception:
-        try:
-            import os
-            with open(f"/proc/{os.getpid()}/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        return int(line.split()[1]) // 1024  # KB -> MB
-        except Exception:
-            return 0
+LOG2_SCALE = 100000  # 5 digits of precision
 
 
 # ===========================================================================
@@ -73,6 +55,13 @@ class IntegerBoltzmannSampler:
     _FP_BITS = 48  # Fixed-point precision for table construction
 
     def __init__(self, beta: float = 0.1, max_delta: int = 5000, scale: int = 1 << 30):
+        if beta <= 0:
+            raise SamplingError(f"beta must be positive, got {beta}")
+        if max_delta <= 0:
+            raise SamplingError(f"max_delta must be positive, got {max_delta}")
+        if scale <= 0:
+            raise SamplingError(f"scale must be positive, got {scale}")
+
         self.beta = beta
         self.scale = scale
         # For accurate PPL computation, max_delta must cover the full energy

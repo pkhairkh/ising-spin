@@ -1,5 +1,5 @@
 """
-Multi-scale recall module for the Ising Spin Glass Language Model v17.
+Multi-scale recall module for the Ising Spin Glass Language Model.
 
 Three recall indexes at different abstraction levels:
   - WordNgramIndex:  Exact word n-gram matching (max_n=5)
@@ -7,16 +7,18 @@ Three recall indexes at different abstraction levels:
   - TopicNgramIndex: Topic n-gram matching (max_n=10, discourse-level)
 
 Combined via MultiScaleRecall using product-of-experts energy fusion.
+
+Shared build/prune/energy logic lives in NgramIndexBase (recall/base.py).
 """
 
-from .base import AbstractRecallIndex
+from .base import NgramIndexBase
 from .word_index import WordNgramIndex
 from .pos_index import PosNgramIndex
 from .topic_index import TopicNgramIndex
 from .multiscale import MultiScaleRecall
 
 __all__ = [
-    "AbstractRecallIndex",
+    "NgramIndexBase",
     "WordNgramIndex",
     "PosNgramIndex",
     "TopicNgramIndex",

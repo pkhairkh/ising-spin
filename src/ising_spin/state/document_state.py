@@ -41,8 +41,9 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ising_spin.sampling.boltzmann import int_log2_fine
-from ising_spin.vocabulary.pos import (
+from ..sampling.boltzmann import int_log2_fine
+from ..utils import validate_array, validate_nonempty, validate_positive
+from ..vocabulary.pos import (
     COARSE_POS_TAGS,
     POS2IDX,
     N_POS,
@@ -300,7 +301,12 @@ class DocumentState:
 
         Returns:
             self
+
+        Raises:
+            ValueError: If sequences is empty.
         """
+        validate_nonempty(sequences, "sequences")
+
         V = self.vocab_size
 
         # Allocate compatibility tables
@@ -734,7 +740,15 @@ class DocumentState:
             word_str: Optional string form of the word for rule evaluation.
             pos_tag: Optional POS tag string.
             topic_id: Optional explicit topic assignment.
+
+        Raises:
+            ValueError: If word_id is outside [0, vocab_size).
         """
+        if word_id < 0 or word_id >= self.vocab_size:
+            raise ValueError(
+                f"word_id must be in [0, {self.vocab_size}), got {word_id}"
+            )
+
         # Resolve word string for rule evaluation
         w = word_str.lower() if word_str else ""
 
@@ -1040,7 +1054,7 @@ class DocumentState:
         return False
 
     # ===================================================================
-    # ENERGY: State-conditioned energy computation
+    # ENERGY: State-conditioned energy computation (vectorized LUT-based)
     # ===================================================================
 
     def compute_energy(
@@ -1056,26 +1070,41 @@ class DocumentState:
         Words that are compatible with the current state get lower energy
         (preferred); incompatible words get higher energy (penalized).
 
-        Uses integer log2 ratio:
+        Uses integer log2 ratio via a pre-computed numpy LUT:
             E_state(w) = log2(total / count) * state_scale  if count > 0
             E_state(w) = max_state_energy                    if count == 0
 
         This is equivalent to -log2(P(w|state)) up to a constant.
 
+        The int_log2_fine function is called only for the unique integer
+        ratios that actually appear, then mapped back to all candidates
+        via numpy fancy indexing — no per-candidate Python loop.
+
         Args:
             candidate_words: 1-D int array of candidate word IDs.
-            state_scale: Integer scaling factor for state energy.
+            state_scale: Integer scaling factor for state energy (must be > 0).
 
         Returns:
             energies: 1-D int64 array of state energy for each candidate.
-        """
-        n_candidates = len(candidate_words)
-        energies = np.zeros(n_candidates, dtype=np.int64)
+                Returns zeros if tables have not been built yet.
 
+        Raises:
+            TypeError: If candidate_words is not a numpy ndarray.
+            ValueError: If state_scale is not positive.
+        """
+        # --- Input validation ---
+        validate_array(candidate_words, "candidate_words", ndim=1)
+        validate_positive(state_scale, "state_scale")
+
+        n_candidates = len(candidate_words)
+
+        # Not built yet: return zeros (no state information available,
+        # so no state-conditioned energy to apply).
         if not self._built:
-            return energies
+            return np.zeros(n_candidates, dtype=np.int64)
 
         max_state_energy = state_scale * 20  # penalty for unseen state-word pairs
+        energies = np.zeros(n_candidates, dtype=np.int64)
 
         # Collect (current_value, counts_table) pairs
         state_vars = [
@@ -1100,124 +1129,40 @@ class DocumentState:
             if total <= 0:
                 continue
 
-            # Vectorized lookup for all candidates at once
-            counts = row[candidate_words]  # fancy indexing → (n_candidates,) int64
-
-            # Compute energy: log2(total / max(count, 1)) * state_scale
-            # For count == 0: max penalty
-            # For count > 0 and count < total: log2 ratio
-            # For count == total: energy = 0 (only word in this state)
-
-            safe_counts = np.maximum(counts, np.int64(1))
-
-            with np.errstate(divide='ignore', invalid='ignore'):
-                ratios = total // safe_counts  # integer division
-
-            # Compute energy using int_log2_fine for each ratio
-            # int_log2_fine returns log2(x) * 256
-            # Energy = (int_log2_fine(ratio) * state_scale) >> 8
-            for i in range(n_candidates):
-                c = int(counts[i])
-                if c == 0:
-                    energies[i] += max_state_energy
-                elif c >= total:
-                    # Word dominates this state value — no penalty
-                    pass
-                else:
-                    ratio = int(ratios[i])
-                    if ratio >= 2:
-                        log2_ratio = int_log2_fine(ratio)
-                        energy = (log2_ratio * state_scale) >> 8
-                        energies[i] += energy
-                    # ratio < 2 means count > total/2 — word is very
-                    # compatible, minimal energy
-
-        return energies
-
-    def compute_energy_vectorized(
-        self,
-        candidate_words: np.ndarray,
-        state_scale: int = 200,
-    ) -> np.ndarray:
-        """
-        Fully vectorized state-conditioned energy computation.
-
-        Same logic as compute_energy but avoids the per-candidate Python
-        loop for int_log2_fine by pre-computing a log2 LUT for the
-        encountered ratios.
-
-        Args:
-            candidate_words: 1-D int array of candidate word IDs.
-            state_scale: Integer scaling factor for state energy.
-
-        Returns:
-            energies: 1-D int64 array of state energy for each candidate.
-        """
-        n_candidates = len(candidate_words)
-        energies = np.zeros(n_candidates, dtype=np.int64)
-
-        if not self._built:
-            return energies
-
-        max_state_energy = state_scale * 20
-
-        state_vars = [
-            (self.topic, self.topic_word_counts),
-            (self.mode, self.mode_word_counts),
-            (self.tense, self.tense_word_counts),
-            (self.negation, self.negation_word_counts),
-            (self.specificity, self.specificity_word_counts),
-            (self.argument_pos, self.argument_word_counts),
-        ]
-
-        for current_val, counts_table in state_vars:
-            if counts_table is None:
-                continue
-
-            n_rows = counts_table.shape[0]
-            if current_val < 0 or current_val >= n_rows:
-                continue
-
-            row = counts_table[current_val]
-            total = int(row.sum())
-            if total <= 0:
-                continue
-
+            # Vectorized fancy-index lookup for all candidates at once
             counts = row[candidate_words].astype(np.int64)
 
-            # Mask for unseen words
+            # --- Masks for the three cases ---
             unseen_mask = counts == 0
-            # Mask for dominant words (count >= total)
             dominant_mask = (counts > 0) & (counts >= total)
-            # Mask for normal words (0 < count < total)
             normal_mask = (counts > 0) & (counts < total)
 
-            # Apply max penalty for unseen
+            # Unseen → max penalty
             energies[unseen_mask] += max_state_energy
 
-            # Compute log2 ratios for normal words
-            normal_indices = np.where(normal_mask)[0]
-            if len(normal_indices) > 0:
-                normal_counts = counts[normal_indices]
-                ratios = total // np.maximum(normal_counts, np.int64(1))
+            # Dominant (count >= total) → no penalty (energy += 0)
 
-                # Vectorized int_log2_fine via LUT
-                # Build a temporary LUT for the unique ratios
+            # Normal (0 < count < total) → compute log2 ratio via LUT
+            if normal_mask.any():
+                normal_counts = counts[normal_mask]
+                # Integer division: total // count
+                safe_counts = np.maximum(normal_counts, np.int64(1))
+                ratios = total // safe_counts  # shape: (n_normal,)
+
+                # Build LUT: call int_log2_fine only for unique ratios,
+                # then map back via numpy fancy indexing.
                 unique_ratios = np.unique(ratios)
-                log2_lut = {}
+
+                # Pre-compute energy for each unique ratio
+                lut = np.zeros(int(unique_ratios.max()) + 1, dtype=np.int64)
                 for r in unique_ratios:
                     r_int = int(r)
                     if r_int >= 2:
-                        log2_lut[r_int] = (int_log2_fine(r_int) * state_scale) >> 8
-                    else:
-                        log2_lut[r_int] = 0
+                        lut[r_int] = (int_log2_fine(r_int) * state_scale) >> 8
+                    # ratio < 2 → energy 0 (word is very compatible)
 
-                # Apply energies
-                for i, idx in enumerate(normal_indices):
-                    r_int = int(ratios[i])
-                    energies[idx] += log2_lut.get(r_int, 0)
-
-            # Dominant words: energy += 0 (no penalty)
+                # Map LUT values back to all normal candidates at once
+                energies[normal_mask] += lut[ratios]
 
         return energies
 
