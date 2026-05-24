@@ -97,7 +97,7 @@ class IsingLMGenerator:
 
         self.copy_enabled = copy_enabled
         self.copy_min_context = copy_min_context
-        self.copy_min_confidence = copy_min_confidence
+        self.copy_min_confidence = copy_min_confidence  # Raised from 0.4 → 0.65 to reduce forced-copy streaks
         self.same_word_penalty = same_word_penalty
         self.max_closed_class_run = max_closed_class_run
         self.interpolated = interpolated
@@ -158,6 +158,7 @@ class IsingLMGenerator:
             'same_word_blocked': 0,
             'closed_loop_blocked': 0,
             'state_energy_sum': 0,
+            'chosen_state_energy': 0,  # Energy of chosen word only (not all candidates)
         }
 
     # ===================================================================
@@ -358,7 +359,7 @@ class IsingLMGenerator:
                             # Don't copy same word twice
                             if len(words) >= 1 and copy_word_idx == words[-1]:
                                 copy_word_idx = None
-                            elif consecutive_copies >= 6:
+                            elif consecutive_copies >= 3:  # Was 6, reduced to prevent repetition loops
                                 copy_word_idx = None
                             else:
                                 copy_word = copy_word_idx
@@ -375,9 +376,11 @@ class IsingLMGenerator:
             candidate_words = np.array(candidate_list, dtype=np.int64)
 
             # Top-k filtering by field strength (unigram frequency)
+            # h[w] = floor(log2(total/count)) — LOWER h = more common = more likely
+            # Keep the most common words (lowest h) as the backbone of generation
             if len(candidate_words) > 300:
                 field_vals = self.h[candidate_words]
-                top_k = np.argsort(field_vals)[-300:]
+                top_k = np.argsort(field_vals)[:300]  # LOWEST h = most common words
                 candidate_words = candidate_words[top_k]
 
             # === STEP 4: Compute energy ===
@@ -420,21 +423,19 @@ class IsingLMGenerator:
                         topic_hit = True
                         self._stats['topic_recall_hit'] += 1
 
-            # Track state energy
-            if self.document_state is not None and self.document_state._built:
-                state_e = self.document_state.compute_energy(
-                    candidate_words, state_scale=self.state_scale
-                )
-                self._stats['state_energy_sum'] += int(state_e.sum())
-
             # Additional penalties that depend on context
             # Vectorised repetition penalty for recent words
+            # Scale with recall_scale: common words with low recall energy need strong
+            # repetition suppression, otherwise they loop (e.g. "the the the")
             if len(words) > 0:
                 recent = set(words[-5:])
-                rep_penalty = max(200, self.recall_scale // 8)
+                rep_penalty = max(800, self.recall_scale // 2)  # Was max(200, recall_scale//8)
                 recent_arr = np.array(list(recent), dtype=np.int64)
                 mask = np.isin(candidate_words, recent_arr)
                 word_energies[mask] += rep_penalty
+                # Extra penalty for immediately previous word (prevent bigram loops)
+                if len(words) >= 1:
+                    word_energies[candidate_words == words[-1]] += rep_penalty  # stacks with above
 
             # === STEP 5: Boltzmann sample ===
             chosen_energy = 0
@@ -447,6 +448,19 @@ class IsingLMGenerator:
 
             words.append(chosen_word)
             types_list.append(chosen_type)
+
+            # Track state energy of chosen word (after selection)
+            if self.document_state is not None and self.document_state._built:
+                chosen_idx_arr = np.array([chosen_word], dtype=np.int64)
+                state_e = self.document_state.compute_energy(
+                    chosen_idx_arr, state_scale=self.state_scale
+                )
+                self._stats['chosen_state_energy'] += int(state_e[0])
+                # Legacy sum for backward compat
+                state_e_all = self.document_state.compute_energy(
+                    candidate_words, state_scale=self.state_scale
+                )
+                self._stats['state_energy_sum'] += int(state_e_all.sum())
 
             # === STEP 6: Update document state ===
             word_str = self.vocab.idx2word.get(chosen_word, "")
@@ -556,10 +570,12 @@ class IsingLMGenerator:
                     continue
                 candidate_words = np.array(candidate_list, dtype=np.int64)
 
-                # If the candidate set is very large, limit to top-500 + target
+                # If the candidate set is very large, limit to most common + target
+                # h[w] = floor(log2(total/count)) — LOWER = more common
+                # Keep common words for realistic PPL computation
                 if len(candidate_words) > 500:
                     field_vals = self.h[candidate_words]
-                    top_k = np.argsort(field_vals)[-499:]
+                    top_k = np.argsort(field_vals)[:499]  # LOWEST h = most common words
                     candidate_words = candidate_words[top_k]
                     # Always include target word
                     if int(target_word) not in set(candidate_words.tolist()):
@@ -602,10 +618,13 @@ class IsingLMGenerator:
                 # Vectorised repetition penalty (matches generation)
                 if len(context_words) > 0:
                     recent = set(context_words[-5:])
-                    rep_penalty = max(200, self.recall_scale // 8)
+                    rep_penalty = max(800, self.recall_scale // 2)  # Matches generation
                     recent_arr = np.array(list(recent), dtype=np.int64)
                     mask = np.isin(candidate_words, recent_arr)
                     energies[mask] += rep_penalty
+                    # Extra penalty for immediately previous word
+                    if len(context_words) >= 1:
+                        energies[candidate_words == context_words[-1]] += rep_penalty
 
                 # Compute log2 probabilities (integer, x LOG2_SCALE)
                 log_probs = sampler.compute_log_probabilities(energies)
@@ -675,6 +694,20 @@ class IsingLMGenerator:
     # ===================================================================
     # DIAGNOSTICS
     # ===================================================================
+
+    def reset_stats(self) -> None:
+        """Reset generation statistics for a new evaluation round."""
+        self._stats = {
+            'total_positions': 0,
+            'recall_hit': 0,
+            'pos_recall_hit': 0,
+            'topic_recall_hit': 0,
+            'copy_used': 0,
+            'same_word_blocked': 0,
+            'closed_loop_blocked': 0,
+            'state_energy_sum': 0,
+            'chosen_state_energy': 0,
+        }
 
     def get_stats(self) -> Dict:
         """Get generation statistics."""

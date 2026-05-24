@@ -202,8 +202,14 @@ def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
     return best_f, best_ppl
 
 
-def print_recall_diagnostics(model):
-    """Print per-scale recall diagnostics from the multi-scale recall layer."""
+def print_recall_diagnostics(model, include_generator_stats=True):
+    """Print per-scale recall diagnostics from the multi-scale recall layer.
+
+    Args:
+        model: The IsingLMModel instance.
+        include_generator_stats: If True, include generator stats (hits, copies, etc.).
+            Set to False before generation to avoid showing misleading zeros.
+    """
     print(f"\nMulti-Scale Recall Diagnostics:")
 
     # Word recall diagnostics
@@ -252,18 +258,22 @@ def print_recall_diagnostics(model):
             for k, v in ds_diag.items():
                 print(f"    {k}={v}")
 
-    # Generator stats (if generator exists)
-    if model.generator is not None and hasattr(model.generator, 'get_stats'):
+    # Generator stats (only after generation has run)
+    if include_generator_stats and model.generator is not None and hasattr(model.generator, 'get_stats'):
         gen_stats = model.generator.get_stats()
         print(f"  GENERATOR STATS:")
         word_hits = gen_stats.get("recall_hit", 0)
         pos_hits = gen_stats.get("pos_recall_hit", 0)
         topic_hits = gen_stats.get("topic_recall_hit", 0)
-        state_energy = gen_stats.get("state_energy_sum", 0)
-        print(f"    word_recall_hits={word_hits}")
-        print(f"    pos_recall_hits={pos_hits}")
-        print(f"    topic_recall_hits={topic_hits}")
-        print(f"    state_energy_sum={state_energy}")
+        copies = gen_stats.get("copy_used", 0)
+        copy_rate = gen_stats.get("copy_rate", 0.0)
+        total_pos = max(1, gen_stats.get("total_positions", 1))
+        state_energy = gen_stats.get("chosen_state_energy", 0)
+        print(f"    word_recall_hits={word_hits} ({word_hits/total_pos:.1%})")
+        print(f"    pos_recall_hits={pos_hits} ({pos_hits/total_pos:.1%})")
+        print(f"    topic_recall_hits={topic_hits} ({topic_hits/total_pos:.1%})")
+        print(f"    copies={copies} ({copy_rate:.1%})")
+        print(f"    chosen_state_energy={state_energy}")
 
 
 def auto_tune_for_memory(
@@ -585,7 +595,7 @@ def main():
         # Copy mechanism
         copy_enabled=True,
         copy_min_context=3,
-        copy_min_confidence=0.4,
+        copy_min_confidence=0.65,  # Raised from 0.4 — high copy rate caused repetition loops
         # Misc
         max_seq_len=args.max_seq_len,
         # v18 modules
@@ -650,13 +660,17 @@ def main():
 
     print(f"\nPPL (full, 100 seqs): {full_ppl:.2f}")
 
-    # --- Multi-Scale Recall Diagnostics ---
+    # --- Multi-Scale Recall Diagnostics (index stats only, before generation) ---
     print(f"\n{'=' * 70}")
-    print("RECALL DIAGNOSTICS")
+    print("RECALL DIAGNOSTICS (index stats)")
     print(f"{'=' * 70}")
-    print_recall_diagnostics(model)
+    print_recall_diagnostics(model, include_generator_stats=False)
 
     # --- Generation ---
+    # Reset generator stats before generation so diagnostics are meaningful
+    if model.generator is not None and hasattr(model.generator, 'reset_stats'):
+        model.generator.reset_stats()
+
     print(f"\n{'=' * 70}")
     print(f"GENERATION (PPL={full_ppl:.2f})")
     print(f"{'=' * 70}")
@@ -680,9 +694,10 @@ def main():
             pos_hits = stats.get("pos_recall_hit", 0)
             topic_hits = stats.get("topic_recall_hit", 0)
             copies = stats.get("copy_used", 0)
-            state_e = stats.get("state_energy_sum", 0)
+            state_e = stats.get("chosen_state_energy", 0)
+            copy_rate = stats.get("copy_rate", 0)
             print(f"  word_hits={word_hits} pos_hits={pos_hits} "
-                  f"topic_hits={topic_hits} copies={copies} state_energy={state_e}")
+                  f"topic_hits={topic_hits} copies={copies} copy_rate={copy_rate:.1%} state_energy={state_e}")
 
             generated_texts.append(text)
 
@@ -693,6 +708,12 @@ def main():
             print(f"  Generation error: {e}")
             traceback.print_exc()
             generated_texts.append("")
+
+    # --- Post-generation diagnostics (with actual stats) ---
+    print(f"\n{'=' * 70}")
+    print("RECALL DIAGNOSTICS (post-generation)")
+    print(f"{'=' * 70}")
+    print_recall_diagnostics(model, include_generator_stats=True)
 
     # --- Save Results ---
     results = {

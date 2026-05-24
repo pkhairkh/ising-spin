@@ -226,6 +226,6 @@ class EnergyComputer:
                 and current_type not in allowed
                 for w in candidate_words
             ], dtype=bool)
-            energies[violates_pos] += 5000  # Hard constraint
+            energies[violates_pos] += 50000  # Hard constraint (was 5000, too soft for scale=1600 recall)
 
         return energies
