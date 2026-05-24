@@ -150,6 +150,20 @@ class LatentSpinGlass:
     # Sigma noise injection probability
     DEFAULT_NOISE_PROB = 0.02
 
+    # Spin vector decorrelation: mean-center accumulators before sign()
+    # This fixes the representation collapse where avg Hamming = 25% (should be ~50%).
+    # Without centering, common words create a shared "background" in the accumulator,
+    # causing most dimensions to have the same sign across words.
+    DEFAULT_DECORRELATE = True
+
+    # J_learned sparsity: fraction of couplings to KEEP after Top-K thresholding.
+    # The Hopfield storage rule with N_patterns >> D produces a dense J that is
+    # essentially the rank-1 outer product of the magnetization vector — no useful
+    # structure. Keeping only the strongest K% creates structural sparsity with
+    # clear attractor basins instead of a flat, frustrated landscape.
+    # 0.0 = keep all (no sparsification), 1.0 = keep nothing (degenerate)
+    DEFAULT_J_SPARSITY = 0.15  # Keep top 15% of couplings
+
     def __init__(
         self,
         vocab_size: int,
@@ -164,6 +178,8 @@ class LatentSpinGlass:
         context_window: int = 5,
         n_j_windows: int = 200000,
         seed: int = 42,
+        decorrelate: bool = True,
+        j_sparsity: float = 0.15,
     ):
         """
         Initialize Learned Latent Spin Glass.
@@ -194,6 +210,8 @@ class LatentSpinGlass:
         self.context_window = context_window
         self.n_j_windows = n_j_windows
         self.seed = seed
+        self.decorrelate = decorrelate
+        self.j_sparsity = j_sparsity
 
         # --- Spin vectors (LEARNED during training) ---
         # sigma_w[w] = binary spin vector for word w
@@ -319,13 +337,46 @@ class LatentSpinGlass:
                 print(f"      Spin vectors: {seq_idx+1}/{n_seqs} seqs, "
                       f"{n_words_seen} words with context")
 
-        # Compute spin vectors: sign of accumulated projections
+        # --- Decorrelation: mean-center accumulators before sign() ---
+        #
+        # ROOT CAUSE of 25.4% Hamming (should be ~50%):
+        #   Common words appear in many contexts, contributing their R[w']
+        #   entries to many other words' accumulators. This creates a shared
+        #   "background" signal that biases most dimensions toward the same
+        #   sign across words. The sign() function then snaps this small bias
+        #   into a hard +1/-1, collapsing the representation.
+        #
+        # FIX: Subtract the per-dimension mean of the accumulator across all
+        #   seen words. This removes the frequency-driven common component,
+        #   leaving only the distinctive signal for each word.
+        #
+        #   This is analogous to mean-centering before PCA: the first principal
+        #   component of the uncentered data is dominated by the mean, but after
+        #   centering, the PCs capture actual variance structure.
+        #
+        #   Note: float64 is used for the mean computation only. This is a
+        #   one-time build step, not the inference hot path. The resulting
+        #   spin vectors are still pure int8 {-1, +1}.
+        #
+        if self.decorrelate:
+            seen_mask = word_counts > 0
+            seen_acc = spin_acc[seen_mask].astype(np.float64)  # (n_seen, D)
+            dim_mean = np.mean(seen_acc, axis=0)  # (D,) float64
+            # Center: subtract the per-dimension mean
+            spin_acc_centered = spin_acc.copy()
+            spin_acc_centered[seen_mask] -= dim_mean.astype(np.int32)
+            print(f"      Decorrelation: dim_mean range [{dim_mean.min():.0f}, {dim_mean.max():.0f}], "
+                  f"|mean|_avg={np.mean(np.abs(dim_mean)):.0f}")
+        else:
+            spin_acc_centered = spin_acc
+            seen_mask = word_counts > 0
+
+        # Compute spin vectors: sign of (centered) accumulated projections
         # sigma_w[d] = +1 if projection > 0, -1 if < 0, +1 if = 0 (break symmetry)
-        spin_vectors = np.sign(spin_acc).astype(np.int8)
+        spin_vectors = np.sign(spin_acc_centered).astype(np.int8)
         # Where accumulator is exactly zero (no context seen), default to +1
-        zero_mask = spin_acc == 0
+        zero_mask = spin_acc_centered == 0
         # But only for words that were seen — unseen words stay at 0
-        seen_mask = word_counts > 0
         spin_vectors[zero_mask & seen_mask[:, np.newaxis]] = 1
         # Unseen words get random spins (break symmetry)
         unseen_mask = word_counts == 0
@@ -418,6 +469,44 @@ class LatentSpinGlass:
 
             # Zero diagonal (no self-coupling)
             np.fill_diagonal(J_scaled, 0)
+
+            # --- Top-K Sparsification of J_learned ---
+            #
+            # ROOT CAUSE of 99.4% dense, frustrated J:
+            #   The Hopfield storage rule J = S^T @ S with N_patterns >> D
+            #   produces a dense matrix. With 200K patterns in 256 dimensions
+            #   (capacity ~ 36 patterns), J is essentially the average outer
+            #   product — a rank-deficient correlation matrix with no useful
+            #   attractor structure.
+            #
+            # FIX: Keep only the strongest K% of couplings by absolute value.
+            #   The strongest couplings capture the REAL dependency structure
+            #   between spin dimensions. The weak couplings are noise from
+            #   storing far more patterns than capacity.
+            #
+            #   A sparse J has:
+            #   - Clear attractor basins (strong couplings create energy wells)
+            #   - Low frustration (the dominant couplings are self-consistent)
+            #   - Efficient computation (fewer multiply-accumulates)
+            #
+            if 0 < self.j_sparsity < 1.0:
+                abs_J = np.abs(J_scaled)
+                # Only consider off-diagonal elements for threshold
+                off_diag_mask = ~np.eye(D, dtype=bool)
+                off_diag_abs = abs_J[off_diag_mask]
+                if len(off_diag_abs) > 0 and np.any(off_diag_abs > 0):
+                    # Compute threshold: keep top j_sparsity fraction
+                    percentile = (1.0 - self.j_sparsity) * 100
+                    threshold = int(np.percentile(off_diag_abs[off_diag_abs > 0], percentile))
+                    # Apply: zero out weak couplings
+                    weak_mask = (abs_J < threshold) & off_diag_mask
+                    J_scaled[weak_mask] = 0
+
+                    n_after = int(np.sum(J_scaled != 0))
+                    total_off_diag = D * (D - 1)
+                    print(f"      J sparsification: kept {n_after}/{total_off_diag} "
+                          f"({100*n_after/total_off_diag:.1f}%) "
+                          f"at threshold={threshold} (target={self.j_sparsity*100:.0f}%)")
 
             self.J_learned = J_scaled
 

@@ -143,6 +143,8 @@ class IsingLMModel:
         latent_spin_temperature: int = 0,
         latent_spin_context_window: int = 5,
         latent_spin_n_j_windows: int = 200000,
+        latent_spin_decorrelate: bool = True,
+        latent_spin_j_sparsity: float = 0.15,
         # Memory budget
         memory_budget_mb: int = 0,
     ):
@@ -215,6 +217,8 @@ class IsingLMModel:
         self.latent_spin_temperature = latent_spin_temperature
         self.latent_spin_context_window = latent_spin_context_window
         self.latent_spin_n_j_windows = latent_spin_n_j_windows
+        self.latent_spin_decorrelate = latent_spin_decorrelate
+        self.latent_spin_j_sparsity = latent_spin_j_sparsity
 
         # Memory budget
         self.memory_budget_mb = memory_budget_mb
@@ -642,6 +646,8 @@ class IsingLMModel:
                 temperature=self.latent_spin_temperature,
                 context_window=self.latent_spin_context_window,
                 n_j_windows=self.latent_spin_n_j_windows,
+                decorrelate=self.latent_spin_decorrelate,
+                j_sparsity=self.latent_spin_j_sparsity,
             )
             self.latent_spin.build(self.sequences)
             diag = self.latent_spin.get_diagnostics()

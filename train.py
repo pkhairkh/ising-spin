@@ -486,6 +486,10 @@ def main():
                         help="Context window for spin vector learning (default: 5)")
     parser.add_argument("--latent-spin-n-j-windows", type=int, default=200000,
                         help="Number of windows for J_learned (default: 200K)")
+    parser.add_argument("--no-latent-spin-decorrelate", action="store_true",
+                        help="Disable spin vector decorrelation (mean-centering before sign)")
+    parser.add_argument("--latent-spin-j-sparsity", type=float, default=0.15,
+                        help="Fraction of J_learned couplings to KEEP after Top-K (default: 0.15, set 1.0 to disable)")
 
     # Dataset selection
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
@@ -627,7 +631,9 @@ def main():
           f" (D={args.latent_spin_dim}, alpha_q8={args.latent_spin_alpha},"
           f" eta={args.latent_spin_eta}, scale={args.latent_spin_scale},"
           f" coupling_scale={args.latent_spin_coupling_scale},"
-          f" temp={args.latent_spin_temperature})")
+          f" temp={args.latent_spin_temperature},"
+          f" decorrelate={not args.no_latent_spin_decorrelate},"
+          f" j_sparsity={args.latent_spin_j_sparsity})")
     print(f"{'=' * 70}")
 
     # --- Train ---
@@ -702,6 +708,8 @@ def main():
         latent_spin_temperature=args.latent_spin_temperature,
         latent_spin_context_window=args.latent_spin_context_window,
         latent_spin_n_j_windows=args.latent_spin_n_j_windows,
+        latent_spin_decorrelate=not args.no_latent_spin_decorrelate,
+        latent_spin_j_sparsity=args.latent_spin_j_sparsity,
         # Memory budget
         memory_budget_mb=args.memory_budget,
     )
