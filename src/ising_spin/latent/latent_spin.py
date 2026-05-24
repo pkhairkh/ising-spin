@@ -337,54 +337,74 @@ class LatentSpinGlass:
                 print(f"      Spin vectors: {seq_idx+1}/{n_seqs} seqs, "
                       f"{n_words_seen} words with context")
 
-        # --- Decorrelation: mean-center accumulators before sign() ---
+        # --- Decorrelation: per-dimension balanced rank binarization ---
         #
-        # ROOT CAUSE of 25.4% Hamming (should be ~50%):
-        #   Common words appear in many contexts, contributing their R[w']
-        #   entries to many other words' accumulators. This creates a shared
-        #   "background" signal that biases most dimensions toward the same
-        #   sign across words. The sign() function then snaps this small bias
-        #   into a hard +1/-1, collapsing the representation.
+        # WHY NOT mean-centering + sign():
+        #   Mean-centering removes the average bias but does NOT guarantee
+        #   balanced spins. With skewed accumulator distributions (common in
+        #   small corpora like TinyStories), most values can still fall on the
+        #   same side of zero after centering. Empirical result:
+        #     Hamming 25.4% → 33.2% (improved but far from 50%)
+        #     Magnetization 173/256 → 236/256 (WORSE!)
         #
-        # FIX: Subtract the per-dimension mean of the accumulator across all
-        #   seen words. This removes the frequency-driven common component,
-        #   leaving only the distinctive signal for each word.
+        # WHY balanced rank binarization:
+        #   For each dimension, rank all seen words by accumulator value,
+        #   assign +1 to the top 50% and -1 to the bottom 50%.
         #
-        #   This is analogous to mean-centering before PCA: the first principal
-        #   component of the uncentered data is dominated by the mean, but after
-        #   centering, the PCs capture actual variance structure.
+        #   This GUARANTEES:
+        #     - Exactly 50% +1 per dimension → magnetization = 0
+        #     - Maximum Hamming distance → ~50% (theoretical optimum)
+        #     - The split is meaningful: words with higher context evidence
+        #       for a dimension get +1, those with lower evidence get -1
         #
-        #   Note: float64 is used for the mean computation only. This is a
-        #   one-time build step, not the inference hot path. The resulting
-        #   spin vectors are still pure int8 {-1, +1}.
+        #   This is the binary analog of median-split: instead of thresholding
+        #   at a fixed value (mean/zero), we threshold at the empirical median,
+        #   which adapts to the actual distribution shape.
         #
         if self.decorrelate:
             seen_mask = word_counts > 0
-            seen_acc = spin_acc[seen_mask].astype(np.float64)  # (n_seen, D)
-            dim_mean = np.mean(seen_acc, axis=0)  # (D,) float64
-            # Center: subtract the per-dimension mean
-            spin_acc_centered = spin_acc.copy()
-            spin_acc_centered[seen_mask] -= dim_mean.astype(np.int32)
-            print(f"      Decorrelation: dim_mean range [{dim_mean.min():.0f}, {dim_mean.max():.0f}], "
-                  f"|mean|_avg={np.mean(np.abs(dim_mean)):.0f}")
-        else:
-            spin_acc_centered = spin_acc
-            seen_mask = word_counts > 0
+            seen_indices = np.where(seen_mask)[0]
+            n_seen = len(seen_indices)
+            n_pos_target = n_seen // 2  # Exactly half +1 per dimension
 
-        # Compute spin vectors: sign of (centered) accumulated projections
-        # sigma_w[d] = +1 if projection > 0, -1 if < 0, +1 if = 0 (break symmetry)
-        spin_vectors = np.sign(spin_acc_centered).astype(np.int8)
-        # Where accumulator is exactly zero (no context seen), default to +1
-        zero_mask = spin_acc_centered == 0
-        # But only for words that were seen — unseen words stay at 0
-        spin_vectors[zero_mask & seen_mask[:, np.newaxis]] = 1
-        # Unseen words get random spins (break symmetry)
-        unseen_mask = word_counts == 0
-        if np.any(unseen_mask):
-            n_unseen = int(np.sum(unseen_mask))
-            spin_vectors[unseen_mask] = rng.choice(
-                [-1, 1], size=(n_unseen, D)
-            ).astype(np.int8)
+            spin_vectors = np.zeros((V, D), dtype=np.int8)
+
+            for d in range(D):
+                col = spin_acc[seen_indices, d]
+                # Rank: highest accumulator values get +1
+                order = np.argsort(col)  # ascending order
+                # Bottom half → -1, top half → +1
+                assignments = np.full(n_seen, -1, dtype=np.int8)
+                assignments[order[n_seen - n_pos_target:]] = 1
+                spin_vectors[seen_indices, d] = assignments
+
+            # Unseen words: balanced random spins (exactly D/2 +1, D/2 -1)
+            unseen_mask = word_counts == 0
+            if np.any(unseen_mask):
+                n_unseen = int(np.sum(unseen_mask))
+                template = np.array(
+                    [1] * (D // 2) + [-1] * (D - D // 2), dtype=np.int8
+                )
+                balanced = np.zeros((n_unseen, D), dtype=np.int8)
+                for i in range(n_unseen):
+                    rng.shuffle(template)
+                    balanced[i] = template.copy()
+                spin_vectors[unseen_mask] = balanced
+
+            print(f"      Decorrelation: balanced rank binarization "
+                  f"({n_seen} words, {n_pos_target}/{n_seen} +1 per dim)")
+        else:
+            # Original: sign of raw accumulator
+            seen_mask = word_counts > 0
+            spin_vectors = np.sign(spin_acc).astype(np.int8)
+            zero_mask = spin_acc == 0
+            spin_vectors[zero_mask & seen_mask[:, np.newaxis]] = 1
+            unseen_mask = word_counts == 0
+            if np.any(unseen_mask):
+                n_unseen = int(np.sum(unseen_mask))
+                spin_vectors[unseen_mask] = rng.choice(
+                    [-1, 1], size=(n_unseen, D)
+                ).astype(np.int8)
 
         self.spin_vectors = spin_vectors
         n_with_features = int(np.sum(word_counts > 0))
