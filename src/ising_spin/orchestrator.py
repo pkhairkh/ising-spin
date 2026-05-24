@@ -36,60 +36,11 @@ from .recall import WordNgramIndex, PosNgramIndex, TopicNgramIndex, MultiScaleRe
 from .state import DocumentState
 from .energy import EnergyComputer
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
-from .utils import get_rss_mb, primary_pos_tag, TAG_PRIORITY
+from .utils import (
+    get_rss_mb, primary_pos_tag, TAG_PRIORITY,
+    load_fineweb_edu, tokenize_texts, truncate_sequences,
+)
 from .exceptions import BuildError, ConfigurationError
-
-
-def _tokenize_texts(texts: List[str], vocab: Vocabulary) -> List[List[int]]:
-    """Tokenize a list of texts using the vocabulary. Pure integer encoding."""
-    sequences = []
-    for text in texts:
-        tokens = vocab.encode(text)
-        if len(tokens) > 0:
-            sequences.append(tokens)
-    return sequences
-
-
-def _truncate_sequences(sequences: List[List[int]], max_len: int = 30) -> List[List[int]]:
-    """Truncate sequences to max_len and filter short ones."""
-    return [seq[:max_len] for seq in sequences if len(seq) > 1]
-
-
-def _load_fineweb_edu(
-    n_samples: int = 50000,
-    split: str = "train",
-    subset: str = "sample-10BT",
-    min_length: int = 20,
-    max_length: int = 2000,
-) -> List[str]:
-    """Load text samples from the fineweb-edu dataset on HuggingFace."""
-    from datasets import load_dataset
-
-    print(f"Loading fineweb-edu ({subset}, split={split})...")
-
-    dataset = None
-    for name in ["HuggingFaceFW/fineweb-edu", "HuggingFW/fineweb-edu"]:
-        try:
-            dataset = load_dataset(name, name=subset, split=split, streaming=True)
-            print(f"  Loaded from '{name}' with subset '{subset}'")
-            break
-        except Exception:
-            continue
-
-    if dataset is None:
-        raise RuntimeError("Could not load fineweb-edu dataset. Install 'datasets' package.")
-
-    texts = []
-    for i, item in enumerate(dataset):
-        if len(texts) >= n_samples:
-            break
-        text = item.get("text", "")
-        if min_length <= len(text) <= max_length:
-            texts.append(text)
-        if (i + 1) % 10000 == 0:
-            print(f"  Scanned {i + 1} items, collected {len(texts)} texts")
-
-    return texts
 
 
 class IsingLMModel:
@@ -150,6 +101,16 @@ class IsingLMModel:
         copy_min_confidence: float = 0.4,
         # Misc
         max_seq_len: int = 30,
+        # v18 modules
+        enable_reservoir: bool = False,
+        enable_coupling: bool = False,
+        enable_vsa: bool = False,
+        reservoir_dim: int = 512,
+        reservoir_alpha_q15: int = 31130,
+        reservoir_scale: int = 800,
+        coupling_scale: int = 200,
+        vsa_scale: int = 800,
+        vsa_dim: int = 512,
     ):
         # Store all params
         self.vocab_min_freq = vocab_min_freq
@@ -178,6 +139,17 @@ class IsingLMModel:
         self.copy_min_confidence = copy_min_confidence
         self.max_seq_len = max_seq_len
 
+        # v18 flags and params
+        self.enable_reservoir = enable_reservoir
+        self.enable_coupling = enable_coupling
+        self.enable_vsa = enable_vsa
+        self.reservoir_dim = reservoir_dim
+        self.reservoir_alpha_q15 = reservoir_alpha_q15
+        self.reservoir_scale = reservoir_scale
+        self.coupling_scale = coupling_scale
+        self.vsa_scale = vsa_scale
+        self.vsa_dim = vsa_dim
+
         # Built during training
         self.vocab: Optional[Vocabulary] = None
         self.pos_system: Optional[POSTypeSystem] = None
@@ -189,6 +161,10 @@ class IsingLMModel:
         self.document_state: Optional[DocumentState] = None
         self.energy_computer: Optional[EnergyComputer] = None
         self.generator = None  # IsingLMGenerator
+
+        # v18 built modules
+        self.reservoir = None  # IntegerESN
+        self.vsa_encoder = None  # VSAEncoder
 
         self.sequences: Optional[List[List[int]]] = None
         self.test_sequences: Optional[List[List[int]]] = None
@@ -227,7 +203,7 @@ class IsingLMModel:
         # ------------------------------------------------------------------
         if texts is None:
             print("[1/14] Loading corpus...")
-            texts = _load_fineweb_edu(n_samples=n_samples)
+            texts = load_fineweb_edu(n_samples=n_samples)
             print(f"  Loaded {len(texts)} texts ({time.time()-t0:.1f}s)")
         else:
             print(f"[1/14] Using provided texts ({len(texts)} texts)")
@@ -247,8 +223,8 @@ class IsingLMModel:
         # Step 3: Tokenize texts → sequences
         # ------------------------------------------------------------------
         print("\n[3/14] Tokenizing texts...")
-        sequences = _tokenize_texts(texts, self.vocab)
-        sequences = _truncate_sequences(sequences, max_len=self.max_seq_len)
+        sequences = tokenize_texts(texts, self.vocab)
+        sequences = truncate_sequences(sequences, max_len=self.max_seq_len)
         print(f"  Tokenized: {len(sequences):,} sequences")
 
         # ------------------------------------------------------------------
@@ -383,10 +359,58 @@ class IsingLMModel:
             pos_system=self.pos_system,
             word_topics=self.topic_assigner.word_topics,
         )
-        self.document_state.build(self.sequences)
+        self.document_state.build(self.sequences, idx2word=self.vocab.idx2word)
 
         # ------------------------------------------------------------------
-        # Step 12: Build energy computer
+        # Step 11b: Build factorial state coupling (v18)
+        # ------------------------------------------------------------------
+        if self.enable_coupling:
+            print("\n[11b] Building factorial state coupling (v18)...")
+            self.document_state.build_coupling(
+                self.sequences,
+                idx2word=self.vocab.idx2word,
+            )
+        else:
+            print("\n[11b] Factorial state coupling: DISABLED")
+
+        # ------------------------------------------------------------------
+        # Step 11c: Build ESN reservoir (v18)
+        # ------------------------------------------------------------------
+        if self.enable_reservoir:
+            print(f"\n[11c] Building ESN reservoir (v18, D={self.reservoir_dim})...")
+            from .reservoir import IntegerESN
+            self.reservoir = IntegerESN(
+                vocab_size=len(self.vocab),
+                reservoir_dim=self.reservoir_dim,
+                alpha_q15=self.reservoir_alpha_q15,
+            )
+            self.reservoir.build(self.sequences)
+        else:
+            print("\n[11c] ESN reservoir: DISABLED")
+            self.reservoir = None
+
+        # ------------------------------------------------------------------
+        # Step 11d: Build VSA encoder (v18)
+        # ------------------------------------------------------------------
+        if self.enable_vsa:
+            print(f"\n[11d] Building VSA encoder (v18, D={self.vsa_dim})...")
+            from .vsa import VSAEncoder
+            self.vsa_encoder = VSAEncoder(
+                vocab_size=len(self.vocab),
+                n_pos=N_POS,
+                n_topics=self.n_topics,
+                dimension=self.vsa_dim,
+            )
+            self.vsa_encoder.build(
+                pos_system=self.pos_system,
+                word_topics=self.topic_assigner.word_topics,
+            )
+        else:
+            print("\n[11d] VSA encoder: DISABLED")
+            self.vsa_encoder = None
+
+        # ------------------------------------------------------------------
+        # Step 12: Build energy computer (with v18 modules)
         # ------------------------------------------------------------------
         print("\n[12/14] Building energy computer...")
         self.energy_computer = EnergyComputer(
@@ -399,7 +423,25 @@ class IsingLMModel:
             state_scale=self.state_scale,
             same_word_penalty=self.same_word_penalty,
             max_closed_class_run=self.max_closed_class_run,
+            # v18 energy scales
+            coupling_scale=self.coupling_scale,
+            reservoir_scale=self.reservoir_scale,
+            vsa_scale=self.vsa_scale,
+            # v18 modules
+            reservoir=self.reservoir,
+            vsa_encoder=self.vsa_encoder,
         )
+        v18_terms = []
+        if self.enable_coupling:
+            v18_terms.append("coupling")
+        if self.enable_reservoir:
+            v18_terms.append("reservoir")
+        if self.enable_vsa:
+            v18_terms.append("VSA")
+        if v18_terms:
+            print(f"  v18 energy terms: {', '.join(v18_terms)}")
+        else:
+            print(f"  v18 energy terms: NONE (base model)")
 
         # ------------------------------------------------------------------
         # Step 13: Auto-calibrate beta
@@ -550,6 +592,8 @@ class IsingLMModel:
             pos_recall_scale=self.pos_recall_scale,
             topic_recall_scale=self.topic_recall_scale,
             state_scale=self.state_scale,
+            # v18: ESN reservoir
+            reservoir=self.reservoir,
         )
 
     # ===================================================================

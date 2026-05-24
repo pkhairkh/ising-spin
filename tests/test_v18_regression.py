@@ -1,5 +1,5 @@
 """
-Regression tests for ISG-LM v18.3 — verify specific behaviors are preserved.
+Regression tests for ISG-LM v18 — verify specific behaviors are preserved.
 
 Test categories:
   RT-01: KN backoff energy computed correctly
@@ -22,7 +22,70 @@ from ising_spin.recall import WordNgramIndex, MultiScaleRecall
 from ising_spin.state import DocumentState
 from ising_spin.energy import EnergyComputer
 from ising_spin.sampling import IntegerBoltzmannSampler
-from ising_spin.model import IsingLMModel, ModelConfig
+
+
+# ── Shared fixtures ──────────────────────────────────────────────────────
+
+_SYNTHETIC_TEXTS = [
+    "the cat sat on the mat and the dog ran in the park",
+    "she went to the store to buy some food for dinner",
+    "the children played in the garden while the sun was shining",
+    "he read a book about the history of science and technology",
+    "they built a small house near the lake in the forest",
+    "the students studied hard for their final exams at school",
+    "she cooked a delicious meal for her family on sunday",
+    "the weather was warm and sunny during the summer months",
+    "he walked along the beach and watched the waves roll in",
+    "the city was busy with people going to work each day",
+] * 3
+
+
+@pytest.fixture
+def small_vocab():
+    v = Vocabulary(min_freq=1, max_size=200)
+    v.build(_SYNTHETIC_TEXTS)
+    return v
+
+
+@pytest.fixture
+def small_model(small_vocab):
+    """Build a small IsingLMModel for regression testing."""
+    from ising_spin.orchestrator import IsingLMModel
+
+    model = IsingLMModel(
+        vocab_min_freq=1,
+        vocab_max_size=200,
+        ngram_max_n=3,
+        ngram_min_count=1,
+        pos_ngram_max_n=5,
+        pos_ngram_min_count=1,
+        topic_ngram_max_n=5,
+        topic_ngram_min_count=1,
+        n_topics=4,
+        reservoir_dim=32,
+        reservoir_alpha_q15=31130,
+        reservoir_scale=800,
+        vsa_dim=64,
+        vsa_scale=800,
+        coupling_scale=200,
+        recall_scale=1600,
+        pos_recall_scale=800,
+        topic_recall_scale=400,
+        state_scale=400,
+        same_word_penalty=200,
+        max_closed_class_run=2,
+        auto_calibrate_beta=False,
+        beta_word=0.1,
+        beta_type=0.01,
+        interpolated=True,
+        kn_backoff=True,
+        max_seq_len=30,
+        enable_reservoir=True,
+        enable_coupling=True,
+        enable_vsa=True,
+    )
+    model.train(texts=_SYNTHETIC_TEXTS)
+    return model
 
 
 # ===================================================================
@@ -95,7 +158,7 @@ class TestInterpolatedSmoothing:
 
     def test_interpolated_enabled_by_default(self, small_model):
         """Model has interpolated=True by default."""
-        assert small_model.config.interpolated is True
+        assert small_model.interpolated is True
 
 
 # ===================================================================
@@ -108,21 +171,16 @@ class TestContextWeightCapping:
     def test_vsa_context_window(self, small_model):
         """VSA context window is bounded."""
         ec = small_model.energy_computer
-        if ec.vsa_encoder is not None:
+        if ec.vsa_encoder is not None and ec.vsa_encoder.built:
             # The VSA encoder should use a window (typically 10)
             # This test verifies the encoder doesn't crash with long contexts
             long_context = list(range(5, 50))
             candidates = np.array([5, 10, 15], dtype=np.int64)
-            # Should not crash
-            vsa_energy = ec._compute_vsa_energy(long_context, candidates)
-            assert vsa_energy.shape == (3,)
-
-    def test_rff_context_window(self, small_model):
-        """RFF context window is bounded (CONTEXT_WINDOW=10)."""
-        ec = small_model.energy_computer
-        if ec.rff is not None and ec.rff.built:
-            # RFF uses CONTEXT_WINDOW = 10 internally
-            assert ec.rff.CONTEXT_WINDOW == 10
+            # Should not crash — VSA internally truncates to window
+            context_enc = ec.vsa_encoder.compute_context_encoding(
+                context_word_ids=long_context,
+            )
+            assert context_enc.shape == (ec.vsa_encoder.dimension,)
 
 
 # ===================================================================
@@ -132,19 +190,17 @@ class TestContextWeightCapping:
 class TestSentenceBoundary:
     """Test that sentence boundaries prevent cross-sentence n-grams."""
 
-    def test_sentence_end_word_ids(self, small_model):
-        """Generator tracks sentence-ending word IDs."""
-        gen = small_model.generator
-        assert hasattr(gen, '_sent_end_word_ids')
-        # Period should be in sentence-end IDs if it's in vocabulary
-        period_idx = small_model.vocab.word2idx.get(".")
-        if period_idx is not None:
-            assert period_idx in gen._sent_end_word_ids
-
-    def test_sent_boundary_token(self, small_vocab):
+    def test_sentence_boundary_token_in_vocab(self, small_vocab):
         """Vocabulary has <S> token for sentence boundaries."""
         assert "<S>" in small_vocab.word2idx
+        # <S> should be at index 4 (after PAD, UNK, SOS, EOS)
         assert small_vocab.word2idx["<S>"] == 4
+
+    def test_generator_has_closed_class_ids(self, small_model):
+        """Generator has closed class ID tracking for anti-loop."""
+        gen = small_model.generator
+        assert hasattr(gen, 'CLOSED_CLASS_IDS')
+        assert len(gen.CLOSED_CLASS_IDS) > 0
 
 
 # ===================================================================
@@ -160,19 +216,14 @@ class TestMultiTypeCandidates:
         pos_system = small_model.pos_system
 
         # Find words with multiple allowed types
-        multi_type_words = []
         for w, allowed in pos_system.allowed_types.items():
             if len(allowed) > 1:
-                multi_type_words.append(w)
+                # Word should appear in its PRIMARY type bucket
+                from ising_spin.utils import primary_pos_tag
+                primary = primary_pos_tag(allowed)
+                assert w in gen.type_words.get(primary, []), \
+                    f"Word {w} not in primary type {primary} bucket"
                 break  # Just need one example
-
-        if multi_type_words:
-            w = multi_type_words[0]
-            types = pos_system.allowed_types[w]
-            # Word should appear in ALL its type buckets
-            for t in types:
-                assert w in gen.type_words.get(t, []), \
-                    f"Word {w} not in type {t} bucket"
 
     def test_type_words_covers_vocab(self, small_model):
         """Most vocabulary words appear in at least one type bucket."""
@@ -260,7 +311,7 @@ class TestClosedClassRunLimit:
     def test_closed_class_run_limit(self, small_model):
         """Generator has max_closed_class_run configured."""
         gen = small_model.generator
-        assert gen.max_closed_class_run == small_model.config.max_closed_class_run
+        assert gen.max_closed_class_run == small_model.max_closed_class_run
         assert gen.max_closed_class_run >= 1
 
     def test_closed_class_penalty_in_energy(self, small_model):

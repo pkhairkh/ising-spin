@@ -26,6 +26,11 @@ from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
 from .utils import TAG_PRIORITY, primary_pos_tag, validate_positive
 from .exceptions import ValidationError
 
+# v18 optional imports (TYPE_CHECKING only to avoid circular imports)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .reservoir.integer_esn import IntegerESN
+
 
 class IsingLMGenerator:
     """
@@ -77,6 +82,8 @@ class IsingLMGenerator:
         pos_recall_scale: int = 800,
         topic_recall_scale: int = 400,
         state_scale: int = 200,
+        # v18 optional modules
+        reservoir: Optional["IntegerESN"] = None,
     ):
         self.vocab = vocab
         self.pos_system = pos_system
@@ -100,6 +107,9 @@ class IsingLMGenerator:
         self.pos_recall_scale = pos_recall_scale
         self.topic_recall_scale = topic_recall_scale
         self.state_scale = state_scale
+
+        # v18: ESN reservoir for long-range temporal dynamics
+        self.reservoir = reservoir
 
         # Build type→words index from POS system (using shared primary_pos_tag)
         self.type_words: Dict[int, List[int]] = {t: [] for t in range(N_POS)}
@@ -286,9 +296,15 @@ class IsingLMGenerator:
 
         # Initialize document state from prompt
         self.document_state.reset()
+        # v18: Reset reservoir state for new document
+        if self.reservoir is not None:
+            self.reservoir.reset()
         for w in words:
             word_str = self.vocab.idx2word.get(w, "")
             self.document_state.update(w, word_str=word_str)
+            # v18: Advance reservoir state with each prompt word
+            if self.reservoir is not None:
+                self.reservoir.step(w)
 
         for pos in range(len(words), length):
             # === STEP 1: Choose POS type (BOLTZMANN) ===
@@ -405,6 +421,14 @@ class IsingLMGenerator:
             word_str = self.vocab.idx2word.get(chosen_word, "")
             self.document_state.update(chosen_word, word_str=word_str)
 
+            # v18: Run mean-field inference after state update (if coupling built)
+            if self.document_state._coupling_built:
+                self.document_state.run_mean_field()
+
+            # v18: Advance ESN reservoir state
+            if self.reservoir is not None:
+                self.reservoir.step(chosen_word)
+
             # Track diagnostics
             self._stats['total_positions'] += 1
             recall_hit = False
@@ -488,6 +512,9 @@ class IsingLMGenerator:
 
             # Reset document state for each new sequence
             self.document_state.reset()
+            # v18: Reset reservoir for each new sequence
+            if self.reservoir is not None:
+                self.reservoir.reset()
 
             for pos in range(1, len(seq)):
                 target_word = seq[pos]
@@ -518,9 +545,13 @@ class IsingLMGenerator:
                     # Target not reachable; use smoothing
                     total_log2_prob += -15 * LOG2_SCALE
                     total_tokens += 1
-                    # Still update document state
+                    # Still update document state + v18 modules
                     word_str = self.vocab.idx2word.get(target_word, "")
                     self.document_state.update(target_word, word_str=word_str)
+                    if self.document_state._coupling_built:
+                        self.document_state.run_mean_field()
+                    if self.reservoir is not None:
+                        self.reservoir.step(target_word)
                     continue
 
                 # Compute closed_class_run for context
@@ -565,6 +596,12 @@ class IsingLMGenerator:
                 # Update document state with actual next word
                 word_str = self.vocab.idx2word.get(target_word, "")
                 self.document_state.update(target_word, word_str=word_str)
+
+                # v18: Run mean-field after state update + advance reservoir
+                if self.document_state._coupling_built:
+                    self.document_state.run_mean_field()
+                if self.reservoir is not None:
+                    self.reservoir.step(target_word)
 
         if total_tokens == 0:
             return float('inf')

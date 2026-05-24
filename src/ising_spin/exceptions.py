@@ -5,6 +5,8 @@ All domain-specific exceptions inherit from IsingSpinError, enabling
 catch-all handling at the package level while still allowing fine-grained
 per-domain catch blocks.
 
+IsingError is kept as a backward-compatible alias for IsingSpinError.
+
 Usage:
     try:
         model.train(texts=texts)
@@ -19,6 +21,10 @@ class IsingSpinError(Exception):
     """Base exception for all ising_spin errors."""
 
 
+# Backward-compatible alias
+IsingError = IsingSpinError
+
+
 # ── Build / Training Errors ──────────────────────────────────────────────
 
 class BuildError(IsingSpinError):
@@ -29,8 +35,16 @@ class VocabularyBuildError(BuildError):
     """Raised when vocabulary construction fails."""
 
 
+class CorpusError(BuildError):
+    """Raised when corpus loading or tokenization fails."""
+
+
 class IndexBuildError(BuildError):
     """Raised when an n-gram index fails to build."""
+
+
+class PreAggregationError(BuildError):
+    """Raised when pre-aggregation (Dense AM / RFF / ESN readout) fails."""
 
 
 class StateBuildError(BuildError):
@@ -55,6 +69,10 @@ class EnergyError(InferenceError):
     """Raised when energy computation encounters invalid state."""
 
 
+class StateError(InferenceError):
+    """Raised when document state update fails."""
+
+
 # ── Validation Errors ────────────────────────────────────────────────────
 
 class ValidationError(IsingSpinError):
@@ -71,6 +89,10 @@ class POSValidationError(ValidationError):
 
 class StateValidationError(ValidationError):
     """Raised when document state is accessed before build."""
+
+
+class ConfigError(ValidationError):
+    """Raised when configuration parameters are invalid."""
 
 
 class ConfigurationError(IsingSpinError):

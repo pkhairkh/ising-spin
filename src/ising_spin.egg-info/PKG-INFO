@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: ising-spin
-Version: 11.7.0
-Summary: Ising Spin Glass Language Model — Integer-only Boltzmann sampling, recall-primary energy, PMI backoff, PPL=51.54
+Version: 17.1.0
+Summary: Ising Spin Glass Language Model — Integer-only Boltzmann sampling, Multi-Scale Abstract Recall, Evolving Document State
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown

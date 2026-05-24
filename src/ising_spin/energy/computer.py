@@ -1,45 +1,69 @@
-import numpy as np
-from typing import List
+"""
+Energy Computer — combines all energy signals for word selection.
 
-from ..recall import MultiScaleRecall
-from ..state import DocumentState
+Energy hierarchy:
+  1. Multi-Scale Recall (PRIMARY): word + POS + topic n-gram energies
+  2. Document State (SECONDARY): topic/mode/tense/negation/specificity/argument conditioning
+  3. Document State Coupling (v18): pairwise compatibility energy E_coupling
+  4. ESN Reservoir (v18): long-range temporal dynamics E_reservoir
+  5. VSA/qFHRR (v18): compositional vector symbolic architecture E_vsa
+  6. Hard constraints: POS type penalties, same-word penalty, closed-class double penalty
+
+All additive: E(w) = E_recall + E_state + E_coupling + E_reservoir + E_vsa + E_hard
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional
+
+import numpy as np
+
 from ..utils import validate_array
 from ..vocabulary.pos import POSTypeSystem, CLOSED_CLASS, POS2IDX
+
+if TYPE_CHECKING:
+    from ..recall import MultiScaleRecall
+    from ..state import DocumentState
+    from ..reservoir.integer_esn import IntegerESN
+    from ..vsa.qfhrr import VSAEncoder
 
 
 class EnergyComputer:
     """
     Combines all energy signals for word selection.
 
-    Energy hierarchy (v17):
+    Energy hierarchy:
       1. Multi-Scale Recall (PRIMARY): word + POS + topic n-gram energies
-      2. Document State (SECONDARY): topic/mode/tense/negation/specificity/argument conditioning
-      3. Hard constraints: POS type penalties, same-word penalty, closed-class double penalty
+      2. Document State (SECONDARY): state-word compatibility conditioning
+      3. Document State Coupling (v18): pairwise state-variable compatibility
+      4. ESN Reservoir (v18): long-range temporal dynamics (~50 token lookback)
+      5. VSA/qFHRR (v18): compositional vector symbolic architecture energy
+      6. Hard constraints: POS type, same-word, closed-class penalties
 
-    Refactored with:
-      - Relative imports for intra-package references
-      - Vectorized numpy boolean indexing for all hard constraints (no Python for-loops)
-      - Input validation via ..utils.validate_array and explicit type checks
-      - Pre-computed closed-class POS ID set (avoids rebuilding per call)
-
-    The key v17 insight: we no longer have recall + weak perturbation layers.
-    Instead, we have recall at MULTIPLE SCALES, each independently constraining
-    the prediction. The document state provides discourse-level coherence that
-    no n-gram (however abstract) can capture.
+    All energy terms are ADDITIVE (Ising model physics: E = Σ E_i).
+    All arithmetic is integer-only. LOWER energy = more likely.
     """
 
     def __init__(
         self,
-        multiscale_recall: MultiScaleRecall,
-        document_state: DocumentState,
+        multiscale_recall: "MultiScaleRecall",
+        document_state: "DocumentState",
         pos_system: POSTypeSystem,
-        recall_scale: int = 1600,      # word n-gram scale (primary)
-        pos_recall_scale: int = 800,    # POS n-gram scale (secondary)
-        topic_recall_scale: int = 400,  # topic n-gram scale (tertiary)
-        state_scale: int = 200,         # document state scale
+        # v17 energy scales
+        recall_scale: int = 1600,
+        pos_recall_scale: int = 800,
+        topic_recall_scale: int = 400,
+        state_scale: int = 200,
         same_word_penalty: int = 200,
         closed_class_double_penalty: int = 50000,
         max_closed_class_run: int = 2,
+        # v18 energy scales
+        coupling_scale: int = 200,
+        reservoir_scale: int = 800,
+        vsa_scale: int = 800,
+        # v18 optional modules (None = disabled)
+        reservoir: Optional["IntegerESN"] = None,
+        vsa_encoder: Optional["VSAEncoder"] = None,
     ):
         self.multiscale_recall = multiscale_recall
         self.document_state = document_state
@@ -51,6 +75,15 @@ class EnergyComputer:
         self.same_word_penalty = same_word_penalty
         self.closed_class_double_penalty = closed_class_double_penalty
         self.max_closed_class_run = max_closed_class_run
+
+        # v18 energy scales
+        self.coupling_scale = coupling_scale
+        self.reservoir_scale = reservoir_scale
+        self.vsa_scale = vsa_scale
+
+        # v18 modules
+        self.reservoir = reservoir
+        self.vsa_encoder = vsa_encoder
 
         # Pre-compute closed-class POS ID set (avoids rebuilding per call)
         self._closed_class_pos_ids: frozenset[int] = frozenset(
@@ -68,10 +101,12 @@ class EnergyComputer:
         """
         Compute total energy for all candidate words.
 
-        E(w) = E_recall_multiscale(w) + E_state(w) + E_hard(w)
+        E(w) = E_recall(w) + E_state(w) + E_coupling(w) + E_reservoir(w)
+             + E_vsa(w) + E_hard(w)
 
-        All hard constraints use vectorized numpy boolean indexing instead of
-        Python for-loops for performance on large candidate sets.
+        All hard constraints use vectorized numpy boolean indexing.
+        v18 energy terms (coupling, reservoir, VSA) are only computed
+        if their respective modules are enabled (not None and built).
 
         Args:
             context_words: List of integer word IDs forming the context.
@@ -85,8 +120,7 @@ class EnergyComputer:
             LOWER = more likely.
 
         Raises:
-            TypeError: If context_words is not a list, candidate_words is not
-                an ndarray, or current_type/prev_word are not ints.
+            TypeError: If input types are invalid.
         """
         # ── Input validation ────────────────────────────────────────────────
         if not isinstance(context_words, list):
@@ -121,14 +155,50 @@ class EnergyComputer:
         )
         energies += state_energy
 
-        # 3. Hard constraints (vectorized)
+        # 3. Coupling energy (v18) — scalar offset, same for all candidates
+        #    This ensures mean-field-inferred state values are consistent.
+        #    Adds a constant energy offset based on current state compatibility.
+        if self.coupling_scale > 0 and self.document_state._coupling_built:
+            coupling_e = self.document_state.compute_coupling_energy(
+                coupling_scale=self.coupling_scale
+            )
+            # Scalar: add same offset to all candidates (shifts baseline)
+            energies += coupling_e
+
+        # 4. ESN Reservoir energy (v18) — long-range temporal dynamics
+        if (self.reservoir is not None
+                and self.reservoir_scale > 0
+                and self.reservoir.built):
+            reservoir_energy = self.reservoir.compute_energy(
+                candidate_words,
+                reservoir_scale=self.reservoir_scale,
+            )
+            energies += reservoir_energy
+
+        # 5. VSA/qFHRR energy (v18) — compositional vector symbolic architecture
+        if (self.vsa_encoder is not None
+                and self.vsa_scale > 0
+                and self.vsa_encoder.built):
+            # Build context encoding for VSA
+            context_encoding = self.vsa_encoder.compute_context_encoding(
+                context_word_ids=context_words,
+                context_pos_ids=None,   # Will use defaults if not available
+                context_topic_ids=None, # Will use defaults if not available
+            )
+            vsa_energy = self.vsa_encoder.compute_vsa_energy(
+                context_encoding,
+                candidate_words,
+                vsa_scale=self.vsa_scale,
+            )
+            energies += vsa_energy
+
+        # 6. Hard constraints (vectorized)
 
         # Same-word penalty: vectorized comparison
         if prev_word >= 0:
             energies[candidate_words == prev_word] += self.same_word_penalty
 
-        # Closed-class double penalty: boolean mask over candidates whose
-        # allowed POS types intersect with the closed-class POS ID set
+        # Closed-class double penalty
         if closed_class_run >= self.max_closed_class_run:
             is_closed_class = np.array([
                 bool(self.pos_system.allowed_types.get(int(w), set()) & self._closed_class_pos_ids)
@@ -136,8 +206,7 @@ class EnergyComputer:
             ], dtype=bool)
             energies[is_closed_class] += self.closed_class_double_penalty
 
-        # POS type penalty: boolean mask for words whose allowed types
-        # exclude the required current_type
+        # POS type penalty
         if current_type >= 0:
             violates_pos = np.array([
                 (allowed := self.pos_system.allowed_types.get(int(w), set()))

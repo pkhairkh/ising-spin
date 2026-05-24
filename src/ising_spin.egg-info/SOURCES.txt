@@ -1,12 +1,11 @@
 pyproject.toml
 src/ising_spin/__init__.py
-src/ising_spin/context_accumulator.py
+src/ising_spin/errors.py
+src/ising_spin/exceptions.py
 src/ising_spin/generator.py
-src/ising_spin/grassmann_flag.py
-src/ising_spin/longrange_coupling.py
-src/ising_spin/model.py
-src/ising_spin/model_v17.py
-src/ising_spin/model_v18.py
+src/ising_spin/helpers.py
+src/ising_spin/orchestrator.py
+src/ising_spin/utils.py
 src/ising_spin.egg-info/PKG-INFO
 src/ising_spin.egg-info/SOURCES.txt
 src/ising_spin.egg-info/dependency_links.txt
@@ -24,6 +23,8 @@ src/ising_spin/recall/topic_index.py
 src/ising_spin/recall/word_index.py
 src/ising_spin/reservoir/__init__.py
 src/ising_spin/reservoir/integer_esn.py
+src/ising_spin/rff/__init__.py
+src/ising_spin/rff/cross_scale.py
 src/ising_spin/sampling/__init__.py
 src/ising_spin/sampling/boltzmann.py
 src/ising_spin/state/__init__.py
@@ -39,3 +40,7 @@ tests/test_dense_am.py
 tests/test_model.py
 tests/test_qfhrr.py
 tests/test_reservoir.py
+tests/test_rff.py
+tests/test_v18_integration.py
+tests/test_v18_property.py
+tests/test_v18_regression.py

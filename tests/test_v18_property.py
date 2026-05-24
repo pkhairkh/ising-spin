@@ -180,10 +180,17 @@ class TestVSAVectorsUint8:
 
     def test_readout_matrix_uint8(self):
         """VSA readout matrix is uint8 after build."""
-        from ising_spin.vocabulary import POSTypeSystem, TopicAssigner
-        from tests.conftest import _SYNTHETIC_TEXTS
+        from ising_spin.vocabulary import POSTypeSystem, TopicAssigner, Vocabulary
 
-        vocab = __import__("ising_spin.vocabulary", fromlist=["Vocabulary"]).Vocabulary(min_freq=1, max_size=200)
+        _SYNTHETIC_TEXTS = [
+            "the cat sat on the mat and the dog ran in the park",
+            "she went to the store to buy some food for dinner",
+            "the children played in the garden while the sun was shining",
+            "he read a book about the history of science and technology",
+            "they built a small house near the lake in the forest",
+        ] * 3
+
+        vocab = Vocabulary(min_freq=1, max_size=200)
         vocab.build(_SYNTHETIC_TEXTS[:50])
 
         pos_system = POSTypeSystem(vocab_size=len(vocab), window=3)

@@ -39,7 +39,7 @@ Computation per token:
 import numpy as np
 from typing import Optional, List
 
-from ising_spin.errors import ValidationError
+from ..exceptions import ValidationError
 
 
 class IntegerESN:

@@ -103,9 +103,9 @@ def load_data(n_samples: int) -> list:
             print(f"  Cache has {len(texts):,} texts but need {n_samples:,}")
 
     print("No cached data found. Downloading from HuggingFace...")
-    from ising_spin.orchestrator import _load_fineweb_edu
+    from ising_spin.utils import load_fineweb_edu
     t0 = time.time()
-    texts = _load_fineweb_edu(n_samples=n_samples)
+    texts = load_fineweb_edu(n_samples=n_samples)
     print(f"  Downloaded {len(texts):,} texts in {time.time()-t0:.1f}s")
 
     if n_samples >= 1000000 and n_samples % 1000000 == 0:
@@ -253,7 +253,7 @@ def print_recall_diagnostics(model):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="v17.0 Training — Multi-Scale Abstract Recall + Document State"
+        description="v18.0 Training — Multi-Scale Abstract Recall + v18 Extensions"
     )
 
     # Core parameters
@@ -291,6 +291,26 @@ def main():
     parser.add_argument("--same-word-penalty", type=int, default=200)
     parser.add_argument("--n-topics", type=int, default=16)
 
+    # v18 module flags
+    parser.add_argument("--enable-reservoir", action="store_true",
+                        help="Enable Integer ESN Reservoir (v18)")
+    parser.add_argument("--enable-coupling", action="store_true",
+                        help="Enable Factorial State Coupling (v18)")
+    parser.add_argument("--enable-vsa", action="store_true",
+                        help="Enable VSA/qFHRR compositional binding (v18)")
+    parser.add_argument("--enable-all-v18", action="store_true",
+                        help="Enable all v18 modules (reservoir + coupling + VSA)")
+    parser.add_argument("--reservoir-dim", type=int, default=512,
+                        help="ESN reservoir dimension (default: 512)")
+    parser.add_argument("--reservoir-scale", type=int, default=800,
+                        help="ESN reservoir energy scale (default: 800)")
+    parser.add_argument("--coupling-scale", type=int, default=200,
+                        help="Factorial coupling energy scale (default: 200)")
+    parser.add_argument("--vsa-scale", type=int, default=800,
+                        help="VSA energy scale (default: 800)")
+    parser.add_argument("--vsa-dim", type=int, default=512,
+                        help="VSA phase vector dimension (default: 512)")
+
     args = parser.parse_args()
 
     # --- Apply ablation flags ---
@@ -300,6 +320,11 @@ def main():
 
     kn_backoff = not args.no_kn_backoff
     interpolated = not args.no_interpolated
+
+    # --- v18 flags ---
+    enable_reservoir = args.enable_reservoir or args.enable_all_v18
+    enable_coupling = args.enable_coupling or args.enable_all_v18
+    enable_vsa = args.enable_vsa or args.enable_all_v18
 
     # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -342,6 +367,13 @@ def main():
     print(f"    same_word_penalty={args.same_word_penalty}")
     print(f"    n_topics={args.n_topics}")
     print(f"    n_samples={n_texts:,}")
+    print(f"  v18 EXTENSIONS:")
+    print(f"    reservoir={'ENABLED' if enable_reservoir else 'DISABLED'}"
+          f" (dim={args.reservoir_dim}, scale={args.reservoir_scale})")
+    print(f"    coupling={'ENABLED' if enable_coupling else 'DISABLED'}"
+          f" (scale={args.coupling_scale})")
+    print(f"    vsa={'ENABLED' if enable_vsa else 'DISABLED'}"
+          f" (dim={args.vsa_dim}, scale={args.vsa_scale})")
     print(f"{'=' * 70}")
 
     # --- Train ---
@@ -381,6 +413,15 @@ def main():
         copy_min_confidence=0.4,
         # Misc
         max_seq_len=args.max_seq_len,
+        # v18 modules
+        enable_reservoir=enable_reservoir,
+        enable_coupling=enable_coupling,
+        enable_vsa=enable_vsa,
+        reservoir_dim=args.reservoir_dim,
+        reservoir_scale=args.reservoir_scale,
+        coupling_scale=args.coupling_scale,
+        vsa_scale=args.vsa_scale,
+        vsa_dim=args.vsa_dim,
     )
 
     t_start = time.time()
@@ -476,8 +517,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "17.1.0",
-        "architecture": "Multi-Scale Abstract Recall + Evolving Document State",
+        "version": "18.0.0",
+        "architecture": "Multi-Scale Abstract Recall + Document State + v18 Extensions",
         "timestamp": timestamp,
         "config": {
             "recall_scale": args.recall_scale,
