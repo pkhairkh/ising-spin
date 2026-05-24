@@ -130,7 +130,7 @@ class IsingLMModel:
         ssr_alpha_q8: int = 255,
         ssr_eta_episodic: int = 2,
         ssr_n_mf_sweeps: int = 2,
-        ssr_scale: int = 400,
+        ssr_scale: int = 2000,
         ssr_temperature: int = 50,
         # v21: Learned Latent Spin Glass (GENUINE understanding from learned physics)
         enable_latent_spin: bool = False,
@@ -138,11 +138,11 @@ class IsingLMModel:
         latent_spin_alpha_q8: int = 255,
         latent_spin_eta_episodic: int = 2,
         latent_spin_n_mf_sweeps: int = 4,
-        latent_spin_scale: int = 4000,
-        latent_spin_coupling_scale: int = 3000,
+        latent_spin_scale: int = 6000,
+        latent_spin_coupling_scale: int = 4000,
         latent_spin_temperature: int = 0,
         latent_spin_context_window: int = 5,
-        latent_spin_n_j_windows: int = 200000,
+        latent_spin_n_j_windows: int = 9000,
         latent_spin_decorrelate: bool = True,
         latent_spin_j_sparsity: float = 0.15,
         # Memory budget

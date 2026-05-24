@@ -278,7 +278,12 @@ class NgramIndexBase:
             return np.array([], dtype=np.int64)
 
         n_candidates = len(candidate_words)
-        max_energy = 20 * recall_scale
+        # v23: Capped from 20*recall_scale to 8*recall_scale.
+        # The old value (32,000) was 10x larger than spin energy range,
+        # making recall completely dominate word selection.
+        # With the cap, recall still provides strong signal but spin can compete.
+        # 8* gives a max of 12,800 vs spin range of ~10,000 — competitive.
+        max_energy = 8 * recall_scale
         recall_energies = np.full(n_candidates, max_energy, dtype=np.int64)
 
         # Backoff energy

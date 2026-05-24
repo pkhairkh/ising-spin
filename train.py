@@ -464,8 +464,8 @@ def main():
                         help="SSR external field strength in Q8 (default: 255 ≈ 1.0)")
     parser.add_argument("--ssr-eta", type=int, default=2,
                         help="SSR Hebbian learning rate for episodic memory (default: 2)")
-    parser.add_argument("--ssr-scale", type=int, default=400,
-                        help="SSR energy scale (default: 400, reduced from 1200 — SSR has random J_struct so should be minor bias)")
+    parser.add_argument("--ssr-scale", type=int, default=2000,
+                        help="SSR energy scale (default: 2000, raised from 400 — SSR must compete with recall)")
     parser.add_argument("--ssr-temperature", type=int, default=50,
                         help="SSR Metropolis temperature for spin dynamics (default: 50)")
 
@@ -478,16 +478,16 @@ def main():
                         help="Latent spin external field strength in Q8 (default: 255 ≈ 1.0, was 128)")
     parser.add_argument("--latent-spin-eta", type=int, default=2,
                         help="Latent spin Hebbian learning rate (default: 2)")
-    parser.add_argument("--latent-spin-scale", type=int, default=4000,
-                        help="Latent spin direct alignment energy scale (default: 4000, was 1200)")
-    parser.add_argument("--latent-spin-coupling-scale", type=int, default=3000,
-                        help="Latent spin coupling-mediated alignment energy scale (default: 3000, was 800)")
+    parser.add_argument("--latent-spin-scale", type=int, default=6000,
+                        help="Latent spin direct alignment energy scale (default: 6000, was 4000)")
+    parser.add_argument("--latent-spin-coupling-scale", type=int, default=4000,
+                        help="Latent spin coupling-mediated alignment energy scale (default: 4000, was 3000)")
     parser.add_argument("--latent-spin-temperature", type=int, default=0,
                         help="Latent spin Metropolis temperature (default: 0, deterministic)")
     parser.add_argument("--latent-spin-context-window", type=int, default=5,
                         help="Context window for spin vector learning (default: 5)")
-    parser.add_argument("--latent-spin-n-j-windows", type=int, default=200000,
-                        help="Number of windows for J_learned (default: 200K)")
+    parser.add_argument("--latent-spin-n-j-windows", type=int, default=9000,
+                        help="Number of windows for J_learned (default: 9K, was 200K — reduced to Hopfield capacity)")
     parser.add_argument("--no-latent-spin-decorrelate", action="store_true",
                         help="Disable spin vector decorrelation (mean-centering before sign)")
     parser.add_argument("--latent-spin-j-sparsity", type=float, default=0.15,
@@ -822,8 +822,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "22.0.0",
-        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (Learned, v22 expressivity fix)",
+        "version": "23.0.0",
+        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (v23 expressivity fix: recall cap, no copy bypass, capacity-limited J, bias field, adaptive alpha)",
         "dataset": args.dataset,
         "curriculum": args.curriculum,
         "timestamp": timestamp,

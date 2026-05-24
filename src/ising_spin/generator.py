@@ -390,12 +390,17 @@ class IsingLMGenerator:
             chosen_type = valid_types[self.type_sampler.sample(type_energies)]
 
             # === STEP 2: Check copy mechanism ===
-            # v22: Copy is now a soft energy bonus, not a hard override.
-            # We still identify high-confidence n-gram candidates, but instead
-            # of bypassing energy computation, we add a strong energy bonus
-            # in STEP 5 so that spin dynamics can still influence selection.
+            # v23: Copy is DISABLED when latent spin is active.
+            # The spin system is supposed to provide the long-range context
+            # that copy was a crutch for. With copy enabled, ~25% of tokens
+            # bypass spin dynamics entirely, making the spin system irrelevant.
+            # Disabling copy forces ALL word selection through spin dynamics,
+            # giving the spin system the feedback it needs to learn.
             copy_word = None
-            if self.copy_enabled and len(words) >= self.copy_min_context and self.word_index is not None:
+            if (self.copy_enabled
+                and self.latent_spin is None  # v23: no copy when spin active
+                and len(words) >= self.copy_min_context
+                and self.word_index is not None):
                 copy_candidate = self.word_index.get_best_copy_candidate(
                     context_words=words,
                     min_context_length=self.copy_min_context,
@@ -493,10 +498,11 @@ class IsingLMGenerator:
                 # Find copy_word in candidates and give it a strong energy bonus
                 copy_idx = np.where(candidate_words == copy_word)[0]
                 if len(copy_idx) > 0:
-                    # Strong bonus: recall_scale * 3 ≈ 4800 with default scale
-                    # This makes the copy word ~95% likely but spin can override
-                    # if alignment strongly disagrees (spin energy > 4800)
-                    copy_bonus = self.recall_scale * 3
+                    # v23: Reduced copy bonus from recall_scale*3 to recall_scale//2.
+                    # The old bonus (4800) was so strong that spin dynamics could
+                    # never override it. With the reduced bonus (~800), spin
+                    # alignment can override copy when it disagrees.
+                    copy_bonus = self.recall_scale // 2
                     word_energies[copy_idx[0]] -= copy_bonus
                     self._stats['copy_used'] += 1
                 # If copy_word not in candidates (rare), fall through to sampling

@@ -143,7 +143,13 @@ class LatentSpinGlass:
     DEFAULT_CONTEXT_WINDOW = 5
 
     # Number of training windows to sample for J_learned
-    DEFAULT_N_J_WINDOWS = 200000
+    # v23: Reduced from 200K to 9K (within Hopfield capacity).
+    # Hopfield capacity ≈ 0.14 * D² for D=256 → ~9,175 patterns.
+    # Storing 200K patterns in 256 dims is 5,579× over capacity,
+    # producing a meaningless near-zero average J that is
+    # perfectly balanced between +1/-1 couplings.
+    # With 9K patterns, each pattern contributes meaningful structure.
+    DEFAULT_N_J_WINDOWS = 9000
 
     # Normalization for energy dot products
     # FIXED normalization: use D (spin dimension) and h_norm (coupling field L1)
@@ -180,12 +186,12 @@ class LatentSpinGlass:
         alpha_q8: int = 128,
         eta_episodic: int = 2,
         n_mf_sweeps: int = 4,
-        latent_scale: int = 1200,
-        coupling_scale: int = 800,
+        latent_scale: int = 6000,
+        coupling_scale: int = 4000,
         temperature: int = 0,
         noise_prob: float = 0.02,
         context_window: int = 5,
-        n_j_windows: int = 200000,
+        n_j_windows: int = 9000,
         seed: int = 42,
         decorrelate: bool = True,
         j_sparsity: float = 0.15,
@@ -230,6 +236,14 @@ class LatentSpinGlass:
         # --- Learned coupling matrix (LEARNED during training) ---
         # J_learned captures the dependency structure from training data
         self.J_learned: Optional[np.ndarray] = None  # (D, D) int16
+
+        # --- Per-dimension bias vector (LEARNED during training) ---
+        # v23: h_bias captures the main effect of each spin dimension,
+        # i.e., which dimensions tend to be +1 vs -1 after seeing context.
+        # This is the "diagonal component" that gets washed out when
+        # J is computed from balanced ±1 patterns. Without h_bias,
+        # the coupling field averages to zero and has no directional signal.
+        self.h_bias: Optional[np.ndarray] = None  # (D,) int16
 
         # --- Episodic coupling (Hebbian during generation) ---
         self.J_episodic = np.zeros((D, D), dtype=np.int16)
@@ -464,11 +478,19 @@ class LatentSpinGlass:
             sampled_windows = all_windows
 
         # Compute context spin patterns AND next-word spin vectors
-        # S_context[i] = sign(sum of sigma_w for context words)
-        # sigma_next[i] = spin vector of the word at position pos
+        # v23: Use RAW accumulators (continuous) for context instead of
+        # binary spin vectors. Balanced rank binarization ensures 50% +1
+        # per dimension, which makes the cross-correlation in J average
+        # to zero. By using raw accumulators, we preserve the directional
+        # signal that binarization destroys.
+        #
+        # Context: sum of raw spin_acc (before binarization) for context words
+        # Next: still use binary spin vector (for alignment with dynamics)
         window_size = 10  # Wider window: 10 words of context
         S_context = np.zeros((len(sampled_windows), D), dtype=np.int8)
         S_next = np.zeros((len(sampled_windows), D), dtype=np.int8)
+        # v23: Also store raw accumulator sums for context
+        C_raw = np.zeros((len(sampled_windows), D), dtype=np.int32)
         valid_mask = np.zeros(len(sampled_windows), dtype=bool)
 
         for i, (seq_idx, pos) in enumerate(sampled_windows):
@@ -483,16 +505,23 @@ class LatentSpinGlass:
             if not context_words or next_word < 0 or next_word >= V:
                 continue
 
-            # Accumulate context spin vectors
+            # v23: Accumulate RAW spin accumulators (continuous values)
+            # This preserves the directional signal that binarization destroys.
+            acc_raw = np.zeros(D, dtype=np.int32)
+            for w in context_words:
+                if 0 <= w < V:
+                    acc_raw += spin_acc[w].astype(np.int32)
+
+            C_raw[i] = acc_raw
+
+            # Also compute binary context pattern (for fallback)
             acc = np.zeros(D, dtype=np.int32)
             for w in context_words:
                 if 0 <= w < V:
                     acc += spin_vectors[w].astype(np.int32)
-
-            # Store sign of accumulated context (binary pattern)
             s_ctx = np.sign(acc).astype(np.int8)
             zero_mask = acc == 0
-            s_ctx[zero_mask] = 1  # Default to +1 when no evidence
+            s_ctx[zero_mask] = 1
 
             S_context[i] = s_ctx
             S_next[i] = spin_vectors[next_word]  # Next word's spin vector
@@ -504,23 +533,36 @@ class LatentSpinGlass:
         if n_valid > 0:
             S_ctx_valid = S_context[valid_mask]  # (n_valid, D) int8
             S_next_valid = S_next[valid_mask]     # (n_valid, D) int8
+            C_raw_valid = C_raw[valid_mask]        # (n_valid, D) int32 — v23: raw accumulators
 
-            # CONDITION-RESPONSE: J = S_context^T @ sigma_next / N
-            # This captures: "if context spin dimension j is +1, how does
-            # it predict next-word spin dimension i?"
-            # J[i,j] = (1/N) * sum_k S_context[k,j] * sigma_next[k,i]
+            # v23 CONDITION-RESPONSE with RAW accumulators:
+            # J = C_raw_context^T @ sigma_next / N
             #
-            # Unlike Hopfield (S^T @ S which is auto-correlation), this
-            # is a CROSS-correlation between context and next-word. It
-            # directly captures the predictive relationship.
+            # KEY FIX: Instead of using binary S_context (which has 50% +1
+            # per dimension from balanced rank binarization, making the
+            # cross-correlation average to zero), we use the RAW spin_acc
+            # values. These continuous values preserve the directional
+            # signal: if context words have high accumulator values in
+            # dimension j, C_raw[j] will be large and positive, creating
+            # a strong predictive signal in J[:,j].
+            #
+            # Normalization: divide by sqrt(sum of squares) per dimension
+            # to prevent dimensions with large accumulator values from
+            # dominating J.
             print(f"      Computing J_learned via condition-response "
-                  f"({n_valid} pairs x {D} dims)...")
+                  f"({n_valid} pairs x {D} dims, using RAW accumulators)...")
 
-            J_int = S_ctx_valid.astype(np.int32).T @ S_next_valid.astype(np.int32)
+            # Normalize raw accumulators per dimension to prevent overflow
+            # and ensure balanced contribution from each dimension
+            col_norms = np.sqrt(np.sum(C_raw_valid.astype(np.float64) ** 2, axis=0))  # (D,)
+            col_norms = np.maximum(col_norms, 1.0)  # Avoid division by zero
+            C_normalized = (C_raw_valid.astype(np.float64) / col_norms[np.newaxis, :]) * 1000  # Scale to ~1000
+            C_int = C_normalized.astype(np.int16)  # (n_valid, D) int16
+
+            J_int = C_int.astype(np.int32).T @ S_next_valid.astype(np.int32)
 
             # Scale to int16: normalize by number of valid pairs
-            # J_learned[i,j] = J_int[i,j] * 256 / n_valid
-            J_scaled = (J_int * 256 // n_valid).astype(np.int16)
+            J_scaled = (J_int * 256 // max(1, n_valid)).astype(np.int16)
 
             # Zero diagonal (no self-coupling)
             np.fill_diagonal(J_scaled, 0)
@@ -547,6 +589,26 @@ class LatentSpinGlass:
                           f"at threshold={threshold} (target={self.j_sparsity*100:.0f}%)")
 
             self.J_learned = J_scaled
+
+            # --- Per-dimension bias (v23) ---
+            # Compute h_bias = mean of sigma_next per dimension.
+            # This captures the main effect: which dimensions tend to be +1
+            # vs -1 in the next word, regardless of context. Without this,
+            # the coupling field has no directional bias and just averages
+            # to zero, producing frustrated dynamics.
+            #
+            # In Hopfield theory, this is the external field that the
+            # patterns create. With balanced binarization (50% +1, 50% -1),
+            # the spin vectors have zero magnetization, so the J matrix
+            # has zero diagonal. But the sigma_next patterns do have
+            # structure — some dimensions are more commonly +1 in certain
+            # contexts. This bias captures that structure.
+            next_mean = np.mean(S_next_valid.astype(np.float32), axis=0)  # (D,)
+            # Scale to int16: bias ∈ [-256, +256] maps to int16 range
+            self.h_bias = (next_mean * 256).astype(np.int16)
+            bias_max = int(np.max(np.abs(self.h_bias)))
+            bias_nonzero = int(np.sum(self.h_bias != 0))
+            print(f"      h_bias: max_abs={bias_max}, nonzero={bias_nonzero}/{D}")
 
             # Diagnostics
             j_max = int(np.max(np.abs(self.J_learned)))
@@ -695,24 +757,39 @@ class LatentSpinGlass:
             J_total += self.J_learned.astype(np.int32)
         J_total += self.J_episodic.astype(np.int32)
 
+        # v23: Per-dimension bias field
+        # h_bias provides a directional signal that the J matrix alone
+        # cannot provide (since J has zero diagonal with balanced spins).
+        h_bias_field = np.zeros(self.D, dtype=np.int32)
+        if self.h_bias is not None:
+            h_bias_field = self.h_bias.astype(np.int32)
+
         # --- Mean-field sweeps ---
         for sweep in range(self.n_mf_sweeps):
             # Internal field from coupling: J_total @ sigma_doc
             h_internal = J_total @ self.sigma_doc.astype(np.int32)  # (D,) int32
 
-            # v22 FIX: Normalize coupling field so it's comparable to the
-            # external field. Without normalization, h_internal values are
-            # ~10K (from summing ~40 non-zero J entries of magnitude ~243),
-            # while h_ext is ~1 (binary ±1). The coupling completely dominates,
-            # making sigma_doc unresponsive to new words (avg alignment was -112
-            # instead of positive). Now we normalize h_internal so its L1 norm
-            # equals D (same as the energy computation normalization), bringing
-            # both fields to comparable magnitude (~±1 per dimension).
-            h_norm = max(self.D, int(np.sum(np.abs(h_internal))))
-            h_internal_normalized = (h_internal.astype(np.int64) * self.D) // h_norm
+            # v23 FIX: Instead of normalizing h_internal down to match h_ext
+            # (which destroyed the coupling structure by compressing ~10K values
+            # to ~256), we scale h_ext UP to match h_internal. This preserves
+            # the full coupling structure while still letting the current word
+            # influence the spin state.
+            #
+            # The adaptive alpha ensures the external field is always strong
+            # enough to move sigma_doc toward the current word, but not so
+            # strong that it ignores coupling structure entirely.
+            h_l1 = max(1, int(np.sum(np.abs(h_internal))))
+            # Scale external field to be ~1/4 of coupling field strength.
+            # This means coupling dominates (long-range structure) but the
+            # current word still has meaningful influence (~25% of total field).
+            coupling_weight = 3  # coupling gets 3x weight vs external
+            alpha_adaptive_q8 = min(255, (self.alpha_q8 * coupling_weight * self.D) // max(1, h_l1 // 256))
+            h_ext_scaled = (alpha_adaptive_q8 * h_ext) >> 8
+            # Scale h_ext up to match h_internal magnitude
+            h_ext_magnitude = (h_ext_scaled.astype(np.int64) * h_l1) // (self.D * coupling_weight)
+            h_ext_scaled = h_ext_magnitude.astype(np.int32)
 
-            # Total field: normalized internal + external (scaled by alpha)
-            h_total = h_internal_normalized.astype(np.int32) + ((self.alpha_q8 * h_ext) >> 8)  # (D,) int32
+            h_total = h_internal + h_bias_field + h_ext_scaled  # (D,) int32
 
             # Mean-field update: sigma_doc_i = sign(h_i)
             new_sigma = np.sign(h_total).astype(np.int8)
@@ -850,8 +927,13 @@ class LatentSpinGlass:
             J_total += self.J_learned.astype(np.int32)
         J_total += self.J_episodic.astype(np.int32)
 
-        # Compute coupling-mediated field: h = J_total @ sigma_doc
+        # Compute coupling-mediated field: h = J_total @ sigma_doc + h_bias
+        # v23: Include h_bias in the coupling field for energy computation.
+        # h_bias provides the directional signal that J alone cannot (since
+        # J has zero diagonal with balanced spins).
         h_coupling = J_total @ self.sigma_doc.astype(np.int32)  # (D,) int32
+        if self.h_bias is not None:
+            h_coupling += self.h_bias.astype(np.int32)
 
         # L1 norm of h_coupling for normalization
         # Floor at D to prevent division by very small numbers when

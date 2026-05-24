@@ -129,7 +129,7 @@ class SemanticSpinResonance:
         alpha_q8: int = 128,
         eta_episodic: int = 2,
         n_mf_sweeps: int = 2,
-        ssr_scale: int = 1200,
+        ssr_scale: int = 2000,
         temperature: int = 50,
         noise_prob: float = 0.02,
         seed: int = 42,
