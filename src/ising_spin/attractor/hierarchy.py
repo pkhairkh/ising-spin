@@ -189,6 +189,7 @@ class HierarchicalDAM:
         context_sdrs: np.ndarray,
         target_sdrs: np.ndarray,
         eta: int = 1,
+        defer_rg: bool = False,
     ) -> None:
         """
         Train ONLY L0 via batch Hebbian. Higher levels get J from RG flow.
@@ -209,6 +210,10 @@ class HierarchicalDAM:
             context_sdrs: Context SDRs (N, D0) uint8.
             target_sdrs: Target SDRs (N, D0) uint8.
             eta: Learning rate.
+            defer_rg: If True, skip RG flow computation (do it once at the end).
+                      This avoids recomputing RG flow after every batch, which
+                      is unnecessary since only L0's J changes during training.
+                      Call finalize_rg_flow() once after all batches are done.
         """
         # Train L0
         self.layers[0].store_batch_hebbian(context_sdrs, target_sdrs, eta)
@@ -218,6 +223,19 @@ class HierarchicalDAM:
             self.layers[0]._uv_regularize()
 
         # Compute coupling flow and apply to all higher levels
+        # DEFERRED: skip during batch training, do once at the end
+        if not defer_rg:
+            self.compute_coupling_flow()
+            self._apply_coupling_flow()
+
+    def finalize_rg_flow(self) -> None:
+        """
+        Compute and apply RG flow ONCE after all Hebbian batches are done.
+
+        This is called instead of running RG flow after every batch.
+        Since only L0's J changes during training, the RG flow to higher
+        levels only needs to be computed once at the end.
+        """
         self.compute_coupling_flow()
         self._apply_coupling_flow()
 
