@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine — Training Script
+Attractor Language Machine v28 — Training Script
 
-ARCHITECTURE:
-  Dense Associative Memory (DAM) as the ENGINE.
-  The attractor dynamics of a DAM ARE a language model.
-
-  - SDR encoding: Sparse Distributed Representations (~2% active bits)
-  - Hierarchical DAM: L0-Lexical → L1-Syntactic → L2-Semantic → L3-Discourse
-  - RG flow: Wilsonian renormalization group between layers (UV-complete)
-  - Episodic memory: Content-addressable sparse pattern storage
-  - F-lookup energy: Nonlinear energy function (exponential capacity)
-  - Hebbian learning: RG fixed point at right sparsity (Agliari 2025)
-  - Coupling-space RG: Wilsonian decimation of J matrices (not spin states)
-  - UV completeness: Cutoff independence + coupling flow stability
+DEEP FIXES:
+  - F_EXP_APPROX: piecewise integer exponential (TRUE exponential capacity)
+  - RG-derived J_eff REPLACES J at higher levels (Wilsonian RG tower)
+  - Ward identity UV checks (not just spectral gap)
+  - Pure Hebbian ONLY (PCD removed)
+  - Anomalous dimensions from operator spectrum
 
 Usage:
   python -u train.py                                     # Default: 500K samples
   python -u train.py --samples 100000                    # 100K samples
   python -u train.py --memory-budget 14000               # Pi 5 (16GB)
+  python -u train.py --f-type quadratic                  # Use quadratic F instead of exp
 
 With nohup (for long runs on Pi 5):
   nohup python -u train.py --memory-budget 14000 > train.log 2>&1 &
@@ -139,7 +134,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine — DAM Engine Training"
+        description="Attractor Language Machine v28 — DEEP FIXES"
     )
 
     # Core parameters
@@ -165,6 +160,13 @@ def main():
     parser.add_argument("--same-word-penalty", type=int, default=800,
                         help="Same-word repetition penalty (default: 800)")
 
+    # F function parameters
+    parser.add_argument("--f-type", type=str, default="exp_approx",
+                        choices=["quadratic", "cubic", "exp_approx"],
+                        help="F function type (default: exp_approx)")
+    parser.add_argument("--exp-temperature", type=int, default=100,
+                        help="Exponential F temperature in Q8 (100=1.0, 50=0.5 sharper, default: 100)")
+
     # UV-complete parameters
     parser.add_argument("--uv-regularize", action="store_true", default=True,
                         help="Enable UV-complete regularization (default: True)")
@@ -175,13 +177,9 @@ def main():
     parser.add_argument("--topdown-scale", type=int, default=200,
                         help="Top-down feedback scale (default: 200)")
 
-    # DAM parameters
+    # Coupling parameters
     parser.add_argument("--j-clip", type=int, default=500,
                         help="Coupling matrix clip value (default: 500)")
-    parser.add_argument("--learning-rate", type=int, default=1,
-                        help="PCD learning rate (default: 1)")
-    parser.add_argument("--n-dream-steps", type=int, default=3,
-                        help="PCD dream steps (default: 3)")
 
     # Episodic memory
     parser.add_argument("--max-episodes", type=int, default=10000,
@@ -199,13 +197,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Parse F type
+    f_type_map = {"quadratic": 0, "cubic": 1, "exp_approx": 2}
+    f_type = f_type_map[args.f_type]
+
     # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = OUTPUT_DIR / f"attractor_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE — Dense Associative Memory Engine", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v28 — DEEP FIXES", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -222,11 +224,15 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine (DAM Engine)")
+    print(f"CONFIG: Attractor Language Machine v28 (DEEP FIXES)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
-    print(f"    Hierarchy: L0(512)→L1(256)→L2(128)→L3(64)")
-    print(f"    RG flow: Wilsonian (UV-complete={uv_regularize})")
+    print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
+    print(f"    RG flow: Wilsonian (J_eff REPLACES J at higher levels)")
+    print(f"  F FUNCTION:")
+    print(f"    Type: {args.f_type}")
+    if f_type == 2:
+        print(f"    Temperature: {args.exp_temperature/100:.2f} (Q8: {args.exp_temperature})")
     print(f"  ENERGY SCALES:")
     print(f"    DAM scale={args.dam_scale}")
     print(f"    Episodic scale={args.episodic_scale}")
@@ -234,9 +240,10 @@ def main():
     print(f"  UV-COMPLETE:")
     print(f"    Regularize={uv_regularize}, lambda={args.uv_lambda}")
     print(f"    Top-down scale={args.topdown_scale}")
-    print(f"  DAM PARAMS:")
-    print(f"    J_clip={args.j_clip}, learning_rate={args.learning_rate}")
-    print(f"    Dream steps={args.n_dream_steps}")
+    print(f"    Ward identity checks: ENABLED")
+    print(f"  COUPLING:")
+    print(f"    J_clip={args.j_clip}")
+    print(f"    Learning: Hebbian (L0 only, RG flow to higher levels)")
     print(f"  EPISODIC:")
     print(f"    Max episodes={args.max_episodes}")
     print(f"  DATA:")
@@ -262,11 +269,11 @@ def main():
         uv_lambda=args.uv_lambda,
         topdown_scale=args.topdown_scale,
         j_clip=args.j_clip,
-        learning_rate=args.learning_rate,
-        n_dream_steps=args.n_dream_steps,
         max_episodes=args.max_episodes,
         max_seq_len=args.max_seq_len,
         memory_budget_mb=args.memory_budget,
+        f_type=f_type,
+        exp_temperature=args.exp_temperature,
         seed=42,
     )
 
@@ -344,8 +351,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "27.0.0",
-        "architecture": "Attractor Language Machine v27 — F-lookup DAM + Coupling-space RG + UV completeness + Hebbian fixed point",
+        "version": "28.0.0",
+        "architecture": "Attractor Language Machine v28 — DEEP FIXES: F_EXP_APPROX, RG-derived J_eff, Ward identities, pure Hebbian",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -357,11 +364,11 @@ def main():
             "uv_lambda": args.uv_lambda,
             "topdown_scale": args.topdown_scale,
             "j_clip": args.j_clip,
-            "learning_rate": args.learning_rate,
-            "n_dream_steps": args.n_dream_steps,
             "max_episodes": args.max_episodes,
             "vocab_max_size": args.vocab,
             "same_word_penalty": args.same_word_penalty,
+            "f_type": args.f_type,
+            "exp_temperature": args.exp_temperature,
         },
         "results": {
             "training_time_sec": t_train,
@@ -384,7 +391,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine")
+    print(f"DONE — Attractor Language Machine v28")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

@@ -1,19 +1,28 @@
 """
 Hierarchical DAM with Wilsonian RG Flow — UV-Complete Architecture.
 
-KEY FIX (Misconception #1): RG flow acts on COUPLING CONSTANTS, not spin states.
+DEEP FIX (Misconception #1): RG flow acts on COUPLING CONSTANTS, not spin states.
+  AND the RG-derived J_eff REPLACES the independently-learned J at higher levels.
 
-The old architecture treated block-spin transforms on spin states as "RG flow."
-This is WRONG. Wilsonian RG operates on coupling constants (the J matrices):
-  - Integrating out short-range DOFs produces effective couplings at coarser scale
-  - J_eff at level l+1 is DERIVED from J at level l via RG decimation
-  - The RG flow equation: J_{l+1} = R(J_l) where R is the decimation operator
+The old architecture had two problems:
+  1. Block-spin transforms on spin states were called "RG flow" — WRONG.
+     Wilsonian RG operates on coupling constants (the J matrices).
+  2. J at each level was independently learned via Hebbian — WRONG.
+     J at higher levels should be DERIVED from J[0] via RG decimation.
 
-This module implements:
-  1. Coupling-space RG flow: J_eff[l+1] derived from J[l] by block decimation
-  2. State-space projection: still used for context propagation (bottom-up/top-down)
-  3. Operator spectrum: eigenvalues of J classify relevant/marginal/irrelevant
-  4. UV completeness check: cutoff independence + coupling flow stability
+This module implements the CORRECT architecture:
+  1. Only L0 is trained (Hebbian, the RG fixed point)
+  2. J_eff[l+1] = Decimate(J_eff[l]) for l = 0, 1, 2, ...
+  3. J_eff[l] REPLACES layers[l].J — no independent learning at higher levels
+  4. The hierarchy is a WILSONIAN RG TOWER: each level is the effective
+     theory at a coarser scale, derived from the level below
+
+This ensures RG CONSISTENCY: the coupling at every level is derivable from
+L0 by successive decimation. This is what Wilsonian RG means.
+
+Inter-layer state coupling still uses block-spin projection (bottom-up)
+and top-down feedback (IR -> UV), but these are for CONTEXT PROPAGATION,
+not for the RG flow (which is in coupling space).
 
 Based on:
   Howard et al. (2024): Wilsonian RG of NN-GPs — data sets IR scale
@@ -39,18 +48,22 @@ class HierarchicalDAM:
 
     Four layers with increasing abstraction and decreasing dimension:
       L0: D=512, k=10 (2% sparse) — lexical patterns (UV)
-      L1: D=256, k=8 (3% sparse) — syntactic patterns
-      L2: D=128, k=5 (4% sparse) — semantic patterns
-      L3: D=64,  k=3 (5% sparse) — discourse patterns (IR)
+      L1: D=256, k=8  (3% sparse) — syntactic patterns
+      L2: D=128, k=5  (4% sparse) — semantic patterns
+      L3: D=64,  k=3  (5% sparse) — discourse patterns (IR)
 
     RG flow (coupling space):
       J_eff[l+1] = Decimate(J[l], block_size=D_l/D_{l+1})
       This is the proper Wilsonian RG: integrating out UV DOFs
       produces effective couplings at the IR scale.
 
+    DEEP FIX: After training L0 via Hebbian, the J at higher levels
+    is REPLACED by J_eff derived from L0. This ensures RG consistency:
+    every level's coupling is derivable from L0 by successive decimation.
+
     Inter-layer state coupling:
       - Bottom-up: block-spin projection (context propagation)
-      - Top-down: relevant operator feedback (IR → UV)
+      - Top-down: relevant operator feedback (IR -> UV)
       - Anomalous dimensions: from operator spectrum of J, not running correlations
     """
 
@@ -65,14 +78,12 @@ class HierarchicalDAM:
     def __init__(
         self,
         layers_config: Optional[List[Tuple[int, int, int]]] = None,
-        learning_rate: int = 1,
-        n_dream_steps: int = 3,
         j_clip: int = 500,
         uv_regularize: bool = True,
         uv_lambda: int = 5,
         topdown_scale: int = 200,
-        rg_beta_strength: int = 100,
-        learning_mode: str = "hebbian",
+        f_type: int = 2,  # F_EXP_APPROX by default
+        exp_temperature: int = 100,
         seed: int = 42,
     ):
         if layers_config is None:
@@ -80,14 +91,12 @@ class HierarchicalDAM:
 
         self.layers_config = layers_config
         self.n_layers = len(layers_config)
-        self.learning_rate = learning_rate
-        self.n_dream_steps = n_dream_steps
         self.j_clip = j_clip
         self.uv_regularize = uv_regularize
         self.uv_lambda = uv_lambda
         self.topdown_scale = topdown_scale
-        self.rg_beta_strength = rg_beta_strength
-        self.learning_mode = learning_mode
+        self.f_type = f_type
+        self.exp_temperature = exp_temperature
         self.seed = seed
 
         # Create DAM layers
@@ -95,12 +104,11 @@ class HierarchicalDAM:
         for l, (D, k, scale) in enumerate(layers_config):
             layer = DAMLayer(
                 D=D, k=k, scale=scale,
-                learning_rate=learning_rate,
-                n_dream_steps=n_dream_steps,
                 j_clip=j_clip,
                 uv_regularize=uv_regularize,
                 uv_lambda=uv_lambda,
-                learning_mode=learning_mode,
+                f_type=f_type,
+                exp_temperature=exp_temperature,
                 seed=seed + l * 1000,
             )
             self.layers.append(layer)
@@ -113,15 +121,18 @@ class HierarchicalDAM:
 
         # RG flow: effective coupling matrices (coupling-space RG)
         # J_eff[l]: effective coupling at level l, derived from level 0
-        # via successive decimation
+        # via successive decimation. After compute_coupling_flow(),
+        # J_eff[l] REPLACES layers[l].J.
         self.J_eff: List[Optional[np.ndarray]] = [None] * self.n_layers
 
         # RG beta functions: coupling flow ratios
         self.rg_beta: List[Optional[float]] = [None] * (self.n_layers - 1)
 
         # Anomalous dimensions: from operator spectrum of J at each level
-        # These are the proper RG anomalous dimensions, NOT running correlations
         self.gamma: List[Optional[np.ndarray]] = [None] * self.n_layers
+
+        # Track whether J_eff has been applied to layers
+        self._rg_applied = False
 
         self._built = False
         self._rng = np.random.RandomState(seed)
@@ -131,8 +142,8 @@ class HierarchicalDAM:
         Build inter-layer coupling matrices and initialize layers.
 
         Two kinds of inter-layer structure:
-          1. STATE-SPACE: W_up/W_down for context propagation (bottom-up/top-down)
-          2. COUPLING-SPACE: J_eff derived by RG decimation (the actual RG flow)
+          1. STATE-SPACE: W_up/W_down for context propagation
+          2. COUPLING-SPACE: J_eff derived by RG decimation (applied after training)
 
         Args:
             sdr_encoder: The SDR encoder (for dimension reference).
@@ -173,12 +184,67 @@ class HierarchicalDAM:
 
         return self
 
+    def train_l0_hebbian(
+        self,
+        context_sdrs: np.ndarray,
+        target_sdrs: np.ndarray,
+        eta: int = 1,
+    ) -> None:
+        """
+        Train ONLY L0 via batch Hebbian. Higher levels get J from RG flow.
+
+        DEEP FIX for Misconception #1: J at higher levels is NOT independently
+        learned. It is DERIVED from L0's J via Wilsonian RG decimation.
+
+        This ensures RG CONSISTENCY: the coupling at every level is derivable
+        from L0 by successive decimation. This is what Wilsonian RG means.
+
+        After training L0:
+          1. Apply UV regularization to L0
+          2. Compute coupling flow: J_eff[l+1] = Decimate(J_eff[l])
+          3. REPLACE layers[l].J with J_eff[l] for all l > 0
+          4. Compute anomalous dimensions from the new operator spectra
+
+        Args:
+            context_sdrs: Context SDRs (N, D0) uint8.
+            target_sdrs: Target SDRs (N, D0) uint8.
+            eta: Learning rate.
+        """
+        # Train L0
+        self.layers[0].store_batch_hebbian(context_sdrs, target_sdrs, eta)
+
+        # UV regularization on L0 only
+        if self.uv_regularize:
+            self.layers[0]._uv_regularize()
+
+        # Compute coupling flow and apply to all higher levels
+        self.compute_coupling_flow()
+        self._apply_coupling_flow()
+
+    def _apply_coupling_flow(self) -> None:
+        """
+        Apply the RG-derived J_eff to all layers.
+
+        This is the KEY step: replace independently-learned J at higher
+        levels with the RG-derived effective coupling from L0.
+
+        After this:
+          - layers[0].J remains the Hebbian-trained L0 coupling (UV theory)
+          - layers[l].J = J_eff[l] for l > 0 (IR theory derived from UV)
+          - The hierarchy is now a PROPER Wilsonian RG tower
+        """
+        for l in range(self.n_layers):
+            if self.J_eff[l] is not None:
+                self.layers[l].apply_coupling_flow(self.J_eff[l])
+
+        self._rg_applied = True
+
     def compute_coupling_flow(self) -> None:
         """
         Compute the RG flow of coupling constants from L0 to L3.
 
-        This is the CORE FIX for Misconception #1: RG acts on couplings,
-        not spin states.
+        DEEP FIX for Misconception #1: RG acts on couplings, not spin states.
+        AND the resulting J_eff is used as the actual J at each level.
 
         The coupling flow works as follows:
           J_eff[0] = J[0]  (L0 is the UV theory, full couplings)
@@ -187,9 +253,9 @@ class HierarchicalDAM:
         The decimation operator integrates out the within-block degrees
         of freedom, producing an effective coupling between blocks.
 
-        This ensures that the J at each level is CONSISTENT with the
-        level below — it's not independently learned but derived from
-        the UV theory via RG flow.
+        This ensures that J at each level is CONSISTENT with the level
+        below — it's not independently learned but derived from the UV
+        theory via RG flow.
         """
         if not self._built or self.n_layers < 2:
             return
@@ -197,7 +263,7 @@ class HierarchicalDAM:
         # L0: the UV theory — full coupling matrix
         self.J_eff[0] = self.layers[0].J.copy()
 
-        # Successive decimation from L0 to L3
+        # Successive decimation from L0 to L(n-1)
         for l in range(self.n_layers - 1):
             D_fine = self.layers_config[l][0]
             D_coarse = self.layers_config[l + 1][0]
@@ -214,24 +280,29 @@ class HierarchicalDAM:
             if D_c < 2:
                 break
 
-            # Block decimation: J_eff[α,β] = Σ_{i∈α, j∈β} J[i,j] / (|α|·|β|)
-            J_coarse = np.zeros((D_c, D_c), dtype=np.int32)
-            for alpha in range(D_c):
-                for beta in range(D_c):
-                    if alpha == beta:
-                        continue
-                    i_start = alpha * block_size
-                    i_end = i_start + block_size
-                    j_start = beta * block_size
-                    j_end = j_start + block_size
+            # Block decimation: J_eff[a,b] = Sigma_{i in a, j in b} J[i,j] / (|a|*|b|)
+            # Rescale to match the target dimension at level l+1
+            # The resulting matrix has size D_c x D_c
+            # If D_c == D_coarse, we can use it directly
+            # If D_c != D_coarse, we need to re-block
 
-                    block_sum = int(np.sum(J_fine[i_start:i_end, j_start:j_end]))
-                    # Normalize by block area, keep in Q8 fixed-point
-                    J_coarse[alpha, beta] = block_sum * 256 // (block_size * block_size)
+            J_coarse = self.layers[l].compute_coupling_flow(block_size)
 
-            # Clip to int16 range
-            J_coarse = np.clip(J_coarse, -32768, 32767).astype(np.int16)
-            self.J_eff[l + 1] = J_coarse
+            # If the coarse dimension matches the next layer, use directly
+            if J_coarse.shape[0] == D_coarse:
+                self.J_eff[l + 1] = J_coarse
+            else:
+                # Need to re-block: J_coarse has dim D_c, but next layer has D_coarse
+                # This happens when the halving chain doesn't match
+                # Use the layer's compute_coupling_flow method instead
+                D_target = D_coarse
+                block_size_2 = D_f // D_target
+                if D_f % D_target == 0 and block_size_2 >= 1:
+                    J_coarse = self.layers[l].compute_coupling_flow(block_size_2)
+                    self.J_eff[l + 1] = J_coarse
+                else:
+                    # Fallback: just copy what we have
+                    self.J_eff[l + 1] = J_coarse
 
             # Update RG beta function: ratio of coupling strengths
             J_fine_max = max(1, int(np.max(np.abs(J_fine))))
@@ -245,27 +316,26 @@ class HierarchicalDAM:
         """
         Compute anomalous dimensions from the operator spectrum of J.
 
-        FIX for Misconception #5: Anomalous dimensions come from the
-        eigenvalue spectrum of J, not from running correlations of
-        spin activity.
+        DEEP FIX for Misconception #5: Anomalous dimensions come from the
+        eigenvalue spectrum of J, not from running correlations of spin activity.
 
         Based on:
           Halverson et al. (2020): J spectrum maps to operator spectrum
           Ferko et al. (2026a): Anomalies detected via Ward identities
           Tiberi et al. (2021): Gell-Mann-Low criticality
 
-        The anomalous dimension γ[d] is defined as:
-          γ[d] = log(|λ_d|) / log(|λ_0|)
+        The anomalous dimension gamma[d] is defined as:
+          gamma[d] = log(|lambda_d|) / log(|lambda_0|)
 
-        where λ_d are eigenvalues of J sorted by magnitude.
+        where lambda_d are eigenvalues of J sorted by magnitude.
 
         Classification:
-          γ > 0.5 → relevant (grows under RG flow to IR)
-          0 < γ ≤ 0.5 → marginal (persists logarithmically)
-          γ ≤ 0 → irrelevant (decays under RG)
+          gamma > 0.5  -> relevant (grows under RG flow to IR)
+          0 < gamma <= 0.5 -> marginal (persists logarithmically)
+          gamma <= 0   -> irrelevant (decays under RG)
         """
         for l in range(self.n_layers):
-            spectrum = self.layers[l].compute_operator_spectrum()
+            spectrum = self.layers[l].compute_operator_spectrum(force_recompute=True)
             self.gamma[l] = spectrum['anomalous_dimensions']
 
     def coarse_grain(self, state: np.ndarray, level: int) -> np.ndarray:
@@ -306,11 +376,11 @@ class HierarchicalDAM:
         """
         Compute top-down feedback field from level l+1 to level l.
 
-        Uses anomalous dimensions γ[d] (from operator spectrum) to weight
-        the top-down signal. Relevant operators (γ > 0.5) get stronger
-        feedback; irrelevant operators (γ ≤ 0) get weaker feedback.
+        Uses anomalous dimensions gamma[d] (from operator spectrum) to weight
+        the top-down signal. Relevant operators (gamma > 0.5) get stronger
+        feedback; irrelevant operators (gamma <= 0) get weaker feedback.
 
-        FIX for Misconception #5: γ comes from operator spectrum, not
+        DEEP FIX for Misconception #5: gamma comes from operator spectrum, not
         running correlations.
 
         Args:
@@ -331,17 +401,12 @@ class HierarchicalDAM:
         field = W.astype(np.int32) @ state.astype(np.int32) * self.topdown_scale
 
         # Apply anomalous dimension weighting
-        # γ comes from the operator spectrum of the coarse level
         if self.gamma[level + 1] is not None:
             gamma = self.gamma[level + 1]
             D_fine = self.layers_config[level][0]
             D_coarse = self.layers_config[level + 1][0]
             block_size = D_fine // D_coarse
 
-            # For each coarse dimension d, weight by γ[d]
-            # γ > 0.5 → relevant → strong feedback (×2)
-            # 0 < γ ≤ 0.5 → marginal → normal feedback (×1)
-            # γ ≤ 0 → irrelevant → weak feedback (×0.5)
             for d in range(min(len(gamma), D_coarse)):
                 if state[d] > 0:
                     g = float(gamma[d])
@@ -350,7 +415,7 @@ class HierarchicalDAM:
                     elif g > 0:
                         weight = 1  # Marginal: keep
                     else:
-                        weight = 0  # Irrelevant: suppress (was 1/2, but int → 0)
+                        weight = 0  # Irrelevant: suppress
                     # Apply to the block of fine dimensions
                     start = d * block_size
                     end = start + block_size
@@ -370,9 +435,9 @@ class HierarchicalDAM:
         Run hierarchical attractor dynamics across all layers.
 
         Order of operations (per sweep):
-          1. Bottom-up: L0 → L1 → L2 → L3 (context propagation)
+          1. Bottom-up: L0 -> L1 -> L2 -> L3 (context propagation)
           2. Each layer runs its own attractor dynamics
-          3. Top-down: L3 → L2 → L1 → L0 (feedback with γ-weighting)
+          3. Top-down: L3 -> L2 -> L1 -> L0 (feedback with gamma-weighting)
           4. Final L0 step with all context
 
         Args:
@@ -424,17 +489,17 @@ class HierarchicalDAM:
         """
         Compute energy for each candidate word using F-lookup nonlinearity.
 
-        FIX for Misconception #6: The energy uses the nonlinear F function,
-        NOT linear alignment. This gives exponential storage capacity.
+        DEEP FIX for Misconception #6: The energy uses the nonlinear F function,
+        NOT linear alignment. With F_EXP_APPROX, this gives exponential capacity.
 
-        E(w) = -Σ_{i ∈ active(w)} F(context_field[i])
+        E(w) = -Sigma_{i in active(w)} F(context_field[i])
 
         where F is the nonlinear energy function from the F-lookup table.
 
         Args:
             context_sdr: Context SDR (D0,) uint8.
             candidate_words: Array of candidate word IDs.
-            sdr_encoder: SDR encoder for word→SDR mapping.
+            sdr_encoder: SDR encoder for word->SDR mapping.
             scale: Energy scale multiplier.
 
         Returns:
@@ -461,7 +526,6 @@ class HierarchicalDAM:
             context_field += td_field
 
         # Compute F-lookup energy for each candidate
-        # This is the CORRECT DAM energy with nonlinear F
         F_lookup = self.layers[0].F_lookup
         F_offset = self.layers[0]._F_offset
         J_MAX = self.layers[0].J_MAX
@@ -500,72 +564,41 @@ class HierarchicalDAM:
         eta: int = 1,
     ) -> None:
         """
-        Batch Hebbian training across all layers.
+        Batch Hebbian training: L0 only, then RG flow to all levels.
 
-        FIX for Misconception #3: Pure Hebbian at the right sparsity
-        IS the RG fixed point (Agliari et al. 2025). No PCD needed
-        when sparsity is properly tuned.
-
-        After training, compute the coupling flow (RG decimation of J)
-        to derive J_eff at all levels from L0's J.
+        DEEP FIX for Misconception #1 + #3:
+          - Only L0 is trained via Hebbian (Misconception #3: pure Hebbian
+            IS the RG fixed point at right sparsity)
+          - Higher levels get J from RG decimation of L0 (Misconception #1:
+            RG acts on couplings, not states)
 
         Args:
             context_sdrs: Context SDRs (N, D0) uint8.
             target_sdrs: Target SDRs (N, D0) uint8.
             eta: Learning rate.
         """
-        N = context_sdrs.shape[0]
-
-        # L0: direct Hebbian storage
+        # Train L0 via batch Hebbian
         self.layers[0].store_batch_hebbian(context_sdrs, target_sdrs, eta)
 
-        # Higher levels: coarse-grain and store
-        prev_context = context_sdrs
-        prev_target = target_sdrs
-
-        for l in range(1, self.n_layers):
-            D_coarse = self.layers_config[l][0]
-            k_coarse = self.layers_config[l][1]
-
-            W = self.W_up[l - 1]
-            if W is None:
-                break
-
-            # Block-spin projection
-            coarse_ctx_acc = W.astype(np.int32) @ prev_context.astype(np.int32).T
-            coarse_tgt_acc = W.astype(np.int32) @ prev_target.astype(np.int32).T
-
-            # kWTA each column
-            coarse_context = np.zeros((N, D_coarse), dtype=np.uint8)
-            coarse_target = np.zeros((N, D_coarse), dtype=np.uint8)
-            for n in range(N):
-                top_k_ctx = np.argpartition(coarse_ctx_acc[:, n], -k_coarse)[-k_coarse:]
-                coarse_context[n, top_k_ctx] = 1
-                top_k_tgt = np.argpartition(coarse_tgt_acc[:, n], -k_coarse)[-k_coarse:]
-                coarse_target[n, top_k_tgt] = 1
-
-            # Store at this level
-            self.layers[l].store_batch_hebbian(coarse_context, coarse_target, eta)
-
-            prev_context = coarse_context
-            prev_target = coarse_target
-
-        # UV regularization at all levels
+        # UV regularization on L0
         if self.uv_regularize:
-            for layer in self.layers:
-                layer._uv_regularize()
+            self.layers[0]._uv_regularize()
 
-        # Compute coupling flow (RG decimation from L0)
+        # Compute coupling flow and apply to all higher levels
         self.compute_coupling_flow()
+        self._apply_coupling_flow()
 
     def check_uv_completeness(self) -> dict:
         """
         Check UV completeness across the entire hierarchy.
 
+        DEEP FIX for Misconception #2: UV completeness requires Ward identities
+        and cutoff independence, NOT spectral gap monitoring.
+
         Based on the knowledge base:
           - Cutoff independence (Sen & Vaidya 2025)
+          - Ward identities (Ferko et al. 2026a)
           - Coupling flow stability (Howard et al. 2024)
-          - No scale anomaly (Ferko et al. 2026a)
           - Gell-Mann-Low criticality (Tiberi et al. 2021)
 
         Returns:
@@ -579,12 +612,11 @@ class HierarchicalDAM:
         flow_consistent = True
         for l in range(self.n_layers - 1):
             if self.rg_beta[l] is not None:
-                # Beta function should be between 0 and 1
-                # (couplings weaken under coarse-graining)
                 if self.rg_beta[l] > 1.5 or self.rg_beta[l] < 0:
                     flow_consistent = False
 
         results['flow_consistent'] = flow_consistent
+        results['rg_applied'] = self._rg_applied
         results['overall_uv_score'] = np.mean([
             results[f'L{l}']['uv_score'] for l in range(self.n_layers)
         ])
@@ -598,14 +630,18 @@ class HierarchicalDAM:
 
     def get_diagnostics(self) -> Dict:
         """Return diagnostics for all layers."""
-        diag = {'n_layers': self.n_layers, 'built': self._built}
+        diag = {
+            'n_layers': self.n_layers,
+            'built': self._built,
+            'rg_applied': self._rg_applied,
+        }
         for l, layer in enumerate(self.layers):
             diag[f'L{l}'] = layer.get_diagnostics()
         if self._built:
             for l in range(self.n_layers - 1):
                 if self.rg_beta[l] is not None:
                     diag[f'rg_beta_{l}'] = self.rg_beta[l]
-            # Include UV completeness
+            # Include UV completeness (with Ward identity checks)
             diag['uv_completeness'] = self.check_uv_completeness()
         total_mem = sum(layer.J.nbytes + layer.h.nbytes for layer in self.layers)
         diag['total_memory_kb'] = total_mem / 1024
@@ -613,16 +649,20 @@ class HierarchicalDAM:
 
     def _print_diagnostics(self) -> None:
         """Print hierarchy diagnostics."""
+        f_type_name = {0: 'quadratic', 1: 'cubic', 2: 'exp_approx'}.get(
+            self.f_type, 'unknown'
+        )
         print(f"    Hierarchical DAM: {self.n_layers} layers")
+        print(f"    F function: {f_type_name}, T={self.exp_temperature/100:.2f}")
         for l, (D, k, scale) in enumerate(self.layers_config):
             sparsity = k / D * 100
             print(f"      L{l}: D={D}, k={k} ({sparsity:.1f}% sparse), scale={scale}")
         if self._built:
             for l in range(self.n_layers - 1):
                 if self.W_up[l] is not None:
-                    print(f"      RG flow L{l}→L{l+1}: "
+                    print(f"      RG flow L{l}->L{l+1}: "
                           f"block_size={self.layers_config[l][0]//self.layers_config[l+1][0]}, "
-                          f"β={self.rg_beta[l]:.3f}")
+                          f"beta={self.rg_beta[l]:.3f}")
         total_mem = sum(layer.J.nbytes + layer.h.nbytes for layer in self.layers)
         print(f"      Total memory: {total_mem/1024:.1f} KB")
-        print(f"      Learning mode: {self.learning_mode}")
+        print(f"      Learning: Hebbian (L0 only, RG flow to higher levels)")
