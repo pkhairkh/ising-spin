@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v28 — Training Script
+Attractor Language Machine v31 — Training Script
 
 DEEP FIXES:
   - F_EXP_APPROX: piecewise integer exponential (TRUE exponential capacity)
@@ -134,7 +134,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v28 — DEEP FIXES"
+        description="Attractor Language Machine v31 — CRITICAL F-CLIP FIX"
     )
 
     # Core parameters
@@ -207,7 +207,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v28 — DEEP FIXES", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v31 — CRITICAL F-CLIP FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -224,11 +224,12 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v28 (DEEP FIXES)")
+    print(f"CONFIG: Attractor Language Machine v31 (F-CLIP FIX + VECTORIZED)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: Wilsonian (J_eff REPLACES J at higher levels)")
+    print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -351,8 +352,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "28.0.0",
-        "architecture": "Attractor Language Machine v28 — DEEP FIXES: F_EXP_APPROX, RG-derived J_eff, Ward identities, pure Hebbian",
+        "version": "31.0.0",
+        "architecture": "Attractor Language Machine v31 — INLINE piecewise F (no J_MAX clip), RG-derived J_eff, pure Hebbian",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -391,7 +392,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v28")
+    print(f"DONE — Attractor Language Machine v31")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
