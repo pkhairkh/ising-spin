@@ -367,10 +367,16 @@ class DAMLayer:
             return 0
 
         energy = 0
-        for i in active:
-            f_val = int(field[i])
-            f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
-            energy -= int(self.F_lookup[f_val + self._F_offset])
+        if self.f_type == self.F_EXP_APPROX:
+            # Inline piecewise F — no clipping, full dynamic range
+            for i in active:
+                energy -= self._F_inline(int(field[i]))
+        else:
+            # LUT for quadratic/cubic — fields in range
+            for i in active:
+                f_val = int(field[i])
+                f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
+                energy -= int(self.F_lookup[f_val + self._F_offset])
 
         return energy
 
@@ -396,6 +402,47 @@ class DAMLayer:
 
         return field
 
+    def _F_inline(self, x: int) -> int:
+        """
+        INLINE piecewise exponential F — no LUT, no clipping.
+
+        F(x) = (T + x%T) << (x//T)   for x > 0
+        F(x) = 0                      for x <= 0
+
+        This is the SAME piecewise exponential as the LUT, but computed
+        inline for any x value — no J_MAX clipping, no table bounds.
+
+        Overflow protection: cap shift at 40 bits (F max ~ T * 2^41).
+        At T=50 this gives F_max ~ 110 trillion, which fits in int64.
+
+        WHY THIS MATTERS:
+          The LUT-based F clips fields at ±J_MAX (1000), but actual fields
+          reach 8000+ (k * j_clip). The clipping DESTROYS the exponential
+          selectivity — everything above 1000 gets the same energy. The
+          inline version preserves the full exponential dynamic range.
+
+        Args:
+            x: Field value (can be any int, no clipping).
+
+        Returns:
+            F(x) as int64. Zero for x <= 0, exponentially growing for x > 0.
+        """
+        if x <= 0:
+            return 0
+
+        T = self.exp_temperature  # Q8: 100 = 1.0, 50 = 0.5, etc.
+        T = max(1, T)  # Avoid division by zero
+
+        n = x // T     # Which "octave" — the shift amount
+        r = x % T      # Position within octave
+
+        # Overflow protection: cap shift at 40
+        # 2^40 * (2*T) ≈ 2.2e14 at T=50 — well within int64
+        if n > 40:
+            n = 40
+
+        return (T + r) << n
+
     def compute_word_energies(
         self,
         context_field: np.ndarray,
@@ -403,7 +450,7 @@ class DAMLayer:
         scale: int = 1600,
     ) -> np.ndarray:
         """
-        Compute DAM energy for candidate words using F-lookup nonlinearity.
+        Compute DAM energy for candidate words using INLINE piecewise F.
 
         FIELD-BASED formulation (Ramsauer, transformer-equivalent):
           E(w) = -scale * Sigma_{i in active(w)} F(field_i) / k
@@ -412,6 +459,11 @@ class DAMLayer:
           - Strong fields (high alignment) get EXPONENTIALLY amplified
           - Weak fields (poor alignment) get suppressed
           - This creates sharp attractor basins
+
+        USES INLINE F instead of LUT to avoid field clipping.
+        The LUT clips at ±J_MAX (1000), but actual fields reach k*j_clip
+        (8000+). The inline piecewise F(x) = (T+r) << n works for ANY
+        field value, preserving the full exponential dynamic range.
 
         Args:
             context_field: Precomputed context field (D,) int32.
@@ -424,22 +476,38 @@ class DAMLayer:
         n_cand = len(candidate_active_bits)
         energies = np.zeros(n_cand, dtype=np.int64)
 
-        for i, active_bits in enumerate(candidate_active_bits):
-            if len(active_bits) == 0:
-                energies[i] = scale * 10  # High energy for empty
-                continue
+        # Use inline F for exp_approx — no LUT clipping!
+        if self.f_type == self.F_EXP_APPROX:
+            for i, active_bits in enumerate(candidate_active_bits):
+                if len(active_bits) == 0:
+                    energies[i] = scale * 10
+                    continue
 
-            k = len(active_bits)
-            total_f = 0
-            for d in active_bits:
-                d = int(d)
-                if 0 <= d < self.D:
-                    f_val = int(context_field[d])
-                    f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
-                    total_f += int(self.F_lookup[f_val + self._F_offset])
+                k = len(active_bits)
+                total_f = 0
+                for d in active_bits:
+                    d = int(d)
+                    if 0 <= d < self.D:
+                        total_f += self._F_inline(int(context_field[d]))
 
-            # Energy = -F_contribution * scale / k (normalized)
-            energies[i] = -total_f * scale // max(1, k)
+                energies[i] = -total_f * scale // max(1, k)
+        else:
+            # Quadratic / cubic: use LUT (field values in range)
+            for i, active_bits in enumerate(candidate_active_bits):
+                if len(active_bits) == 0:
+                    energies[i] = scale * 10
+                    continue
+
+                k = len(active_bits)
+                total_f = 0
+                for d in active_bits:
+                    d = int(d)
+                    if 0 <= d < self.D:
+                        f_val = int(context_field[d])
+                        f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
+                        total_f += int(self.F_lookup[f_val + self._F_offset])
+
+                energies[i] = -total_f * scale // max(1, k)
 
         return energies
 
