@@ -68,16 +68,10 @@ class IntegerBoltzmannSampler:
         self.beta = beta
         self.scale = scale
         # For accurate PPL computation, max_delta must cover the full energy
-        # range. With recall_scale=1600 and 5K vocab, max delta ≈ 32K.
-        # With v22 spin energy fixes (latent_scale=4000, coupling_scale=3000),
-        # total energy range is wider, so we need a larger cap.
-        # Memory: 50001 × 8 bytes ≈ 400KB — still very affordable.
-        #
-        # v22: Increased from 25K to 50K. The previous 25K cap was tested
-        # before spin energy was properly normalized and scaled. With the new
-        # energy landscape (spin terms competitive with recall), the wider
-        # range allows the Boltzmann distribution to express sharper
-        # preferences when spin alignment strongly favors a candidate.
+        # range. With dam_scale=1600 and ~2K vocab, max delta ≈ 32K.
+        # The hierarchical DAM with multi-layer energy contributions can
+        # produce wider ranges, so we use a generous cap.
+        # Memory: 50001 × 8 bytes ≈ 400KB — very affordable.
         fine_max = min(max_delta, 50000)
         self.table = np.zeros(fine_max + 1, dtype=np.int64)
 
@@ -162,8 +156,8 @@ class IntegerBoltzmannSampler:
         Compute log2 probabilities for each element — INTEGER-ONLY.
 
         Uses the analytical formula for log2 of Boltzmann weights:
-          table[d] = scale * 2^(-β*d/ln2) = scale * 2^(-0.85*d/recall_scale)
-          log2(table[d]) = log2(scale) - 0.85*d/recall_scale = 30 - 0.85*d/recall_scale
+          table[d] = scale * 2^(-β*d/ln2)
+          log2(table[d]) = log2(scale) - β*d/ln2
 
         This is EXACT — no approximation needed for individual log2 weights.
         Only log2(Z) requires the lookup table (for the sum).
@@ -255,13 +249,13 @@ class IntegerBoltzmannSampler:
 # All in fixed-point with 16 bits of precision.
 # Then log₂(1+ε) = ln(1+ε) / ln(2) = ln(1+ε) * LN2_DEN / LN2_NUM
 
-_RECALL_LUT_BITS = 16
-_RECALL_LUT_SIZE = 1 << _RECALL_LUT_BITS  # 65536
-_RECALL_LOG2_FRAC = 8  # 8 bits of fractional precision for log₂
-_RECALL_LOG2_SCALE = 1 << _RECALL_LOG2_FRAC  # 256
+_LOG2_LUT_BITS = 16
+_LOG2_LUT_SIZE = 1 << _LOG2_LUT_BITS  # 65536
+_LOG2_FRAC_BITS = 8  # 8 bits of fractional precision for log₂
+_LOG2_FRAC_SCALE = 1 << _LOG2_FRAC_BITS  # 256
 
-_RECALL_LOG2_LUT = np.zeros(_RECALL_LUT_SIZE, dtype=np.int32)
-for _i in range(_RECALL_LUT_SIZE):
+_LOG2_LUT = np.zeros(_LOG2_LUT_SIZE, dtype=np.int32)
+for _i in range(_LOG2_LUT_SIZE):
     # INTEGER-ONLY LUT construction — range-splitting for accuracy.
     # ε = _i / 65536 ∈ [0, 1). We compute log₂(1+ε) * 256 entirely with integers.
     #
@@ -273,9 +267,9 @@ for _i in range(_RECALL_LUT_SIZE):
     _ONE = 1 << _FP
     _HALF = _ONE >> 1
 
-    if _i < _RECALL_LUT_SIZE >> 1:
+    if _i < _LOG2_LUT_SIZE >> 1:
         # ε ∈ [0, 0.5): direct Taylor of ln(1+ε), 12th order
-        _eps = (_i << _FP) // _RECALL_LUT_SIZE
+        _eps = (_i << _FP) // _LOG2_LUT_SIZE
         _e2 = (_eps * _eps) >> _FP
         _e3 = (_e2 * _eps) >> _FP
         _e4 = (_e3 * _eps) >> _FP
@@ -294,7 +288,7 @@ for _i in range(_RECALL_LUT_SIZE):
         # ε ∈ [0.5, 1): use log₂(1+ε) = 1 + log₂(1 - δ)
         # where δ = (1-ε)/2 ∈ [0, 0.25]
         # ε = _i / 65536, so δ = (65536 - _i) / (2 * 65536)
-        _delta = ((_RECALL_LUT_SIZE - _i) << _FP) // (2 * _RECALL_LUT_SIZE)
+        _delta = ((_LOG2_LUT_SIZE - _i) << _FP) // (2 * _LOG2_LUT_SIZE)
         _d2 = (_delta * _delta) >> _FP
         _d3 = (_d2 * _delta) >> _FP
         _d4 = (_d3 * _delta) >> _FP
@@ -307,9 +301,9 @@ for _i in range(_RECALL_LUT_SIZE):
         _ln = -_ln_neg
         # log₂(1-δ) * 256 + 256 (the +256 is the "1" in "1 + log₂(1-δ)")
         _log2_frac = (_ln * LN2_DEN) // (LN2_NUM * (1 << 24))
-        _log2_val = _RECALL_LOG2_SCALE + _log2_frac  # 256 + log₂(1-δ)*256
+        _log2_val = _LOG2_FRAC_SCALE + _log2_frac  # 256 + log₂(1-δ)*256
 
-    _RECALL_LOG2_LUT[_i] = _log2_val
+    _LOG2_LUT[_i] = _log2_val
 
 
 def int_log2_fine(x: int) -> int:
@@ -332,7 +326,7 @@ def int_log2_fine(x: int) -> int:
     int_part = x.bit_length() - 1
 
     # Normalize x to [65536, 131072) i.e. [1.0, 2.0) in 16-bit fixed point
-    SHIFT = _RECALL_LUT_BITS  # 16
+    SHIFT = _LOG2_LUT_BITS  # 16
     if int_part >= SHIFT:
         m = x >> (int_part - SHIFT)
     else:
@@ -341,7 +335,7 @@ def int_log2_fine(x: int) -> int:
 
     # ε = m/65536 - 1, so ε_index = m - 65536 ∈ [0, 65536)
     eps_idx = m - (1 << SHIFT)
-    eps_idx = max(0, min(eps_idx, _RECALL_LUT_SIZE - 1))
-    frac = int(_RECALL_LOG2_LUT[eps_idx])
+    eps_idx = max(0, min(eps_idx, _LOG2_LUT_SIZE - 1))
+    frac = int(_LOG2_LUT[eps_idx])
 
-    return int_part * _RECALL_LOG2_SCALE + frac
+    return int_part * _LOG2_FRAC_SCALE + frac

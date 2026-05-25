@@ -14,12 +14,12 @@ ARCHITECTURE:
   - PCD learning: Contrastive divergence for energy landscape sculpting
 
 Usage:
-  python -u train_attractor.py                          # Default: 500K samples
-  python -u train_attractor.py --samples 100000          # 100K samples
-  python -u train_attractor.py --memory-budget 14000     # Pi 5 (16GB)
+  python -u train.py                                     # Default: 500K samples
+  python -u train.py --samples 100000                    # 100K samples
+  python -u train.py --memory-budget 14000               # Pi 5 (16GB)
 
 With nohup (for long runs on Pi 5):
-  nohup python -u train_attractor.py --memory-budget 14000 > train_attractor.log 2>&1 &
+  nohup python -u train.py --memory-budget 14000 > train.log 2>&1 &
 """
 
 # --- UNBUFFERED OUTPUT ---

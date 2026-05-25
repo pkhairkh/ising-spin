@@ -149,7 +149,7 @@ class TopicAssigner:
                 chunk = remaining[chunk_start:chunk_start + CHUNK]
                 chunk_vecs = np.zeros((len(chunk), vocab_size), dtype=np.int64)
                 for d, text in enumerate(chunk):
-                    # v17.4 FIX: Use vocab._tokenize() instead of text.split()
+                    # Use vocab._tokenize() for proper tokenization
                     tokens = vocab._tokenize(text)
                     for w in tokens:
                         idx = vocab.word2idx.get(w)

@@ -4,12 +4,12 @@ Attractor Language Machine — THE ENGINE.
 The attractor dynamics of a Dense Associative Memory ARE a language model.
 Not an approximation. Not a component. They ARE one.
 
-This engine replaces:
-  - Multi-scale n-gram recall → DAM attractor dynamics
-  - Document state (7 rule-based vars) → Hierarchical DAM states (L0-L3)
-  - Hebbian SSR → Content-addressable episodic memory
-  - Balanced ±1 binarization → Sparse Distributed Representations (kWTA)
-  - Boltzmann sampling → kWTA attractor dynamics + Boltzmann refinement
+This engine implements:
+  - DAM attractor dynamics (energy-based prediction)
+  - Hierarchical DAM states (L0-L3) with Wilsonian RG flow
+  - Content-addressable episodic memory (sparse pattern storage)
+  - Sparse Distributed Representations (kWTA, ~2% active bits)
+  - kWTA attractor dynamics + Boltzmann refinement
 
 WHAT'S KEPT FROM THE OLD ARCHITECTURE:
   - Vocabulary building and tokenization

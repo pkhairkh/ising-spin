@@ -8,7 +8,7 @@ per-domain catch blocks.
 
 
 class AttractorError(Exception):
-    """Base exception for all attractor_lm errors."""
+    """Base exception for all ising_spin errors."""
 
 
 # ── Build / Training Errors ──────────────────────────────────────────────

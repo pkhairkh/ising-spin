@@ -90,7 +90,7 @@ class DAMLayer:
             D: State dimension.
             k: Number of active bits (sparsity).
             energy_beta: Polynomial degree for F function (2=quadratic, 3=cubic).
-            scale: Energy scale (maps to recall_scale in old architecture).
+            scale: Energy scale for DAM attractor dynamics.
             learning_rate: PCD learning rate (integer).
             n_dream_steps: Number of attractor relaxation steps in PCD.
             j_clip: Maximum absolute coupling value (prevents unbounded growth).
