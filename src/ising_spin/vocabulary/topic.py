@@ -1,9 +1,9 @@
 """
 Topic assignment from training data using integer K-means.
 
-This module is ONLY for computing topic assignments from training data.
-Runtime spin-flip logic (sigma_T, coherence penalty, etc.) belongs in
-the state module.
+Computes word-topic assignments for the hierarchical DAM's semantic
+layer (L2). Each word is assigned a dominant topic via integer K-means
+clustering of document-term vectors.
 """
 
 import math
@@ -75,9 +75,8 @@ class TopicAssigner:
         print(f"    [1/4] Building document-term matrix ({n_docs} docs, {vocab_size} vocab)...")
         doc_vectors = np.zeros((n_docs, vocab_size), dtype=np.int32)
         for d, text in enumerate(cluster_texts):
-            # v17.4 FIX: Use vocab._tokenize() instead of text.split()
-            # text.split() misses lowercasing, punctuation stripping, and contraction splitting.
-            # This caused massive lookup failures (e.g., "The" never matched "the").
+            # Use vocab._tokenize() for proper tokenization (lowercasing,
+            # punctuation stripping, contraction splitting)
             tokens = vocab._tokenize(text)
             for w in tokens:
                 idx = vocab.word2idx.get(w)

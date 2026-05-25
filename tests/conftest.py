@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
 # ── Shared synthetic texts ──────────────────────────────────────────────────
@@ -47,41 +47,22 @@ def small_vocab():
 
 
 @pytest.fixture
-def small_model():
-    """Build a small IsingLMModel with all modules for integration/property tests."""
-    from ising_spin.orchestrator import IsingLMModel
+def small_attractor_model():
+    """Build a small AttractorLanguageModel for integration tests."""
+    from ising_spin.attractor import AttractorLanguageModel
 
-    model = IsingLMModel(
+    model = AttractorLanguageModel(
         vocab_min_freq=1,
         vocab_max_size=200,
-        ngram_max_n=3,
-        ngram_min_count=1,
-        pos_ngram_max_n=5,
-        pos_ngram_min_count=1,
-        topic_ngram_max_n=5,
-        topic_ngram_min_count=1,
-        n_topics=4,
-        reservoir_dim=32,
-        reservoir_alpha_q15=31130,
-        reservoir_scale=800,
-        vsa_dim=64,
-        vsa_scale=800,
-        coupling_scale=200,
-        recall_scale=1600,
-        pos_recall_scale=800,
-        topic_recall_scale=400,
-        state_scale=400,
+        sdr_dim=64,
+        sdr_sparsity=0.08,
+        dam_scale=400,
+        grammar_penalty_scale=30,
         same_word_penalty=200,
-        max_closed_class_run=2,
-        auto_calibrate_beta=False,
-        beta_word=0.1,
-        beta_type=0.01,
-        interpolated=True,
-        kn_backoff=True,
-        max_seq_len=30,
-        enable_reservoir=True,
-        enable_coupling=True,
-        enable_vsa=True,
+        max_episodes=100,
+        episodic_scale=200,
+        max_seq_len=15,
+        seed=42,
     )
-    model.train(texts=_SYNTHETIC_TEXTS)
+    model.train(n_samples=len(_SYNTHETIC_TEXTS), texts=_SYNTHETIC_TEXTS)
     return model

@@ -1,5 +1,5 @@
 """
-Shared utilities for the Ising Spin Glass Language Model.
+Shared utilities for the Attractor Language Machine.
 
 Single source of truth for constants and helpers:
   - TAG_PRIORITY: word→POS disambiguation priority
@@ -22,7 +22,7 @@ from typing import List, Sequence
 import numpy as np
 
 from .vocabulary.pos import POS2IDX
-from .errors import CorpusError
+from .exceptions import CorpusError
 
 
 # ── TAG PRIORITY ─────────────────────────────────────────────────────────

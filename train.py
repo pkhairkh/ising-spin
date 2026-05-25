@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-Training Script — Multi-Scale Abstract Recall + Evolving Document State
+Attractor Language Machine — Training Script
 
 ARCHITECTURE:
-  Word n-gram (5) + POS n-gram (15) + Topic n-gram (10) + Document State (7 vars)
+  Dense Associative Memory (DAM) as the ENGINE.
+  The attractor dynamics of a DAM ARE a language model.
 
-KEY INSIGHT:
-  When the 5-word n-gram is unseen, the POS 10-gram IS seen.
-  When POS is ambiguous, topic disambiguates.
-  When all n-grams miss, document state carries discourse coherence.
+  - SDR encoding: Sparse Distributed Representations (~2% active bits)
+  - Hierarchical DAM: L0-Lexical → L1-Syntactic → L2-Semantic → L3-Discourse
+  - RG flow: Wilsonian renormalization group between layers (UV-complete)
+  - Episodic memory: Content-addressable sparse pattern storage
+  - F-lookup energy: Nonlinear energy function (exponential capacity)
+  - PCD learning: Contrastive divergence for energy landscape sculpting
 
 Usage:
-  python -u train.py                          # Default: 500K samples
-  python -u train.py --samples 1000000         # 1M samples
-  python -u train.py --no-pos-recall            # Ablation: without POS n-gram
-  python -u train.py --no-topic-recall          # Ablation: without topic n-gram
-  python -u train.py --no-state                 # Ablation: without document state
+  python -u train_attractor.py                          # Default: 500K samples
+  python -u train_attractor.py --samples 100000          # 100K samples
+  python -u train_attractor.py --memory-budget 14000     # Pi 5 (16GB)
+
+With nohup (for long runs on Pi 5):
+  nohup python -u train_attractor.py --memory-budget 14000 > train_attractor.log 2>&1 &
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -38,15 +42,11 @@ from pathlib import Path
 # --- Configuration ---
 
 DEFAULT_SAMPLES = 500000
-DEFAULT_VOCAB = 2000  # TinyStories vocabulary ~2K; was 4000 for FineWeb-Edu
+DEFAULT_VOCAB = 2000
 DEFAULT_DATASET = "tinystories"
-DEFAULT_RECALL_SCALE = 1600
-DEFAULT_POS_RECALL_SCALE = 800
-DEFAULT_TOPIC_RECALL_SCALE = 400
-DEFAULT_STATE_SCALE = 200
-DEFAULT_POS_NGRAM_MAX_N = 15
-DEFAULT_TOPIC_NGRAM_MAX_N = 10
-DEFAULT_MEMORY_BUDGET = 0  # 0 = unlimited; set to MB for constrained devices (e.g. 14000 for 16GB Pi)
+DEFAULT_MEMORY_BUDGET = 0
+DEFAULT_SDR_DIM = 512
+DEFAULT_SDR_SPARSITY = 0.02
 
 # Cache directory
 CACHE_DIR = Path(__file__).parent
@@ -59,13 +59,12 @@ def get_rss_mb() -> int:
     return _get_rss_mb()
 
 
-def find_cache_file(n_samples: int, dataset_name: str = "fineweb") -> str:
+def find_cache_file(n_samples: int, dataset_name: str = "tinystories") -> str:
     """Find the best cache file for the requested number of samples."""
     cache_files = {}
     glob_pattern = f"cached_{dataset_name}_*.json"
     for f in CACHE_DIR.glob(glob_pattern):
         name = f.stem
-        # Extract size from filename: cached_tinystories_500k.json → 500k
         parts = name.split("_")
         size_str = parts[-1]
         try:
@@ -91,19 +90,14 @@ def find_cache_file(n_samples: int, dataset_name: str = "fineweb") -> str:
 
 
 def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
-    """Load or download data with proper cache handling.
-
-    Supported datasets: tinystories, tiny-textbooks, writingprompts, fineweb-edu
-    """
+    """Load or download data with proper cache handling."""
     from ising_spin.utils import DATASET_LOADERS, DEFAULT_DATASET as _DEF
 
-    # Resolve dataset name
     dataset_name = dataset_name or _DEF
     if dataset_name not in DATASET_LOADERS:
         print(f"  Unknown dataset '{dataset_name}', falling back to {_DEF}")
         dataset_name = _DEF
 
-    # Sanitize dataset name for cache filenames
     cache_dataset = dataset_name.replace("-", "_")
     cache_path = find_cache_file(n_samples, cache_dataset)
 
@@ -141,579 +135,137 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
     return texts
 
 
-def beta_sweep_ppl(model, beta_factors=None, n_seqs=10):
-    """Two-phase beta sweep to find optimal PPL."""
-    import numpy as np
-    from ising_spin.sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN
-
-    recall_scale = model.recall_scale
-    base_beta = 0.5 * float(LN2_NUM) / float(LN2_DEN) / recall_scale
-
-    if beta_factors is None:
-        beta_factors = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00, 4.00, 5.00]
-
-    best_ppl = float('inf')
-    best_f = 1.0
-
-    print("\nBeta sweep (Phase 1 — coarse):")
-    for f in beta_factors:
-        new_beta = base_beta * f
-        model.generator.word_sampler = IntegerBoltzmannSampler(
-            beta=new_beta, max_delta=50000
-        )
-        try:
-            ppl = model.compute_perplexity(n_samples=n_seqs)
-            marker = " <-- BEST" if ppl < best_ppl else ""
-            print(f"    f={f:.2f} (beta={new_beta:.6f}): PPL={ppl:.1f}{marker}")
-            if ppl < best_ppl:
-                best_ppl = ppl
-                best_f = f
-        except Exception as e:
-            print(f"    f={f:.2f}: Error: {e}")
-
-    # Phase 2: Fine sweep
-    fine_lo = max(0.5, best_f - 0.5)
-    fine_hi = best_f + 0.5
-    fine_factors = np.arange(fine_lo, fine_hi + 0.1, 0.1).tolist()
-    fine_factors = [f for f in fine_factors if abs(f - best_f) > 0.05 or f == best_f]
-
-    if len(fine_factors) > 1:
-        print(f"\nBeta sweep (Phase 2 — fine around f={best_f:.2f}):")
-        for f in fine_factors:
-            new_beta = base_beta * f
-            model.generator.word_sampler = IntegerBoltzmannSampler(
-                beta=new_beta, max_delta=50000
-            )
-            try:
-                ppl = model.compute_perplexity(n_samples=n_seqs)
-                marker = " <-- BEST" if ppl < best_ppl else ""
-                print(f"    f={f:.2f} (beta={new_beta:.6f}): PPL={ppl:.1f}{marker}")
-                if ppl < best_ppl:
-                    best_ppl = ppl
-                    best_f = f
-            except Exception as e:
-                print(f"    f={f:.2f}: Error: {e}")
-
-    model.generator.word_sampler = IntegerBoltzmannSampler(
-        beta=base_beta * best_f, max_delta=50000
-    )
-    print(f"\nBest: f={best_f:.2f} (beta={base_beta * best_f:.6f}), PPL={best_ppl:.1f}")
-
-    return best_f, best_ppl
-
-
-def print_recall_diagnostics(model, include_generator_stats=True):
-    """Print per-scale recall diagnostics from the multi-scale recall layer.
-
-    Args:
-        model: The IsingLMModel instance.
-        include_generator_stats: If True, include generator stats (hits, copies, etc.).
-            Set to False before generation to avoid showing misleading zeros.
-    """
-    print(f"\nMulti-Scale Recall Diagnostics:")
-
-    # Word recall diagnostics
-    if model.word_index is not None:
-        n_word_entries = sum(len(model.word_index.index[k]) for k in range(1, model.word_index.max_n + 1))
-        n_word_sequences = sum(
-            sum(len(v) for v in model.word_index.index[k].values())
-            for k in range(1, model.word_index.max_n + 1)
-        )
-        print(f"  WORD n-gram index:")
-        print(f"    entries={n_word_entries:,}, sequences={n_word_sequences:,}")
-
-    # POS recall diagnostics
-    if model.pos_index is not None:
-        n_pos_entries = sum(len(model.pos_index.index[k]) for k in range(1, model.pos_index.max_n + 1))
-        n_pos_sequences = sum(
-            sum(len(v) for v in model.pos_index.index[k].values())
-            for k in range(1, model.pos_index.max_n + 1)
-        )
-        print(f"  POS n-gram index:")
-        print(f"    entries={n_pos_entries:,}, sequences={n_pos_sequences:,}")
-
-    # Topic recall diagnostics
-    if model.topic_index is not None:
-        n_topic_entries = sum(len(model.topic_index.index[k]) for k in range(1, model.topic_index.max_n + 1))
-        n_topic_sequences = sum(
-            sum(len(v) for v in model.topic_index.index[k].values())
-            for k in range(1, model.topic_index.max_n + 1)
-        )
-        print(f"  TOPIC n-gram index:")
-        print(f"    entries={n_topic_entries:,}, sequences={n_topic_sequences:,}")
-
-    # Multi-scale recall summary
-    if model.multiscale_recall is not None:
-        summary = model.multiscale_recall.summary()
-        print(f"  Multi-scale recall summary: {summary}")
-
-    # Document state diagnostics
-    if model.document_state is not None:
-        ds = model.document_state
-        n_state_vars = getattr(ds, 'n_state_vars', 7)
-        print(f"  DOCUMENT STATE:")
-        print(f"    n_state_vars={n_state_vars}, state_scale={model.state_scale}")
-        if hasattr(ds, 'get_diagnostics'):
-            ds_diag = ds.get_diagnostics()
-            for k, v in ds_diag.items():
-                print(f"    {k}={v}")
-
-    # Generator stats (only after generation has run)
-    if include_generator_stats and model.generator is not None and hasattr(model.generator, 'get_stats'):
-        gen_stats = model.generator.get_stats()
-        print(f"  GENERATOR STATS:")
-        word_hits = gen_stats.get("recall_hit", 0)
-        pos_hits = gen_stats.get("pos_recall_hit", 0)
-        topic_hits = gen_stats.get("topic_recall_hit", 0)
-        copies = gen_stats.get("copy_used", 0)
-        copy_rate = gen_stats.get("copy_rate", 0.0)
-        total_pos = max(1, gen_stats.get("total_positions", 1))
-        state_energy = gen_stats.get("chosen_state_energy", 0)
-        print(f"    word_recall_hits={word_hits} ({word_hits/total_pos:.1%})")
-        print(f"    pos_recall_hits={pos_hits} ({pos_hits/total_pos:.1%})")
-        print(f"    topic_recall_hits={topic_hits} ({topic_hits/total_pos:.1%})")
-        print(f"    copies={copies} ({copy_rate:.1%})")
-        print(f"    chosen_state_energy={state_energy}")
-
-
-def auto_tune_for_memory(
-    budget_mb: int,
-    n_samples: int,
-    word_ngram_max_n: int,
-    pos_ngram_max_n: int,
-    topic_ngram_max_n: int,
-    ngram_max_seqs: int,
-    reservoir_dim: int,
-    vsa_dim: int,
-) -> dict:
-    """Auto-tune parameters for a memory budget (MB).
-
-    Based on empirical memory profiling on 500K TinyStories:
-      - Tokenized data + vocab: ~2.6 GB for 500K
-      - Word 5-gram index: +6.5 GB (2M contexts, 3.2M continuations)
-      - POS 15-gram: +3-4 GB projected
-      - Topic 10-gram: +1-2 GB projected
-      - v18 modules: +0.5-1 GB
-
-    Strategy: reduce n-gram orders and cap sequences to fit budget.
-    Target RSS = budget_mb * 0.85 (leave 15% headroom for OS).
-
-    Returns dict of adjusted parameters.
-    """
-    target_mb = int(budget_mb * 0.85)
-    adjustments = {}
-
-    # Reserve for tokenization, vocab, POS system, topic, etc.
-    base_mb = 2500  # ~2.5 GB for data structures
-    if n_samples > 200000:
-        base_mb += (n_samples - 200000) // 200000 * 500  # ~500 MB per 200K extra
-    v18_mb = 0
-
-    # Estimate v18 module memory
-    if reservoir_dim > 0:
-        v18_mb += reservoir_dim * 2 // 1000  # rough estimate
-    if vsa_dim > 0:
-        v18_mb += vsa_dim * 2 // 1000
-
-    available_mb = target_mb - base_mb - v18_mb
-    if available_mb < 1000:
-        print(f"  MEMORY WARNING: Only {available_mb} MB available for indexes!")
-        available_mb = max(1000, available_mb)
-
-    # Allocate index budget: word gets 50%, POS 30%, topic 20%
-    word_budget = int(available_mb * 0.50)
-    pos_budget = int(available_mb * 0.30)
-    topic_budget = int(available_mb * 0.20)
-
-    # Word n-gram: each additional order roughly doubles contexts
-    # 5-gram on 500K = ~6.5 GB, 4-gram = ~4 GB, 3-gram = ~2 GB
-    if word_budget < 3000:
-        adjustments['ngram_max_n'] = 3
-    elif word_budget < 5000:
-        adjustments['ngram_max_n'] = 4
-    else:
-        adjustments['ngram_max_n'] = word_ngram_max_n  # keep original
-
-    # POS n-gram: 13 POS types, so contexts are smaller but max_n=15 is huge
-    # POS 7-gram: ~1.5 GB, POS 10-gram: ~2.5 GB, POS 15-gram: ~4 GB
-    if pos_budget < 1500:
-        adjustments['pos_ngram_max_n'] = 5
-    elif pos_budget < 2500:
-        adjustments['pos_ngram_max_n'] = 7
-    elif pos_budget < 3500:
-        adjustments['pos_ngram_max_n'] = 10
-    else:
-        adjustments['pos_ngram_max_n'] = pos_ngram_max_n
-
-    # Topic n-gram: 16 topics, very compact contexts
-    # Topic 5-gram: ~0.5 GB, Topic 8-gram: ~1 GB, Topic 10-gram: ~1.5 GB
-    if topic_budget < 800:
-        adjustments['topic_ngram_max_n'] = 4
-    elif topic_budget < 1200:
-        adjustments['topic_ngram_max_n'] = 6
-    else:
-        adjustments['topic_ngram_max_n'] = topic_ngram_max_n
-
-    # Cap n-gram sequences: fewer sequences = smaller indexes
-    # For 16GB Pi, 200K sequences is safe; 100K for 8GB
-    if budget_mb <= 8000:
-        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 100000)
-    elif budget_mb <= 16000:
-        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 250000)
-    elif budget_mb <= 32000:
-        adjustments['ngram_max_seqs'] = min(ngram_max_seqs, 400000)
-    # else: keep original
-
-    # Reduce reservoir/VSA dims for very constrained devices
-    if budget_mb <= 8000:
-        adjustments['reservoir_dim'] = min(reservoir_dim, 128)
-        adjustments['vsa_dim'] = min(vsa_dim, 256)
-    elif budget_mb <= 16000:
-        adjustments['reservoir_dim'] = min(reservoir_dim, 256)
-        adjustments['vsa_dim'] = min(vsa_dim, 512)
-
-    return adjustments
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="v18.0 Training — Multi-Scale Abstract Recall + v18 Extensions"
+        description="Attractor Language Machine — DAM Engine Training"
     )
 
     # Core parameters
-    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
-    parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
-    parser.add_argument("--recall-scale", type=int, default=DEFAULT_RECALL_SCALE,
-                        help="Word n-gram recall energy scale (default: 1600)")
-    parser.add_argument("--pos-recall-scale", type=int, default=DEFAULT_POS_RECALL_SCALE,
-                        help="POS n-gram recall energy scale (default: 800)")
-    parser.add_argument("--topic-recall-scale", type=int, default=DEFAULT_TOPIC_RECALL_SCALE,
-                        help="Topic n-gram recall energy scale (default: 400)")
-    parser.add_argument("--state-scale", type=int, default=DEFAULT_STATE_SCALE,
-                        help="Document state energy scale (default: 200)")
-
-    # POS and Topic n-gram sizes
-    parser.add_argument("--pos-ngram-max-n", type=int, default=DEFAULT_POS_NGRAM_MAX_N,
-                        help="Maximum POS n-gram order (default: 15)")
-    parser.add_argument("--topic-ngram-max-n", type=int, default=DEFAULT_TOPIC_NGRAM_MAX_N,
-                        help="Maximum topic n-gram order (default: 10)")
-
-    # Ablation flags
-    parser.add_argument("--no-pos-recall", action="store_true",
-                        help="Ablation: disable POS n-gram recall (set scale=0)")
-    parser.add_argument("--no-topic-recall", action="store_true",
-                        help="Ablation: disable topic n-gram recall (set scale=0)")
-    parser.add_argument("--no-state", action="store_true",
-                        help="Ablation: disable document state (set scale=0)")
-
-    # Standard n-gram parameters
-    parser.add_argument("--no-kn-backoff", action="store_true")
-    parser.add_argument("--no-interpolated", action="store_true")
-    parser.add_argument("--ngram-min-count", type=int, default=2)
-    parser.add_argument("--ngram-max-n", type=int, default=6,
-                        help="Maximum word n-gram order (default: 6, was 5)")
-    parser.add_argument("--ngram-max-seqs", type=int, default=1000000)
-    parser.add_argument("--max-seq-len", type=int, default=30)
-    parser.add_argument("--same-word-penalty", type=int, default=200)
-    parser.add_argument("--n-topics", type=int, default=16)
-
-    # v18 module flags
-    parser.add_argument("--enable-reservoir", action="store_true",
-                        help="Enable Integer ESN Reservoir")
-    parser.add_argument("--enable-coupling", action="store_true",
-                        help="Enable Factorial State Coupling")
-    parser.add_argument("--enable-vsa", action="store_true",
-                        help="Enable VSA/qFHRR compositional binding")
-    parser.add_argument("--enable-all-v18", action="store_true",
-                        help="Enable all v18 modules (reservoir + coupling + VSA)")
-    parser.add_argument("--reservoir-dim", type=int, default=512,
-                        help="ESN reservoir dimension (default: 512)")
-    parser.add_argument("--reservoir-scale", type=int, default=800,
-                        help="ESN reservoir energy scale (default: 800)")
-    parser.add_argument("--coupling-scale", type=int, default=200,
-                        help="Factorial coupling energy scale (default: 200)")
-    parser.add_argument("--vsa-scale", type=int, default=800,
-                        help="VSA energy scale (default: 800)")
-    parser.add_argument("--vsa-dim", type=int, default=512,
-                        help="VSA phase vector dimension (default: 512)")
-
-    # v19 macro-spin layer flags
-    parser.add_argument("--enable-macro", action="store_true",
-                        help="Enable v19 Macro-Spin Layer (entity+phase+scene coupling)")
-    parser.add_argument("--macro-entity-scale", type=int, default=800,
-                        help="Entity macro-spin energy scale (default: 800)")
-    parser.add_argument("--macro-phase-scale", type=int, default=600,
-                        help="Narrative phase energy scale (default: 600)")
-    parser.add_argument("--macro-scene-scale", type=int, default=400,
-                        help="Scene macro-spin energy scale (default: 400)")
-    parser.add_argument("--macro-scale", type=int, default=800,
-                        help="Global macro-spin scale multiplier (default: 800)")
-
-    # v19.1 Multi-Timescale Reservoir flags
-    parser.add_argument("--enable-mtr", action="store_true",
-                        help="Enable v19.1 Multi-Timescale Reservoir (EMERGENT long-range coherence)")
-    parser.add_argument("--mtr-dims", type=int, default=128,
-                        help="Per-timescale reservoir dimension (default: 128)")
-
-    # v20 Semantic Spin Resonance flags
-    parser.add_argument("--enable-ssr", action="store_true",
-                        help="Enable v20 Semantic Spin Resonance (EMERGENT understanding via frustrated dynamics)")
-    parser.add_argument("--ssr-dim", type=int, default=256,
-                        help="SSR spin dimension (default: 256)")
-    parser.add_argument("--ssr-alpha", type=int, default=255,
-                        help="SSR external field strength in Q8 (default: 255 ≈ 1.0)")
-    parser.add_argument("--ssr-eta", type=int, default=2,
-                        help="SSR Hebbian learning rate for episodic memory (default: 2)")
-    parser.add_argument("--ssr-scale", type=int, default=2000,
-                        help="SSR energy scale (default: 2000, raised from 400 — SSR must compete with recall)")
-    parser.add_argument("--ssr-temperature", type=int, default=50,
-                        help="SSR Metropolis temperature for spin dynamics (default: 50)")
-
-    # v21 Learned Latent Spin Glass flags
-    parser.add_argument("--enable-latent-spin", action="store_true",
-                        help="Enable v21 Learned Latent Spin Glass (EMERGENT understanding from LEARNED physics)")
-    parser.add_argument("--latent-spin-dim", type=int, default=256,
-                        help="Latent spin dimension (default: 256)")
-    parser.add_argument("--latent-spin-alpha", type=int, default=255,
-                        help="Latent spin external field strength in Q8 (default: 255 ≈ 1.0, was 128)")
-    parser.add_argument("--latent-spin-eta", type=int, default=2,
-                        help="Latent spin Hebbian learning rate (default: 2)")
-    parser.add_argument("--latent-spin-scale", type=int, default=6000,
-                        help="Latent spin direct alignment energy scale (default: 6000, was 4000)")
-    parser.add_argument("--latent-spin-coupling-scale", type=int, default=4000,
-                        help="Latent spin coupling-mediated alignment energy scale (default: 4000, was 3000)")
-    parser.add_argument("--latent-spin-temperature", type=int, default=0,
-                        help="Latent spin Metropolis temperature (default: 0, deterministic)")
-    parser.add_argument("--latent-spin-context-window", type=int, default=5,
-                        help="Context window for spin vector learning (default: 5)")
-    parser.add_argument("--latent-spin-n-j-windows", type=int, default=9000,
-                        help="Number of windows for J_learned (default: 9K, was 200K — reduced to Hopfield capacity)")
-    parser.add_argument("--no-latent-spin-decorrelate", action="store_true",
-                        help="Disable spin vector decorrelation (mean-centering before sign)")
-    parser.add_argument("--latent-spin-j-sparsity", type=float, default=0.15,
-                        help="Fraction of J_learned couplings to KEEP after Top-K (default: 0.15, set 1.0 to disable)")
-
-    # Dataset selection
+    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
+                        help="Number of training samples (default: 500K)")
+    parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB,
+                        help="Max vocabulary size (default: 2000)")
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
                         choices=["tinystories", "tiny-textbooks", "writingprompts", "fineweb-edu"],
-                        help=f"Dataset to train on (default: {DEFAULT_DATASET})")
-    parser.add_argument("--curriculum", action="store_true",
-                        help="Curriculum: TinyStories → tiny-textbooks → WritingPrompts")
+                        help=f"Dataset (default: {DEFAULT_DATASET})")
+
+    # SDR parameters
+    parser.add_argument("--sdr-dim", type=int, default=DEFAULT_SDR_DIM,
+                        help="SDR dimension (default: 512)")
+    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY,
+                        help="SDR sparsity (default: 0.02 = 2%%)")
+
+    # Energy scales
+    parser.add_argument("--dam-scale", type=int, default=1600,
+                        help="DAM energy scale (default: 1600)")
+    parser.add_argument("--episodic-scale", type=int, default=500,
+                        help="Episodic memory energy scale (default: 500)")
+    parser.add_argument("--same-word-penalty", type=int, default=800,
+                        help="Same-word repetition penalty (default: 800)")
+
+    # UV-complete parameters
+    parser.add_argument("--uv-regularize", action="store_true", default=True,
+                        help="Enable UV-complete regularization (default: True)")
+    parser.add_argument("--no-uv-regularize", action="store_true",
+                        help="Disable UV-complete regularization")
+    parser.add_argument("--uv-lambda", type=int, default=5,
+                        help="UV regularization strength (default: 5)")
+    parser.add_argument("--topdown-scale", type=int, default=200,
+                        help="Top-down feedback scale (default: 200)")
+
+    # DAM parameters
+    parser.add_argument("--j-clip", type=int, default=500,
+                        help="Coupling matrix clip value (default: 500)")
+    parser.add_argument("--learning-rate", type=int, default=1,
+                        help="PCD learning rate (default: 1)")
+    parser.add_argument("--n-dream-steps", type=int, default=3,
+                        help="PCD dream steps (default: 3)")
+
+    # Episodic memory
+    parser.add_argument("--max-episodes", type=int, default=10000,
+                        help="Max episodic memory episodes (default: 10000)")
+
+    # Generation
+    parser.add_argument("--max-seq-len", type=int, default=30,
+                        help="Max sequence length (default: 30)")
     parser.add_argument("--vocab-min-freq", type=int, default=5,
-                        help="Min word frequency for vocab (default: 5, was 25 for FineWeb)")
+                        help="Min word frequency for vocab (default: 5)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
-                        help="Memory budget in MB (0=unlimited; 14000=16GB Pi, 7000=8GB Pi). "
-                             "Auto-adjusts n-gram orders, sequence caps, and v18 dims.")
+                        help="Memory budget in MB (0=unlimited; 14000=16GB Pi)")
 
     args = parser.parse_args()
 
-    # --- Apply ablation flags ---
-    pos_recall_scale = 0 if args.no_pos_recall else args.pos_recall_scale
-    topic_recall_scale = 0 if args.no_topic_recall else args.topic_recall_scale
-    state_scale = 0 if args.no_state else args.state_scale
-
-    kn_backoff = not args.no_kn_backoff
-    interpolated = not args.no_interpolated
-
-    # --- v18 flags ---
-    enable_reservoir = args.enable_reservoir or args.enable_all_v18
-    enable_coupling = args.enable_coupling or args.enable_all_v18
-    enable_vsa = args.enable_vsa or args.enable_all_v18
-
-    # --- Memory budget auto-tuning ---
-    mem_adjustments = {}
-    if args.memory_budget > 0:
-        mem_adjustments = auto_tune_for_memory(
-            budget_mb=args.memory_budget,
-            n_samples=args.samples,
-            word_ngram_max_n=args.ngram_max_n,
-            pos_ngram_max_n=args.pos_ngram_max_n,
-            topic_ngram_max_n=args.topic_ngram_max_n,
-            ngram_max_seqs=args.ngram_max_seqs,
-            reservoir_dim=args.reservoir_dim,
-            vsa_dim=args.vsa_dim,
-        )
-        print(f"\n{'=' * 70}")
-        print(f"MEMORY BUDGET: {args.memory_budget:,} MB (target RSS: {int(args.memory_budget * 0.85):,} MB)")
-        print(f"{'=' * 70}")
-        for key, val in mem_adjustments.items():
-            orig = {
-                'ngram_max_n': args.ngram_max_n, 'pos_ngram_max_n': args.pos_ngram_max_n,
-                'topic_ngram_max_n': args.topic_ngram_max_n,
-                'ngram_max_seqs': args.ngram_max_seqs,
-                'reservoir_dim': args.reservoir_dim, 'vsa_dim': args.vsa_dim,
-            }.get(key, '?')
-            print(f"  {key}: {orig} → {val}")
-        print(f"{'=' * 70}")
-
-    # Apply memory adjustments
-    effective_ngram_max_n = mem_adjustments.get('ngram_max_n', args.ngram_max_n)
-    effective_pos_ngram_max_n = mem_adjustments.get('pos_ngram_max_n', args.pos_ngram_max_n)
-    effective_topic_ngram_max_n = mem_adjustments.get('topic_ngram_max_n', args.topic_ngram_max_n)
-    effective_ngram_max_seqs = mem_adjustments.get('ngram_max_seqs', args.ngram_max_seqs)
-    effective_reservoir_dim = mem_adjustments.get('reservoir_dim', args.reservoir_dim)
-    effective_vsa_dim = mem_adjustments.get('vsa_dim', args.vsa_dim)
-
     # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = OUTPUT_DIR / f"run_{timestamp}"
+    output_dir = OUTPUT_DIR / f"attractor_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ISING SPIN GLASS LANGUAGE MODEL — MULTI-SCALE ABSTRACT RECALL", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE — Dense Associative Memory Engine", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
-    print(f"Workers: {os.cpu_count()}", flush=True)
     rss = get_rss_mb()
     if rss > 0:
         print(f"Memory (RSS): {rss:,} MB", flush=True)
     print("=" * 70, flush=True)
 
     # --- Load Data ---
-    if args.curriculum:
-        # Curriculum learning: TinyStories → tiny-textbooks → WritingPrompts
-        print("\n" + "=" * 70, flush=True)
-        print("CURRICULUM LEARNING: Phase 1 — TinyStories (grammar)", flush=True)
-        print("=" * 70, flush=True)
-        texts = load_data(args.samples, dataset_name="tinystories")
-    else:
-        texts = load_data(args.samples, dataset_name=args.dataset)
+    texts = load_data(args.samples, dataset_name=args.dataset)
     n_texts = len(texts)
     print(f"Using {n_texts:,} texts for training")
 
     # --- Config ---
+    uv_regularize = args.uv_regularize and not args.no_uv_regularize
+
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Multi-Scale Abstract Recall + Document State")
-    print(f"  WORD RECALL:")
-    print(f"    ngram_max_n={effective_ngram_max_n}, recall_scale={args.recall_scale}")
-    print(f"  POS RECALL:")
-    print(f"    pos_ngram_max_n={effective_pos_ngram_max_n}, pos_recall_scale={pos_recall_scale}"
-          f"{' [DISABLED]' if args.no_pos_recall else ''}")
-    print(f"  TOPIC RECALL:")
-    print(f"    topic_ngram_max_n={effective_topic_ngram_max_n}, topic_recall_scale={topic_recall_scale}"
-          f"{' [DISABLED]' if args.no_topic_recall else ''}")
-    print(f"  DOCUMENT STATE:")
-    print(f"    state_scale={state_scale}"
-          f"{' [DISABLED]' if args.no_state else ''}")
-    print(f"  STANDARD:")
-    print(f"    dataset={args.dataset}")
-    print(f"    curriculum={args.curriculum}")
-    print(f"    vocab_max_size={args.vocab}")
-    print(f"    vocab_min_freq={args.vocab_min_freq}")
-    print(f"    kn_backoff={kn_backoff}")
-    print(f"    interpolated={interpolated}")
-    print(f"    same_word_penalty={args.same_word_penalty}")
-    print(f"    n_topics={args.n_topics}")
-    print(f"    n_samples={n_texts:,}")
-    print(f"    ngram_max_seqs={effective_ngram_max_seqs:,}")
+    print(f"CONFIG: Attractor Language Machine (DAM Engine)")
+    print(f"  ARCHITECTURE:")
+    print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
+    print(f"    Hierarchy: L0(512)→L1(256)→L2(128)→L3(64)")
+    print(f"    RG flow: Wilsonian (UV-complete={uv_regularize})")
+    print(f"  ENERGY SCALES:")
+    print(f"    DAM scale={args.dam_scale}")
+    print(f"    Episodic scale={args.episodic_scale}")
+    print(f"    Same-word penalty={args.same_word_penalty}")
+    print(f"  UV-COMPLETE:")
+    print(f"    Regularize={uv_regularize}, lambda={args.uv_lambda}")
+    print(f"    Top-down scale={args.topdown_scale}")
+    print(f"  DAM PARAMS:")
+    print(f"    J_clip={args.j_clip}, learning_rate={args.learning_rate}")
+    print(f"    Dream steps={args.n_dream_steps}")
+    print(f"  EPISODIC:")
+    print(f"    Max episodes={args.max_episodes}")
+    print(f"  DATA:")
+    print(f"    Dataset={args.dataset}, samples={n_texts:,}")
+    print(f"    Vocab max={args.vocab}, min_freq={args.vocab_min_freq}")
+    print(f"    Max seq len={args.max_seq_len}")
     if args.memory_budget > 0:
-        print(f"    memory_budget={args.memory_budget:,} MB")
-    print(f"  v18 EXTENSIONS:")
-    print(f"    reservoir={'ENABLED' if enable_reservoir else 'DISABLED'}"
-          f" (dim={effective_reservoir_dim}, scale={args.reservoir_scale})")
-    print(f"    coupling={'ENABLED' if enable_coupling else 'DISABLED'}"
-          f" (scale={args.coupling_scale})")
-    print(f"    vsa={'ENABLED' if enable_vsa else 'DISABLED'}"
-          f" (dim={effective_vsa_dim}, scale={args.vsa_scale})")
-    print(f"  v19 MACRO-SPIN LAYER:")
-    print(f"    macro={'ENABLED' if args.enable_macro else 'DISABLED'}"
-          f" (entity_scale={args.macro_entity_scale}, phase_scale={args.macro_phase_scale},"
-          f" scene_scale={args.macro_scene_scale}, global_scale={args.macro_scale})")
-    print(f"  v19.1 MULTI-TIMESCALE RESERVOIR:")
-    print(f"    mtr={'ENABLED' if args.enable_mtr else 'DISABLED'}"
-          f" (dims={args.mtr_dims}, timescales=fast+medium+slow)")
-    print(f"  v20 SEMANTIC SPIN RESONANCE:")
-    print(f"    ssr={'ENABLED' if args.enable_ssr else 'DISABLED'}"
-          f" (D={args.ssr_dim}, alpha_q8={args.ssr_alpha}, eta={args.ssr_eta},"
-          f" scale={args.ssr_scale}, temp={args.ssr_temperature})")
-    print(f"  v21 LEARNED LATENT SPIN GLASS:")
-    print(f"    latent_spin={'ENABLED' if args.enable_latent_spin else 'DISABLED'}"
-          f" (D={args.latent_spin_dim}, alpha_q8={args.latent_spin_alpha},"
-          f" eta={args.latent_spin_eta}, scale={args.latent_spin_scale},"
-          f" coupling_scale={args.latent_spin_coupling_scale},"
-          f" temp={args.latent_spin_temperature},"
-          f" decorrelate={not args.no_latent_spin_decorrelate},"
-          f" j_sparsity={args.latent_spin_j_sparsity})")
+        print(f"    Memory budget={args.memory_budget:,} MB")
     print(f"{'=' * 70}")
 
     # --- Train ---
-    from ising_spin.orchestrator import IsingLMModel
+    from ising_spin.attractor import AttractorLanguageModel
 
-    model = IsingLMModel(
-        # Vocabulary
+    model = AttractorLanguageModel(
         vocab_min_freq=args.vocab_min_freq,
         vocab_max_size=args.vocab,
-        # Word N-gram
-        ngram_max_n=effective_ngram_max_n,
-        ngram_min_count=args.ngram_min_count,
-        ngram_max_sequences=effective_ngram_max_seqs,
-        # POS N-gram
-        pos_ngram_max_n=effective_pos_ngram_max_n,
-        pos_ngram_min_count=2,
-        # Topic
-        n_topics=args.n_topics,
-        topic_ngram_max_n=effective_topic_ngram_max_n,
-        topic_ngram_min_count=3,
-        # Energy scales
-        recall_scale=args.recall_scale,
-        pos_recall_scale=pos_recall_scale,
-        topic_recall_scale=topic_recall_scale,
-        state_scale=state_scale,
-        # Hard constraints
+        sdr_dim=args.sdr_dim,
+        sdr_sparsity=args.sdr_sparsity,
+        dam_scale=args.dam_scale,
+        episodic_scale=args.episodic_scale,
         same_word_penalty=args.same_word_penalty,
-        max_closed_class_run=2,
-        # Beta
-        auto_calibrate_beta=True,
-        # Interpolation
-        interpolated=interpolated,
-        kn_backoff=kn_backoff,
-        # Copy mechanism
-        copy_enabled=True,
-        copy_min_context=3,
-        copy_min_confidence=0.95,  # v22: raised from 0.90 — copy is now soft bias, threshold is for identification only
-        # Misc
+        uv_regularize=uv_regularize,
+        uv_lambda=args.uv_lambda,
+        topdown_scale=args.topdown_scale,
+        j_clip=args.j_clip,
+        learning_rate=args.learning_rate,
+        n_dream_steps=args.n_dream_steps,
+        max_episodes=args.max_episodes,
         max_seq_len=args.max_seq_len,
-        # v18 modules
-        enable_reservoir=enable_reservoir,
-        enable_coupling=enable_coupling,
-        enable_vsa=enable_vsa,
-        reservoir_dim=effective_reservoir_dim,
-        reservoir_scale=args.reservoir_scale,
-        coupling_scale=args.coupling_scale,
-        vsa_scale=args.vsa_scale,
-        vsa_dim=effective_vsa_dim,
-        # v19: Macro-spin layer
-        enable_macro=args.enable_macro,
-        macro_entity_scale=args.macro_entity_scale,
-        macro_phase_scale=args.macro_phase_scale,
-        macro_scene_scale=args.macro_scene_scale,
-        macro_scale=args.macro_scale,
-        # v19.1: Multi-Timescale Reservoir
-        enable_mtr=args.enable_mtr,
-        mtr_dims=args.mtr_dims,
-        # v20: Semantic Spin Resonance
-        enable_ssr=args.enable_ssr,
-        ssr_dim=args.ssr_dim,
-        ssr_alpha_q8=args.ssr_alpha,
-        ssr_eta_episodic=args.ssr_eta,
-        ssr_scale=args.ssr_scale,
-        ssr_temperature=args.ssr_temperature,
-        # v21: Learned Latent Spin Glass
-        enable_latent_spin=args.enable_latent_spin,
-        latent_spin_dim=args.latent_spin_dim,
-        latent_spin_alpha_q8=args.latent_spin_alpha,
-        latent_spin_eta_episodic=args.latent_spin_eta,
-        latent_spin_scale=args.latent_spin_scale,
-        latent_spin_coupling_scale=args.latent_spin_coupling_scale,
-        latent_spin_temperature=args.latent_spin_temperature,
-        latent_spin_context_window=args.latent_spin_context_window,
-        latent_spin_n_j_windows=args.latent_spin_n_j_windows,
-        latent_spin_decorrelate=not args.no_latent_spin_decorrelate,
-        latent_spin_j_sparsity=args.latent_spin_j_sparsity,
-        # Memory budget
         memory_budget_mb=args.memory_budget,
+        seed=42,
     )
 
     t_start = time.time()
@@ -742,8 +294,8 @@ def main():
     print("EVALUATION")
     print(f"{'=' * 70}")
 
-    # Quick PPL at default beta
-    print("\nQuick PPL (default beta, 10 seqs):", end=" ")
+    # Quick PPL
+    print("\nQuick PPL (10 seqs):", end=" ")
     try:
         quick_ppl = model.compute_perplexity(n_samples=10)
         print(f"{quick_ppl:.1f}")
@@ -751,59 +303,33 @@ def main():
         print(f"Error: {e}")
         quick_ppl = 999
 
-    # Beta sweep
-    best_f, best_sweep_ppl = beta_sweep_ppl(model, n_seqs=10)
-
-    # Full PPL evaluation at best beta
-    print(f"\nFull PPL evaluation...")
+    # Full PPL
+    print(f"\nFull PPL evaluation (100 seqs)...")
     try:
         full_ppl = model.compute_perplexity(n_samples=100)
         print(f"  Perplexity: {full_ppl:.2f}")
     except Exception as e:
         print(f"  Error: {e}")
-        full_ppl = best_sweep_ppl
-
-    print(f"\nPPL (full, 100 seqs): {full_ppl:.2f}")
-
-    # --- Multi-Scale Recall Diagnostics (index stats only, before generation) ---
-    print(f"\n{'=' * 70}")
-    print("RECALL DIAGNOSTICS (index stats)")
-    print(f"{'=' * 70}")
-    print_recall_diagnostics(model, include_generator_stats=False)
+        full_ppl = quick_ppl
 
     # --- Generation ---
-    # Reset generator stats before generation so diagnostics are meaningful
-    if model.generator is not None and hasattr(model.generator, 'reset_stats'):
-        model.generator.reset_stats()
-
     print(f"\n{'=' * 70}")
     print(f"GENERATION (PPL={full_ppl:.2f})")
     print(f"{'=' * 70}")
 
     prompts = ["once upon a time", "there was a little", "the little girl"]
-    if args.dataset == "fineweb-edu" or (not args.curriculum and args.dataset != "tinystories"):
+    if args.dataset != "tinystories":
         prompts = ["the history of", "science and technology", "research shows that"]
-    generated_texts = []
 
+    generated_texts = []
     for i, prompt in enumerate(prompts):
-        print(f"\n  --- '{prompt}' (400 words) ---")
+        print(f"\n  --- '{prompt}' (200 words) ---")
         try:
-            result = model.generator.generate(prompt=prompt, length=400)
+            result = model.generate(prompt=prompt, length=200)
             text = result.get("text", str(result))
             if isinstance(text, list):
                 text = " ".join(text)
             print(f"  {text[:300]}...")
-
-            stats = model.generator.get_stats()
-            word_hits = stats.get("recall_hit", 0)
-            pos_hits = stats.get("pos_recall_hit", 0)
-            topic_hits = stats.get("topic_recall_hit", 0)
-            copies = stats.get("copy_used", 0)
-            state_e = stats.get("chosen_state_energy", 0)
-            copy_rate = stats.get("copy_rate", 0)
-            print(f"  word_hits={word_hits} pos_hits={pos_hits} "
-                  f"topic_hits={topic_hits} copies={copies} copy_rate={copy_rate:.1%} state_energy={state_e}")
-
             generated_texts.append(text)
 
             gen_file = output_dir / f"generated_{i}.txt"
@@ -814,41 +340,30 @@ def main():
             traceback.print_exc()
             generated_texts.append("")
 
-    # --- Post-generation diagnostics (with actual stats) ---
-    print(f"\n{'=' * 70}")
-    print("RECALL DIAGNOSTICS (post-generation)")
-    print(f"{'=' * 70}")
-    print_recall_diagnostics(model, include_generator_stats=True)
-
     # --- Save Results ---
     results = {
-        "version": "23.0.0",
-        "architecture": "Multi-Scale Abstract Recall + Document State + Latent Spin Glass (v23 expressivity fix: recall cap, no copy bypass, capacity-limited J, bias field, adaptive alpha)",
+        "version": "25.0.0",
+        "architecture": "Attractor Language Machine — Dense Associative Memory Engine with UV-complete Wilsonian RG flow",
         "dataset": args.dataset,
-        "curriculum": args.curriculum,
         "timestamp": timestamp,
         "config": {
-            "recall_scale": args.recall_scale,
-            "pos_recall_scale": pos_recall_scale,
-            "topic_recall_scale": topic_recall_scale,
-            "state_scale": state_scale,
-            "pos_ngram_max_n": args.pos_ngram_max_n,
-            "topic_ngram_max_n": args.topic_ngram_max_n,
-            "no_pos_recall": args.no_pos_recall,
-            "no_topic_recall": args.no_topic_recall,
-            "no_state": args.no_state,
+            "sdr_dim": args.sdr_dim,
+            "sdr_sparsity": args.sdr_sparsity,
+            "dam_scale": args.dam_scale,
+            "episodic_scale": args.episodic_scale,
+            "uv_regularize": uv_regularize,
+            "uv_lambda": args.uv_lambda,
+            "topdown_scale": args.topdown_scale,
+            "j_clip": args.j_clip,
+            "learning_rate": args.learning_rate,
+            "n_dream_steps": args.n_dream_steps,
+            "max_episodes": args.max_episodes,
             "vocab_max_size": args.vocab,
-            "kn_backoff": kn_backoff,
-            "interpolated": interpolated,
             "same_word_penalty": args.same_word_penalty,
-            "n_topics": args.n_topics,
-            "n_samples": n_texts,
         },
         "results": {
             "training_time_sec": t_train,
             "quick_ppl": quick_ppl,
-            "best_beta_factor": best_f,
-            "best_sweep_ppl": best_sweep_ppl,
             "full_ppl": full_ppl,
             "vocab_size": len(model.vocab),
             "peak_rss_mb": get_rss_mb(),
@@ -867,7 +382,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Multi-Scale Abstract Recall + Document State")
+    print(f"DONE — Attractor Language Machine")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

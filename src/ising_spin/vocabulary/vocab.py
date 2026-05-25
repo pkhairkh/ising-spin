@@ -4,10 +4,8 @@ Integer-only vocabulary mapping between words and indices.
 Special tokens:
     <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3, <S>=4
 
-v17.4: <S> (sentence boundary) inserted after '.', '!', '?' to prevent
-       cross-sentence n-gram contamination.
-
-Path 3a: Enhanced tokenizer handles contractions, hyphens, and numbers.
+The <S> (sentence boundary) token is inserted after '.', '!', '?' to
+mark sentence boundaries for the SDR encoder and POS type system.
 """
 
 import re
@@ -20,16 +18,14 @@ class Vocabulary:
     Integer-only vocabulary mapping between words and indices.
 
     Special tokens:
-        <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3
-
-    Path 3a: Enhanced tokenizer handles contractions, hyphens, and numbers.
+        <UNK>=0, <BOS>=1, <EOS>=2, <PAD>=3, <S>=4
     """
 
     UNK = "<UNK>"
     BOS = "<BOS>"
     EOS = "<EOS>"
     PAD = "<PAD>"
-    SENT = "<S>"  # v17.4: Sentence boundary marker — prevents cross-sentence n-grams
+    SENT = "<S>"  # Sentence boundary marker
     SPECIALS = [UNK, BOS, EOS, PAD, SENT]
 
     # Contraction suffixes to split off
@@ -51,21 +47,18 @@ class Vocabulary:
         self.word_counts: Counter = Counter()
         self._built = False
 
-    # Sentence-ending punctuation — v17.4: insert <S> after these
+    # Sentence-ending punctuation — insert <S> after these
     SENTENCE_ENDS = {'.', '!', '?'}
 
     def _tokenize(self, text: str) -> List[str]:
         """
-        Enhanced tokenizer with better handling of contractions, hyphens,
-        and numbers. Pure string manipulation — no external dependencies.
+        Enhanced tokenizer with handling of contractions, hyphens, and numbers.
 
-        Path 3a improvements:
-          - Contractions: "don't" -> "do" + "n't", "it's" -> "it" + "'s"
-          - Hyphens: "well-known" -> "well-known" (kept as one token)
-          - Numbers: "3.14" stays as one token, "1,000" stays as one token
-        v17.4 improvement:
-          - Sentence boundaries: insert <S> after '.', '!', '?' to prevent
-            cross-sentence n-gram contamination
+        Contractions: "don't" -> "do" + "n't", "it's" -> "it" + "'s"
+        Hyphens: "well-known" -> "well-known" (kept as one token)
+        Numbers: "3.14" stays as one token, "1,000" stays as one token
+        Sentence boundaries: insert <S> after '.', '!', '?' to mark
+        sentence boundaries for the SDR encoder.
         """
         tokens = []
         for word in text.split():
@@ -88,7 +81,7 @@ class Vocabulary:
             # Add leading punctuation tokens
             tokens.extend(leading_punct)
 
-            # v17.4: Track if trailing punct includes sentence end
+            # Track if trailing punct includes sentence end
             has_sentence_end = any(p in self.SENTENCE_ENDS for p in trailing_punct)
 
             if not stripped:
@@ -141,7 +134,7 @@ class Vocabulary:
             tokens.append(lower)
             tokens.extend(reversed(trailing_punct))
 
-            # v17.4: Insert sentence boundary marker after sentence-ending punct
+            # Insert sentence boundary marker after sentence-ending punct
             if has_sentence_end:
                 tokens.append(self.SENT)
 
@@ -163,8 +156,6 @@ class Vocabulary:
             (word, count)
             for word, count in self.word_counts.most_common()
             if count >= self.min_freq and word not in self.SPECIALS
-            # v12: Filter out pure number tokens — they hurt coherence
-            # Numbers like "2012", "3", "27" add noise without helping fluency
             and not word.replace(".", "").replace(",", "").replace("-", "").isdigit()
         ]
         if self.max_size is not None:
@@ -223,7 +214,6 @@ class Vocabulary:
         for idx in indices:
             word = self.idx2word.get(idx, self.UNK)
             if word in (self.BOS, self.EOS, self.PAD, self.SENT):
-                # v17.4: Also suppress SENT in decoded output
                 continue
             words.append(word)
         return " ".join(words)

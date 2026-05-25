@@ -1,5 +1,5 @@
 """
-Integer-only POS type system for the coupled Ising-Potts model.
+Integer-only POS type system for the Attractor Language Machine.
 
 Components:
   - I_emit[w, t]: emission weight (count of word w tagged as type t)
@@ -45,7 +45,7 @@ CLOSED_CLASS = {"DET", "PREP", "PRON", "AUX", "CONJ", "PART"}
 
 class POSTypeSystem:
     """
-    Integer-only POS type system for the coupled Ising-Potts model.
+    Integer-only POS type system for the Attractor Language Machine.
 
     Components:
       - I_emit[w, t]: emission weight (count of word w tagged as type t)

@@ -1,20 +1,25 @@
 """
-Ising Spin Glass Language Model — Multi-Scale Abstract Recall + Evolving Document State.
+Attractor Language Machine — Dense Associative Memory Engine.
+
+The attractor dynamics of a properly trained Dense Associative Memory
+ARE a language model. Not an approximation. Not a component. They ARE one.
 
 Architecture:
-    - Word-level n-gram recall (5-gram) — exact word context
-    - POS-level n-gram recall (15-gram) — abstract syntactic generalization
-    - Topic-level n-gram recall (10-gram) — discourse coherence
-    - Document state (7 evolving integer variables) — full-document context
-    - Additive energy fusion — each scale contributes independently
-    - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
+  - SDR encoding: Sparse Distributed Representations (~2% active bits)
+  - DAM layers: Dense Associative Memory with F-lookup energy (exponential capacity)
+  - Hierarchy: L0-Lexical → L1-Syntactic → L2-Semantic → L3-Discourse
+  - RG flow: Wilsonian renormalization group between layers (UV-complete)
+  - Episodic memory: Content-addressable sparse pattern storage
+  - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
 
-v18 extensions:
-    - Factorial State Coupling: 5 pairwise compatibility tables, mean-field inference
-    - Integer ESN Reservoir: long-range temporal dynamics (~50 token lookback)
-    - VSA/qFHRR: compositional vector symbolic architecture for cross-scale binding
-    - Dense Associative Memory: random feature energy with polynomial nonlinearity
-    - Cross-Scale RFF: joint word+POS+topic random feature projection
+Key physics:
+  - Energy: E = -Σ F(J_ij * s_i * s_j) - Σ h_i * s_i
+  - F-lookup: nonlinear energy function → exponential storage capacity
+  - PCD learning: ΔJ = η(data_correlations - model_correlations)
+  - UV completeness: couplings renormalizable at all hierarchical scales
+  - RG beta functions: g_{l+1} = β(g_l) govern inter-layer flow
+
+All integer arithmetic. Zero floats in the hot path. Runs on Pi 5.
 """
 
 from .vocabulary import Vocabulary, POSTypeSystem, TopicAssigner
@@ -23,19 +28,19 @@ from .vocabulary.pos import (
     NOUN_LIKE, VERB_LIKE, OPEN_CLASS, CLOSED_CLASS,
 )
 from .sampling import IntegerBoltzmannSampler, LN2_NUM, LN2_DEN, LOG2_SCALE
-from .recall import (
-    WordNgramIndex, PosNgramIndex, TopicNgramIndex, MultiScaleRecall,
+from .attractor import (
+    SDREncoder,
+    DAMLayer,
+    HierarchicalDAM,
+    EpisodicMemory,
+    AttractorLanguageModel,
 )
-from .state import DocumentState
-from .energy import EnergyComputer
-from .orchestrator import IsingLMModel
 from .exceptions import (
-    IsingSpinError, IsingError,
-    BuildError, VocabularyBuildError, CorpusError, IndexBuildError,
-    PreAggregationError, StateBuildError, TopicBuildError,
-    InferenceError, SamplingError, EnergyError, StateError,
-    ValidationError, VocabularyError, POSValidationError,
-    StateValidationError, ConfigError, ConfigurationError,
+    AttractorError,
+    BuildError, VocabularyBuildError, CorpusError,
+    TopicBuildError,
+    InferenceError, SamplingError, EnergyError,
+    ValidationError, VocabularyError, POSValidationError, ConfigError,
 )
 from .utils import (
     get_rss_mb, TAG_PRIORITY, primary_pos_tag,
@@ -43,15 +48,4 @@ from .utils import (
     load_writingprompts, DATASET_LOADERS, DEFAULT_DATASET,
 )
 
-# v18 modules
-from .reservoir import IntegerESN
-from .vsa import QFHRRVectors, VSAEncoder
-from .dense_am import RandomFeatureProjector, DenseAMEnergy
-from .rff import CrossScaleRFF
-
-# v19+ modules
-from .macro import EntityTracker, NarrativePhaseTracker, SceneTracker, MacroSpinCoupling
-from .ssr import SemanticSpinResonance
-from .latent import LatentSpinGlass
-
-__version__ = "21.0.0"
+__version__ = "25.0.0"

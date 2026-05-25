@@ -52,7 +52,7 @@ class AttractorLanguageModel:
     The full language model: SDR encoder + hierarchical DAM + episodic
     memory + POS constraints. Training via batch Hebbian + PCD refinement.
 
-    This is the replacement for the old IsingLMModel orchestrator.
+    This is the main entry point for the Attractor Language Machine.
     """
 
     def __init__(

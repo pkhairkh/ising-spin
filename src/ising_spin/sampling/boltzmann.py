@@ -1,9 +1,12 @@
 """
-Integer-only Boltzmann sampling for Ising-spin energy models.
+Integer-only Boltzmann sampling for the Attractor Language Machine.
 
-This module provides Boltzmann sampling using ONLY integer arithmetic,
-including initialization.  Pre-computes a lookup table at initialization
-using integer geometric recurrence (NO math.exp).
+Pre-computes a lookup table at initialization using integer geometric
+recurrence (NO math.exp). At generation time, sampling is pure integer:
+    1. deltas = energies - E_min (non-negative integers)
+    2. weights = table[deltas] (integer array lookup)
+    3. Cumulative sum (integer addition)
+    4. Binary search (integer comparison)
 
 Public API:
     IntegerBoltzmannSampler  — main sampler class
@@ -37,7 +40,7 @@ class IntegerBoltzmannSampler:
     """
     Boltzmann sampling using ONLY integer arithmetic — INCLUDING initialization.
 
-    v8.2: ZERO floating-point operations anywhere.
+    ZERO floating-point operations anywhere.
 
     Pre-computes a lookup table at initialization using integer geometric
     recurrence (NO math.exp):
@@ -156,7 +159,7 @@ class IntegerBoltzmannSampler:
 
     def compute_log_probabilities(self, energies: np.ndarray) -> np.ndarray:
         """
-        Compute log2 probabilities for each element — INTEGER-ONLY (v8.2).
+        Compute log2 probabilities for each element — INTEGER-ONLY.
 
         Uses the analytical formula for log2 of Boltzmann weights:
           table[d] = scale * 2^(-β*d/ln2) = scale * 2^(-0.85*d/recall_scale)
@@ -240,7 +243,7 @@ class IntegerBoltzmannSampler:
 
 
 # ===========================================================================
-# FINE-GRAINED INTEGER LOG₂ (v9.0)
+# FINE-GRAINED INTEGER LOG₂
 # ===========================================================================
 
 # Pre-computed LUT for log₂(1 + ε) where ε ∈ [0, 1)
@@ -313,8 +316,8 @@ def int_log2_fine(x: int) -> int:
     """
     Compute log₂(x) * 256 using integer-only arithmetic with pre-computed LUT.
 
-    v9.0: Replaces floor(log₂) = bit_length()-1 with fine-grained fractional
-    log₂, eliminating the BIGGEST source of PPL loss in the recall energy.
+    Replaces floor(log₂) = bit_length()-1 with fine-grained fractional
+    log₂, providing accurate log-probability computation for perplexity.
 
     Returns log₂(x) with 8 bits of fractional precision:
       int_log2_fine(2)   = 256   (log₂(2) = 1.0)

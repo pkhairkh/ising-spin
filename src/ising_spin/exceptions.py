@@ -1,33 +1,19 @@
 """
-Custom exception hierarchy for the Ising Spin Glass Language Model.
+Custom exception hierarchy for the Attractor Language Machine.
 
-All domain-specific exceptions inherit from IsingSpinError, enabling
+All domain-specific exceptions inherit from AttractorError, enabling
 catch-all handling at the package level while still allowing fine-grained
 per-domain catch blocks.
-
-IsingError is kept as a backward-compatible alias for IsingSpinError.
-
-Usage:
-    try:
-        model.train(texts=texts)
-    except BuildError as e:
-        logger.error("Build failed: %s", e)
-    except IsingSpinError:
-        logger.error("Something went wrong in ising_spin")
 """
 
 
-class IsingSpinError(Exception):
-    """Base exception for all ising_spin errors."""
-
-
-# Backward-compatible alias
-IsingError = IsingSpinError
+class AttractorError(Exception):
+    """Base exception for all attractor_lm errors."""
 
 
 # ── Build / Training Errors ──────────────────────────────────────────────
 
-class BuildError(IsingSpinError):
+class BuildError(AttractorError):
     """Raised when a model component fails to build."""
 
 
@@ -39,25 +25,13 @@ class CorpusError(BuildError):
     """Raised when corpus loading or tokenization fails."""
 
 
-class IndexBuildError(BuildError):
-    """Raised when an n-gram index fails to build."""
-
-
-class PreAggregationError(BuildError):
-    """Raised when pre-aggregation (Dense AM / RFF / ESN readout) fails."""
-
-
-class StateBuildError(BuildError):
-    """Raised when DocumentState compatibility tables fail to build."""
-
-
 class TopicBuildError(BuildError):
     """Raised when topic assignment fails to build."""
 
 
 # ── Runtime / Inference Errors ────────────────────────────────────────────
 
-class InferenceError(IsingSpinError):
+class InferenceError(AttractorError):
     """Raised during text generation or perplexity computation."""
 
 
@@ -69,13 +43,9 @@ class EnergyError(InferenceError):
     """Raised when energy computation encounters invalid state."""
 
 
-class StateError(InferenceError):
-    """Raised when document state update fails."""
-
-
 # ── Validation Errors ────────────────────────────────────────────────────
 
-class ValidationError(IsingSpinError):
+class ValidationError(AttractorError):
     """Raised when input validation fails."""
 
 
@@ -87,13 +57,5 @@ class POSValidationError(ValidationError):
     """Raised for POS tag validation failures."""
 
 
-class StateValidationError(ValidationError):
-    """Raised when document state is accessed before build."""
-
-
 class ConfigError(ValidationError):
     """Raised when configuration parameters are invalid."""
-
-
-class ConfigurationError(IsingSpinError):
-    """Raised when an invalid configuration is detected."""
