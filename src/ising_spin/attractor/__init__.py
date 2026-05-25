@@ -30,6 +30,7 @@ from .dam import DAMLayer
 from .hierarchy import HierarchicalDAM
 from .episodic import EpisodicMemory
 from .engine import AttractorLanguageModel
+from .expressivity import ManifoldCapacity
 
 __all__ = [
     "SDREncoder",
@@ -37,4 +38,5 @@ __all__ = [
     "HierarchicalDAM",
     "EpisodicMemory",
     "AttractorLanguageModel",
+    "ManifoldCapacity",
 ]

@@ -65,6 +65,8 @@ Memory (D=512):
 import numpy as np
 from typing import Optional, Tuple
 
+from .expressivity import ManifoldCapacity
+
 
 class DAMLayer:
     """
@@ -1086,3 +1088,45 @@ class DAMLayer:
             'exp_temperature': self.exp_temperature,
             'memory_kb': (J.nbytes + self.h.nbytes) / 1024,
         }
+
+    def manifold_capacity(self, V: int) -> dict:
+        """
+        Compute intrinsic information capacity of this DAM layer.
+
+        Returns the full capacity analysis: P_max (attractor basins),
+        metric entropy H(F), encodable parameters d_eff, and
+        fat-shattering dimension fat_F.
+
+        This is a THEORETICAL computation (not a runtime diagnostic).
+        It tells you the maximum expressivity the architecture CAN
+        achieve, regardless of training.
+
+        For F_EXP_APPROX, the effective beta is derived from
+        exp_temperature: beta_eff = ln(2) / T where T = exp_temperature.
+        This is because F(x) = T * 2^(x/T) ≡ exp(x * ln(2)/T),
+        so the effective inverse temperature is beta = ln(2)/T.
+
+        Args:
+            V: Vocabulary size (needed for metric entropy computation).
+
+        Returns:
+            Dictionary with all capacity metrics (see ManifoldCapacity).
+        """
+        import math
+
+        # For piecewise exponential F(x) = T * 2^(x/T), the effective
+        # beta in the DAM capacity formula is beta = ln(2) / T
+        # because F(x) = exp(beta * x) where beta = ln(2) / T
+        if self.f_type == self.F_EXP_APPROX and self.exp_temperature > 0:
+            T_real = self.exp_temperature  # T in Q8: 100 = 1.0
+            beta_eff = math.log(2) / (T_real / 100.0)
+            beta_fp_eff = int(beta_eff * 256)
+        else:
+            beta_fp_eff = 64  # fallback
+
+        return ManifoldCapacity.compute_layer_capacity(
+            D=self.D,
+            k=self.k,
+            beta_fp=beta_fp_eff,
+            V=V,
+        )
