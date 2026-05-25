@@ -1,5 +1,5 @@
 """
-Attractor Language Machine — Dense Associative Memory Engine.
+Attractor Language Machine v27 — Dense Associative Memory Engine.
 
 The attractor dynamics of a properly trained Dense Associative Memory
 ARE a language model. Not an approximation. Not a component. They ARE one.
@@ -8,16 +8,17 @@ Architecture:
   - SDR encoding: Sparse Distributed Representations (~2% active bits)
   - DAM layers: Dense Associative Memory with F-lookup energy (exponential capacity)
   - Hierarchy: L0-Lexical → L1-Syntactic → L2-Semantic → L3-Discourse
-  - RG flow: Wilsonian renormalization group between layers (UV-complete)
+  - RG flow: Coupling-space Wilsonian RG (decimation of J matrices)
+  - UV completeness: Cutoff independence + coupling flow stability
   - Episodic memory: Content-addressable sparse pattern storage
   - Integer-only Boltzmann sampler (ZERO float ops in hot loop)
 
-Key physics:
-  - Energy: E = -Σ F(J_ij * s_i * s_j) - Σ h_i * s_i
-  - F-lookup: nonlinear energy function → exponential storage capacity
-  - PCD learning: ΔJ = η(data_correlations - model_correlations)
-  - UV completeness: couplings renormalizable at all hierarchical scales
-  - RG beta functions: g_{l+1} = β(g_l) govern inter-layer flow
+Key physics (v27 fixes based on knowledge base analysis):
+  - Energy: E = -Σ F(J_ij * s_i * s_j) with NONLINEAR F (exponential capacity)
+  - Hebbian learning: RG fixed point at right sparsity (Agliari 2025, Eugenio 2025)
+  - Coupling-space RG: J_eff[l+1] = Decimate(J[l]), NOT state-space block-spin
+  - UV completeness: cutoff independence + operator spectrum stability
+  - Anomalous dimensions: from operator spectrum of J, NOT running correlations
 
 All integer arithmetic. Zero floats in the hot path. Runs on Pi 5.
 """
@@ -48,4 +49,4 @@ from .utils import (
     load_writingprompts, DATASET_LOADERS, DEFAULT_DATASET,
 )
 
-__version__ = "25.0.0"
+__version__ = "27.0.0"

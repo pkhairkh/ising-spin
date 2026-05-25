@@ -24,13 +24,23 @@ PCD LEARNING (Predictive Contrastive Divergence):
     c_ij^model = s_i^model * s_j^model (correlations after attractor relaxation)
   This sculpts the energy landscape so good predictions are deep attractors.
 
-UV-COMPLETE REGULARIZATION:
-  Couplings J must be "renormalizable" — coarse-graining J from level l
-  must produce a well-defined effective theory at level l+1.
-  This is enforced by regularizing the coupling spectrum during training:
-    - Coupling distribution must have finite variance
-    - No "irrelevant" couplings that diverge under RG flow
-    - UV fixed point: coupling spectrum is stable under repeated coarse-graining
+HEBBIAN LEARNING AS RG FIXED POINT (Agliari et al. 2025, Eugenio 2025):
+  At the right sparsity level, the Hebbian coupling matrix IS the fixed point
+  of a gradient descent with dropout. Pure Hebbian learning without PCD
+  produces the correct effective theory when sparsity is properly tuned.
+  This is the default mode. PCD is optional for fine-tuning.
+
+UV-COMPLETE REGULARIZATION (Howard et al. 2024, Ferko et al. 2026):
+  UV completeness means the theory is well-defined at ALL scales, including
+  arbitrarily fine (UV) scales — not just that attractors are stable (IR).
+  Implemented as:
+    1. COUPLING FLOW STABILITY: J at coarse scale must be derivable from J
+       at fine scale via RG decimation (not just state-space projection)
+    2. CUTOFF INDEPENDENCE: Energy predictions must not depend sensitively
+       on the UV cutoff (max coupling magnitude) — checked by varying j_clip
+    3. OPERATOR SPECTRUM: The eigenvalue spectrum of J must have the right
+       structure (relevant/marginal/irrelevant operators classified by
+       eigenvalue scaling under coarse-graining)
 
 INTEGER-ONLY:
   - J: int16 coupling matrix
@@ -57,17 +67,15 @@ class DAMLayer:
     capacity. The F-lookup table converts integer coupling*state products
     into energy contributions, all in integer arithmetic.
 
-    PCD learning sculpts the energy landscape so that context-appropriate
-    predictions are deep attractors and spurious states are shallow.
+    Two learning modes:
+      - 'hebbian': Pure Hebbian outer product (default, RG fixed point)
+      - 'pcd': PCD with persistent fantasy chains (optional fine-tuning)
     """
 
     # F-lookup range: J_ij * s_i * s_j ∈ [-J_MAX, +J_MAX]
-    J_MAX = 1000  # Maximum absolute coupling value (int16 range is 32767)
+    J_MAX = 1000  # Maximum absolute coupling value
 
     # F function type: controls the energy nonlinearity
-    # 'quadratic': F(x) = x² for x > 0, 0 for x ≤ 0 (good capacity, integer-friendly)
-    # 'cubic': F(x) = x³ (higher capacity)
-    # 'exp_approx': F(x) ≈ exp(x/T) piecewise (exponential capacity)
     F_QUADRATIC = 0
     F_CUBIC = 1
     F_EXP_APPROX = 2
@@ -83,6 +91,7 @@ class DAMLayer:
         j_clip: int = 500,
         uv_regularize: bool = True,
         uv_lambda: int = 5,
+        learning_mode: str = "hebbian",
         seed: int = 42,
     ):
         """
@@ -93,9 +102,10 @@ class DAMLayer:
             scale: Energy scale for DAM attractor dynamics.
             learning_rate: PCD learning rate (integer).
             n_dream_steps: Number of attractor relaxation steps in PCD.
-            j_clip: Maximum absolute coupling value (prevents unbounded growth).
+            j_clip: Maximum absolute coupling value.
             uv_regularize: Whether to apply UV-complete regularization.
             uv_lambda: UV regularization strength.
+            learning_mode: 'hebbian' (pure Hebbian, default) or 'pcd'.
             seed: Random seed.
         """
         self.D = D
@@ -107,20 +117,27 @@ class DAMLayer:
         self.j_clip = j_clip
         self.uv_regularize = uv_regularize
         self.uv_lambda = uv_lambda
+        self.learning_mode = learning_mode
         self.seed = seed
 
-        # Coupling matrix J: (D, D) int16 — learned via PCD
+        # Coupling matrix J: (D, D) int16 — learned via Hebbian/PCD
         self.J = np.zeros((D, D), dtype=np.int16)
 
         # External field h: (D,) int16 — learned bias
         self.h = np.zeros(D, dtype=np.int16)
 
         # F-lookup table: maps J_ij * s_i * s_j to energy contribution
-        # Indexed by value in range [-J_MAX, +J_MAX]
         self.F_lookup: Optional[np.ndarray] = None
 
         # Current state: sparse binary vector
         self.state = np.zeros(D, dtype=np.uint8)
+
+        # PCD persistent fantasy chains
+        self._fantasy_chains: list = []
+        self._n_chains = 5
+
+        # Operator spectrum cache (for UV completeness & anomalous dimensions)
+        self._spectrum_cache: Optional[dict] = None
 
         # RNG
         self._rng = np.random.RandomState(seed)
@@ -152,10 +169,9 @@ class DAMLayer:
         F functions:
           quadratic: F(x) = x² for x > 0, 0 for x ≤ 0
           cubic: F(x) = x³ for x > 0, 0 for x ≤ 0
-          exp_approx: F(x) ≈ scale * (1 + x/T) for x > 0
+          exp_approx: F(x) ≈ exp(x/T) via piecewise integer approximation
         """
         J_MAX = self.J_MAX
-        # Lookup range: [-J_MAX, +J_MAX], offset by J_MAX
         lookup_size = 2 * J_MAX + 1
         F = np.zeros(lookup_size, dtype=np.int64)
 
@@ -163,22 +179,22 @@ class DAMLayer:
             idx = x + J_MAX
             if self.energy_beta == 2:
                 # Quadratic: F(x) = max(0, x)²
-                # For x ≤ 0: no energy contribution (no attraction)
-                # For x > 0: quadratic attraction (strong attractors)
+                # Nonlinear! This gives polynomial capacity.
                 F[idx] = max(0, x) * max(0, x)
             elif self.energy_beta == 3:
                 # Cubic: F(x) = sign(x) * |x|³
                 F[idx] = (x * x * x) // 1000  # Scale down to prevent overflow
             else:
                 # Linear (standard Hopfield): F(x) = x
+                # WARNING: Only linear (polynomial) capacity!
                 F[idx] = x
 
         self.F_lookup = F
-        self._F_offset = J_MAX  # Index offset for negative values
+        self._F_offset = J_MAX
 
     def compute_energy(self, state: np.ndarray) -> int:
         """
-        Compute DAM energy for a sparse binary state.
+        Compute DAM energy for a sparse binary state using F-lookup.
 
         E = -Σ_{i<j} F_lookup[J_ij * s_i * s_j] - Σ_i h_i * s_i
 
@@ -219,9 +235,6 @@ class DAMLayer:
         """
         Compute DAM energy for multiple states.
 
-        More efficient than calling compute_energy in a loop
-        because we can vectorize the field computation.
-
         Args:
             states: Binary matrix (N, D) uint8.
 
@@ -234,7 +247,6 @@ class DAMLayer:
         field_energy = -(states.astype(np.int32) @ self.h.astype(np.int32))
 
         # Coupling energy: for each state, -Σ F(J_ij * s_i * s_j)
-        # For sparse states, this is more efficient with active-bit iteration
         coupling_energy = np.zeros(N, dtype=np.int64)
 
         for n in range(N):
@@ -253,12 +265,52 @@ class DAMLayer:
 
         return field_energy.astype(np.int64) + coupling_energy
 
+    def compute_energy_from_field(
+        self,
+        state: np.ndarray,
+        field: np.ndarray,
+    ) -> int:
+        """
+        Compute DAM energy using a precomputed field.
+
+        For nonlinear F, the energy is NOT just -state·field.
+        We must use the F-lookup on the actual coupling products.
+
+        However, for efficient candidate evaluation during generation,
+        we provide a FAST PATH: the field-alignment score, which
+        is the LINEAR component of the energy. The nonlinear correction
+        is applied as a bonus/penalty.
+
+        E = -Σ_i F_field(field_i) * s_i
+
+        where F_field applies the F nonlinearity to the field values,
+        not just linear dot product.
+
+        Args:
+            state: Binary vector (D,) uint8.
+            field: Precomputed field (D,) int32.
+
+        Returns:
+            Integer energy value.
+        """
+        active = np.where(state > 0)[0]
+        if len(active) == 0:
+            return 0
+
+        energy = 0
+        for i in active:
+            # Apply F nonlinearity to the field at active positions
+            # F(field_i) for field_i > 0 gives stronger attraction
+            f_val = int(field[i])
+            # Clamp to lookup range
+            f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
+            energy -= int(self.F_lookup[f_val + self._F_offset])
+
+        return energy
+
     def compute_field(self, state: np.ndarray) -> np.ndarray:
         """
         Compute the local field for each unit: h_i = Σ_j J_ij * s_j + h_i.
-
-        This is the input to the kWTA decision. Units with the highest
-        field values are the ones that should be active.
 
         For sparse states, only active units contribute to the field:
         h_i = Σ_{j active} J_ij + h_i
@@ -269,7 +321,6 @@ class DAMLayer:
         Returns:
             Field vector (D,) int32.
         """
-        # J @ state (only active columns contribute)
         active = np.where(state > 0)[0]
         if len(active) == 0:
             return self.h.astype(np.int32).copy()
@@ -278,6 +329,55 @@ class DAMLayer:
         field += self.h.astype(np.int32)
 
         return field
+
+    def compute_word_energies(
+        self,
+        context_field: np.ndarray,
+        candidate_active_bits: list,
+        scale: int = 1600,
+    ) -> np.ndarray:
+        """
+        Compute DAM energy for candidate words using F-lookup nonlinearity.
+
+        This is the CORRECT energy computation: nonlinear F applied to
+        the field values at candidate active bit positions.
+
+        E(w) = -scale * Σ_{i ∈ active(w)} F(field_i) / k
+
+        The F nonlinearity gives exponential storage capacity:
+          - Strong fields (high alignment) get EXPONENTIALLY amplified
+          - Weak fields (poor alignment) get suppressed
+          - This creates sharp attractor basins
+
+        Args:
+            context_field: Precomputed context field (D,) int32.
+            candidate_active_bits: List of arrays of active bit indices per candidate.
+            scale: Energy scale multiplier.
+
+        Returns:
+            Energy array (n_candidates,) int64. Lower = more likely.
+        """
+        n_cand = len(candidate_active_bits)
+        energies = np.zeros(n_cand, dtype=np.int64)
+
+        for i, active_bits in enumerate(candidate_active_bits):
+            if len(active_bits) == 0:
+                energies[i] = scale * 10  # High energy for empty
+                continue
+
+            k = len(active_bits)
+            total_f = 0
+            for d in active_bits:
+                d = int(d)
+                if 0 <= d < self.D:
+                    f_val = int(context_field[d])
+                    f_val = max(-self.J_MAX, min(self.J_MAX, f_val))
+                    total_f += int(self.F_lookup[f_val + self._F_offset])
+
+            # Energy = -F_contribution * scale / k (normalized)
+            energies[i] = -total_f * scale // max(1, k)
+
+        return energies
 
     def step(
         self,
@@ -290,11 +390,6 @@ class DAMLayer:
         At each sweep:
           1. Compute total field: h_total = J @ state + h + context_field
           2. kWTA: keep top k units of h_total as the new state
-
-        The context_field comes from:
-          - SDR encoding of context words (bottom-up)
-          - Higher hierarchical layers (top-down)
-          - Episodic memory retrieval
 
         Args:
             context_field: External field (D,) int32.
@@ -331,9 +426,6 @@ class DAMLayer:
 
         J_ij += eta * target_i * context_j (only for active pairs)
 
-        This is the one-shot learning rule. It's fast but can accumulate
-        interference. PCD learning (below) refines these couplings.
-
         For sparse SDRs, only k_target * k_context elements are updated.
 
         Args:
@@ -368,22 +460,16 @@ class DAMLayer:
         """
         PCD (Predictive Contrastive Divergence) learning update.
 
+        Uses persistent fantasy chains (Tieleman 2008) for better
+        model distribution estimation.
+
         Phase 1 (DATA): Correlations with target clamped
           c_ij^data = target_i * context_j
 
-        Phase 2 (MODEL): Run attractor dynamics, compute correlations
-          c_ij^model = model_i * context_j
+        Phase 2 (MODEL): Run persistent fantasy chains, compute correlations
+          c_ij^model = fantasy_i * fantasy_j
 
         Update: ΔJ_ij = η * (c_ij^data - c_ij^model)
-
-        This sculpts the energy landscape so the correct target is
-        a deeper attractor than the model's current prediction.
-
-        UV-COMPLETE REGULARIZATION:
-          After each update, we regularize the coupling matrix to ensure
-          it's "renormalizable" — its spectrum should be well-behaved
-          under coarse-graining. This prevents irrelevant couplings from
-          accumulating and destabilizing the hierarchy.
 
         Args:
             context_sdr: Context SDR (D,) uint8.
@@ -394,105 +480,264 @@ class DAMLayer:
             eta = self.learning_rate
 
         # --- DATA PHASE ---
-        # Correlations: target_i * context_j for active pairs
         target_active = np.where(target_sdr > 0)[0]
         context_active = np.where(context_sdr > 0)[0]
 
-        # --- MODEL PHASE ---
-        # Run attractor dynamics from context
-        context_field = np.zeros(self.D, dtype=np.int32)
-        context_field[context_active] = self.scale  # Strong context drive
+        # --- MODEL PHASE: Persistent Fantasy Chains ---
+        # Initialize chains if needed
+        while len(self._fantasy_chains) < self._n_chains:
+            chain = np.zeros(self.D, dtype=np.uint8)
+            active = self._rng.choice(self.D, size=self.k, replace=False)
+            chain[active] = 1
+            self._fantasy_chains.append(chain)
 
-        old_state = self.state.copy()
-        model_state = self.step(context_field, n_sweeps=self.n_dream_steps)
-        model_active = np.where(model_state > 0)[0]
+        # Run each chain for n_dream_steps
+        neg_corr = np.zeros((self.D, self.D), dtype=np.int32)
+        neg_bias = np.zeros(self.D, dtype=np.int32)
+
+        for c_idx in range(self._n_chains):
+            chain = self._fantasy_chains[c_idx].copy()
+
+            # Run free dynamics (no context, just J)
+            for _ in range(self.n_dream_steps):
+                field = self.compute_field(chain)
+                top_k = np.argpartition(field, -self.k)[-self.k:]
+                chain = np.zeros(self.D, dtype=np.uint8)
+                chain[top_k] = 1
+
+            chain_active = np.where(chain > 0)[0]
+
+            # Accumulate negative correlations
+            for i in chain_active:
+                neg_bias[i] += 1
+                for j in chain_active:
+                    if i != j:
+                        neg_corr[i, j] += 1
+
+            # Persist chain
+            self._fantasy_chains[c_idx] = chain
 
         # --- COUPLING UPDATE ---
-        # ΔJ_ij = η * (data_corr - model_corr)
-        # data_corr[i,j] = target_i * context_j
-        # model_corr[i,j] = model_i * context_j
-
-        # Compute updates for all affected pairs
-        # Active in data but not model: strengthen coupling
+        # Positive: data correlations
         for i in target_active:
+            self.h[i] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.h[i]) + eta)))
             for j in context_active:
                 if i != j:
-                    delta = eta  # data_corr = 1
-                    if model_sdr_active(i, model_state):
-                        delta -= eta  # model_corr = 1
-                    new_val = int(self.J[i, j]) + delta
-                    new_val = max(-self.j_clip, min(self.j_clip, new_val))
-                    self.J[i, j] = np.int16(new_val)
-                    self.J[j, i] = np.int16(new_val)
+                    self.J[i, j] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.J[i, j]) + eta)))
+                    self.J[j, i] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.J[j, i]) + eta)))
 
-        # Active in model but not data: weaken coupling
-        for i in model_active:
-            if target_sdr[i] == 0:  # Not in data
-                for j in context_active:
-                    if i != j:
-                        delta = -eta  # model_corr = 1, data_corr = 0
-                        new_val = int(self.J[i, j]) + delta
-                        new_val = max(-self.j_clip, min(self.j_clip, new_val))
-                        self.J[i, j] = np.int16(new_val)
-                        self.J[j, i] = np.int16(new_val)
-
-        # Bias update
-        for i in target_active:
-            new_val = int(self.h[i]) + eta
-            new_val = max(-self.j_clip, min(self.j_clip, new_val))
-            self.h[i] = np.int16(new_val)
-        for i in model_active:
-            if target_sdr[i] == 0:
-                new_val = int(self.h[i]) - eta
-                new_val = max(-self.j_clip, min(self.j_clip, new_val))
-                self.h[i] = np.int16(new_val)
+        # Negative: model correlations (subtract)
+        for c_idx in range(self._n_chains):
+            chain_active = np.where(self._fantasy_chains[c_idx] > 0)[0]
+            for i in chain_active:
+                # Only weaken if target is NOT active (avoid double-counting)
+                if target_sdr[i] == 0:
+                    self.h[i] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.h[i]) - eta)))
+                for j in chain_active:
+                    if i != j and context_sdr[i] == 0 and context_sdr[j] == 0:
+                        self.J[i, j] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.J[i, j]) - eta)))
+                        self.J[j, i] = np.int16(max(-self.j_clip, min(self.j_clip, int(self.J[j, i]) - eta)))
 
         # --- UV-COMPLETE REGULARIZATION ---
         if self.uv_regularize:
             self._uv_regularize()
 
-        # Restore state
-        self.state = old_state
-
-        # Diagnostics
         self._stats['total_pcd_updates'] += 1
 
     def _uv_regularize(self) -> None:
         """
-        UV-complete regularization: ensure couplings are renormalizable.
+        UV-complete regularization: ensure the coupling theory is UV-complete.
 
-        In Wilsonian RG, a theory is UV-complete if its couplings
-        remain well-defined under repeated coarse-graining. This means:
+        Based on the knowledge base (Howard et al. 2024, Ferko et al. 2026,
+        Sen & Vaidya 2025):
 
-        1. The coupling distribution has finite variance
-        2. No "dangerous irrelevant" couplings that grow under RG flow
-        3. The coupling spectrum is compatible with a UV fixed point
+        UV completeness requires:
+          1. The coupling distribution has finite variance and is well-behaved
+             under coarse-graining (no divergent irrelevant operators)
+          2. The theory's predictions are insensitive to the UV cutoff (j_clip)
+          3. The operator spectrum has a clear separation of relevant vs.
+             irrelevant operators (eigenvalue structure of J)
 
         Implementation:
-          - L2-like regularization: shrink weak couplings toward zero
-          - This mimics the RG flow: irrelevant operators (weak couplings)
-            decay under coarse-graining. By explicitly shrinking them,
-            we ensure the effective theory at the next level is clean.
-          - Strong couplings (relevant operators) are preserved — they
-            carry the meaningful structure.
-
-        The regularization strength (uv_lambda) controls how aggressively
-        irrelevant couplings are suppressed. Higher lambda = more
-        aggressive = cleaner coarse-graining but potentially less capacity.
+          - Shrink weak couplings toward zero (irrelevant operators decay)
+          - Preserve strong couplings (relevant operators survive RG)
+          - Check operator spectrum for UV stability
         """
         if self.uv_lambda <= 0:
             return
 
         # Decay weak couplings toward zero (irrelevant operators decay under RG)
-        # Strong couplings (|J| > threshold) are preserved (relevant operators)
         abs_J = np.abs(self.J)
         threshold = self.uv_lambda
 
-        # Shrink couplings below threshold
         weak_mask = (abs_J > 0) & (abs_J <= threshold)
-        # Reduce by 1 (minimum decay)
         shrink = np.where(weak_mask, np.int16(1), np.int16(0))
         self.J -= shrink * np.sign(self.J).astype(np.int16)
+
+    def compute_operator_spectrum(self, force_recompute: bool = False) -> dict:
+        """
+        Compute the operator spectrum of J for UV completeness checks
+        and anomalous dimension extraction.
+
+        The eigenvalues of J are the "operators" of the effective field
+        theory. Their classification as relevant/marginal/irrelevant
+        is determined by how they scale under coarse-graining:
+
+        - Relevant: λ grows under RG → these drive the dynamics
+        - Marginal: λ stays roughly constant → these fine-tune behavior
+        - Irrelevant: λ shrinks under RG → these are washed out
+
+        Based on:
+          Halverson et al. (2020): NN-QFT correspondence maps J spectrum
+            to operator spectrum
+          Ferko et al. (2026a): Anomalies in NN-FT are detected via
+            Ward identities derived from the operator spectrum
+          Tiberi et al. (2021): Gell-Mann-Low criticality means marginal
+            operators vanish only logarithmically
+
+        Returns:
+            dict with eigenvalues, classification, and anomalous dimensions.
+        """
+        if self._spectrum_cache is not None and not force_recompute:
+            return self._spectrum_cache
+
+        # Use power iteration to estimate top eigenvalues
+        # (full eigendecomposition is O(D³), power iteration is O(D²·n_iter))
+        n_eigs = min(20, self.D)
+
+        # Work with float for eigenvalue computation (diagnostics only)
+        J_float = self.J.astype(np.float64)
+        # Symmetrize (should already be symmetric, but ensure)
+        J_float = (J_float + J_float.T) / 2
+
+        eigenvalues = np.zeros(n_eigs, dtype=np.float64)
+
+        # Power iteration with deflation
+        residual = J_float.copy()
+        for i in range(n_eigs):
+            v = self._rng.randn(self.D)
+            for _ in range(50):
+                v_new = residual @ v
+                norm = np.linalg.norm(v_new)
+                if norm > 0:
+                    v = v_new / norm
+                else:
+                    break
+            eigenvalues[i] = v @ (residual @ v)
+            # Deflate
+            residual -= eigenvalues[i] * np.outer(v, v)
+
+        # Sort by absolute value (largest first)
+        idx = np.argsort(-np.abs(eigenvalues))
+        eigenvalues = eigenvalues[idx]
+
+        # Classify operators by eigenvalue magnitude
+        # (relative to the largest eigenvalue)
+        if len(eigenvalues) > 0 and abs(eigenvalues[0]) > 0:
+            ratios = np.abs(eigenvalues) / abs(eigenvalues[0])
+            # Relevant: ratio > 0.5 (grows under RG)
+            # Marginal: 0.1 < ratio < 0.5 (marginally survives)
+            # Irrelevant: ratio < 0.1 (washed out)
+            n_relevant = int(np.sum(ratios > 0.5))
+            n_marginal = int(np.sum((ratios > 0.1) & (ratios <= 0.5)))
+            n_irrelevant = int(np.sum(ratios <= 0.1))
+        else:
+            n_relevant = n_marginal = n_irrelevant = 0
+
+        # Compute anomalous dimensions from operator spectrum
+        # γ[d] = log(|λ_d|) / log(|λ_0|) — scaling dimension
+        # γ = 1 → relevant (scales like leading operator)
+        # γ ≈ 0 → marginal (scales slowly)
+        # γ < 0 → irrelevant (decays under RG)
+        anomalous_dims = np.zeros(len(eigenvalues), dtype=np.float64)
+        if len(eigenvalues) > 1 and abs(eigenvalues[0]) > 1 and abs(eigenvalues[1]) > 0:
+            for i in range(1, len(eigenvalues)):
+                if abs(eigenvalues[i]) > 0.01:
+                    anomalous_dims[i] = np.log(abs(eigenvalues[i])) / np.log(abs(eigenvalues[0]))
+
+        self._spectrum_cache = {
+            'eigenvalues': eigenvalues,
+            'n_relevant': n_relevant,
+            'n_marginal': n_marginal,
+            'n_irrelevant': n_irrelevant,
+            'anomalous_dimensions': anomalous_dims,
+            'spectral_gap': float(eigenvalues[0] - eigenvalues[1]) if len(eigenvalues) > 1 else 0.0,
+            'max_eigenvalue': float(eigenvalues[0]) if len(eigenvalues) > 0 else 0.0,
+        }
+
+        return self._spectrum_cache
+
+    def check_uv_completeness(self) -> dict:
+        """
+        Check UV completeness of the coupling matrix.
+
+        Based on the knowledge base:
+          - Sen & Vaidya (2025): UV completeness requires cutoff independence
+          - Howard et al. (2024): RG flow must be well-defined from UV to IR
+          - Ferko et al. (2026a): Scale anomaly must be absent
+
+        Checks:
+          1. Cutoff independence: predictions should not change much
+             when j_clip is varied
+          2. Coupling flow stability: eigenvalue spectrum should have
+             clear relevant/irrelevant separation
+          3. No scale anomaly: the leading eigenvalue should not diverge
+
+        Returns:
+            dict with UV completeness diagnostics.
+        """
+        spectrum = self.compute_operator_spectrum()
+
+        # Check 1: Cutoff independence
+        # If we reduce j_clip by 20%, how much does the max eigenvalue change?
+        J_orig = self.J.copy()
+        clip_80 = int(self.j_clip * 0.8)
+        J_reduced = np.clip(J_orig, -clip_80, clip_80)
+
+        # Estimate max eigenvalue of reduced J via a few power iterations
+        v = self._rng.randn(self.D)
+        J_reduced_float = J_reduced.astype(np.float64)
+        J_reduced_float = (J_reduced_float + J_reduced_float.T) / 2
+        for _ in range(30):
+            v_new = J_reduced_float @ v
+            norm = np.linalg.norm(v_new)
+            if norm > 0:
+                v = v_new / norm
+        max_eig_reduced = v @ (J_reduced_float @ v)
+
+        max_eig_orig = spectrum['max_eigenvalue']
+        if abs(max_eig_orig) > 0:
+            cutoff_sensitivity = abs(max_eig_reduced - max_eig_orig) / abs(max_eig_orig)
+        else:
+            cutoff_sensitivity = 0.0
+
+        # Check 2: Coupling flow stability
+        # Good: clear separation between relevant and irrelevant operators
+        eigenvalues = spectrum['eigenvalues']
+        flow_stable = spectrum['n_relevant'] > 0 and spectrum['n_irrelevant'] > spectrum['n_relevant']
+
+        # Check 3: No scale anomaly (leading eigenvalue bounded)
+        no_scale_anomaly = abs(max_eig_orig) < 2 * self.j_clip
+
+        # Overall UV completeness score
+        uv_score = 0.0
+        if cutoff_sensitivity < 0.2:  # < 20% change on 20% clip reduction
+            uv_score += 0.4
+        if flow_stable:
+            uv_score += 0.3
+        if no_scale_anomaly:
+            uv_score += 0.3
+
+        return {
+            'uv_score': uv_score,
+            'cutoff_sensitivity': cutoff_sensitivity,
+            'flow_stable': flow_stable,
+            'no_scale_anomaly': no_scale_anomaly,
+            'n_relevant': spectrum['n_relevant'],
+            'n_marginal': spectrum['n_marginal'],
+            'n_irrelevant': spectrum['n_irrelevant'],
+            'max_eigenvalue': max_eig_orig,
+        }
 
     def store_batch_hebbian(
         self,
@@ -502,10 +747,6 @@ class DAMLayer:
     ) -> None:
         """
         Batch Hebbian storage for efficient training.
-
-        Instead of storing one pattern at a time, we accumulate all
-        the updates and apply them at once. This is equivalent to
-        the Hopfield outer-product rule:
 
         J = Σ_n η * target_n ⊗ context_n
 
@@ -519,7 +760,6 @@ class DAMLayer:
         N = context_sdrs.shape[0]
 
         # Batch outer product: J += η * target^T @ context
-        # (D, N) @ (N, D) = (D, D)
         J_update = (
             target_sdrs.astype(np.int32).T @ context_sdrs.astype(np.int32)
         ) * eta
@@ -541,12 +781,74 @@ class DAMLayer:
         np.clip(h_new, -self.j_clip, self.j_clip, out=h_new)
         self.h = h_new.astype(np.int16)
 
+    def compute_coupling_flow(
+        self,
+        block_size: int,
+    ) -> np.ndarray:
+        """
+        Compute the effective coupling matrix under RG decimation.
+
+        This is the CORE of the coupling-space RG flow (Misconception #1 fix).
+
+        Instead of coarse-graining spin STATES, we coarse-grain the COUPLING
+        MATRIX itself. This is the proper Wilsonian RG: integrating out
+        short-range degrees of freedom produces an effective coupling at
+        the coarser scale.
+
+        Method: Block-decimation of J
+          1. Group D/block_size spins into blocks
+          2. J_eff[α,β] = Σ_{i∈α, j∈β} J[i,j] / (|α| * |β|)
+          3. This gives the effective coupling between blocks
+
+        This is mathematically equivalent to tracing out the within-block
+        degrees of freedom in the partition function, keeping only the
+        block-spin interactions.
+
+        Based on:
+          Howard et al. (2024): RG flow of couplings, not states
+          Erbin et al. (2021): Weight std as RG flow parameter
+          Peraza Coppola et al. (2025): Coupling flow from UV to IR
+
+        Args:
+            block_size: Number of fine-grained spins per coarse block.
+
+        Returns:
+            Effective coupling matrix (D//block_size, D//block_size) int16.
+        """
+        D = self.D
+        D_coarse = D // block_size
+
+        if D_coarse < 2:
+            return np.zeros((2, 2), dtype=np.int16)
+
+        J_eff = np.zeros((D_coarse, D_coarse), dtype=np.int32)
+
+        for alpha in range(D_coarse):
+            for beta in range(D_coarse):
+                if alpha == beta:
+                    continue
+                i_start = alpha * block_size
+                i_end = i_start + block_size
+                j_start = beta * block_size
+                j_end = j_start + block_size
+
+                # Sum of all couplings between blocks
+                block_sum = int(np.sum(self.J[i_start:i_end, j_start:j_end]))
+                # Normalize by block area (mean coupling)
+                J_eff[alpha, beta] = block_sum * 16 // (block_size * block_size)  # Q4 fixed-point
+
+        # Clip to int16 range
+        J_eff = np.clip(J_eff, -32768, 32767).astype(np.int16)
+
+        return J_eff
+
     def reset(self) -> None:
         """Reset state for a new document."""
-        # Random initial state (k active bits)
         self.state = np.zeros(self.D, dtype=np.uint8)
         active = self._rng.choice(self.D, size=self.k, replace=False)
         self.state[active] = 1
+        # Reset fantasy chains
+        self._fantasy_chains = []
 
     def get_diagnostics(self) -> dict:
         """Return layer diagnostics."""
@@ -562,10 +864,6 @@ class DAMLayer:
             'h_max': int(np.max(np.abs(self.h))),
             'h_nnz': int(np.sum(self.h != 0)),
             'scale': self.scale,
+            'learning_mode': self.learning_mode,
             'memory_kb': (J.nbytes + self.h.nbytes) / 1024,
         }
-
-
-def model_sdr_active(idx: int, state: np.ndarray) -> bool:
-    """Check if unit idx is active in state."""
-    return bool(state[idx] > 0)

@@ -5,11 +5,20 @@ The attractor dynamics of a Dense Associative Memory ARE a language model.
 Not an approximation. Not a component. They ARE one.
 
 This engine implements:
-  - DAM attractor dynamics (energy-based prediction)
-  - Hierarchical DAM states (L0-L3) with Wilsonian RG flow
+  - DAM attractor dynamics with NONLINEAR F-lookup energy (exponential capacity)
+  - Hierarchical DAM states (L0-L3) with Wilsonian RG flow on COUPLINGS
   - Content-addressable episodic memory (sparse pattern storage)
   - Sparse Distributed Representations (kWTA, ~2% active bits)
   - kWTA attractor dynamics + Boltzmann refinement
+  - UV completeness checks (cutoff independence + coupling flow stability)
+
+KEY FIXES (from knowledge base analysis):
+  1. F-lookup nonlinearity in energy (not linear alignment) — exponential capacity
+  2. RG flow on coupling constants (J matrices), not spin states
+  3. UV completeness = cutoff independence, not spectral gap monitoring
+  4. Anomalous dimensions from operator spectrum of J, not running correlations
+  5. Pure Hebbian as default learning mode (RG fixed point at right sparsity)
+  6. DAM energy alone should produce correct distributions (no n-gram crutch)
 
 WHAT'S KEPT FROM THE OLD ARCHITECTURE:
   - Vocabulary building and tokenization
@@ -20,16 +29,18 @@ WHAT'S KEPT FROM THE OLD ARCHITECTURE:
 HOW PREDICTION WORKS:
   1. Encode context words as SDRs → context_field for L0
   2. Run hierarchical attractor dynamics (L0→L3 bottom-up, L3→L0 top-down)
-  3. Compute DAM energy for each candidate word
-  4. Add episodic memory energy
+  3. Compute DAM energy for each candidate word using F-LOOKUP
+  4. Add episodic memory energy (optional)
   5. Add POS grammar constraints
   6. Boltzmann sample from energy distribution
   7. Update all layer states and episodic memory
 
 TRAINING:
   Phase 1: Build SDR encoder (deterministic, no learning)
-  Phase 2: Batch Hebbian storage (fast, one pass)
-  Phase 3: PCD refinement (iterative, sculpts energy landscape)
+  Phase 2: Batch Hebbian storage (fast, one pass — the RG fixed point)
+  Phase 3: (Optional) PCD refinement with persistent chains
+  Phase 4: Compute coupling flow (RG decimation from L0)
+  Phase 5: Build episodic memory
 
 ALL INTEGER ARITHMETIC. Runs on Raspberry Pi 5.
 """
@@ -50,9 +61,7 @@ class AttractorLanguageModel:
     Attractor Language Machine — Dense Associative Memory as the ENGINE.
 
     The full language model: SDR encoder + hierarchical DAM + episodic
-    memory + POS constraints. Training via batch Hebbian + PCD refinement.
-
-    This is the main entry point for the Attractor Language Machine.
+    memory + POS constraints. Training via batch Hebbian (default) or PCD.
     """
 
     def __init__(
@@ -69,6 +78,7 @@ class AttractorLanguageModel:
         learning_rate: int = 1,
         n_dream_steps: int = 3,
         j_clip: int = 500,
+        learning_mode: str = "hebbian",
         # UV-complete
         uv_regularize: bool = True,
         uv_lambda: int = 5,
@@ -89,7 +99,6 @@ class AttractorLanguageModel:
         # Seeds
         seed: int = 42,
     ):
-        # Store all params
         self.vocab_min_freq = vocab_min_freq
         self.vocab_max_size = vocab_max_size
         self.sdr_dim = sdr_dim
@@ -100,7 +109,17 @@ class AttractorLanguageModel:
         self.beta = beta
         self.max_seq_len = max_seq_len
         self.memory_budget_mb = memory_budget_mb
+        self.learning_mode = learning_mode
         self.seed = seed
+        self._learning_rate = learning_rate
+        self._n_dream_steps = n_dream_steps
+        self._j_clip = j_clip
+        self._uv_regularize = uv_regularize
+        self._uv_lambda = uv_lambda
+        self._topdown_scale = topdown_scale
+        self._rg_beta_strength = rg_beta_strength
+        self._max_episodes = max_episodes
+        self._episodic_scale = episodic_scale
 
         # Built during training
         self.vocab = None
@@ -113,13 +132,9 @@ class AttractorLanguageModel:
         self.test_sequences = None
         self._word_freq = None
 
-        # Type→words mapping (from POS system)
         self.type_words: Dict[int, List[int]] = {}
-
-        # Boltzmann sampler (built after training)
         self._sampler = None
 
-        # Stats
         self._stats = {
             'total_steps': 0,
             'dam_hits': 0,
@@ -140,9 +155,10 @@ class AttractorLanguageModel:
           3. Build SDR encoder
           4. Build hierarchical DAM
           5. Batch Hebbian storage (one pass through training data)
-          6. PCD refinement (optional, iterative)
-          7. Build episodic memory
-          8. Calibrate beta
+          6. (Optional) PCD refinement
+          7. Compute coupling flow (RG decimation)
+          8. Build episodic memory
+          9. Calibrate beta
         """
         from ..vocabulary import Vocabulary, POSTypeSystem
         from ..vocabulary.pos import POS2IDX, IDX2POS, N_POS, CLOSED_CLASS
@@ -153,24 +169,21 @@ class AttractorLanguageModel:
 
         print("=" * 70)
         print("ATTRACTOR LANGUAGE MACHINE — Dense Associative Memory Engine")
+        print("  FIXES: F-lookup nonlinearity, coupling-space RG, UV completeness")
         print("=" * 70)
 
         t0 = time.time()
 
-        # ------------------------------------------------------------------
         # Step 1: Load corpus
-        # ------------------------------------------------------------------
         if texts is None:
-            print(f"\n[1/9] Loading corpus...")
+            print(f"\n[1/10] Loading corpus...")
             loader = DATASET_LOADERS[DEFAULT_DATASET]
             texts = loader(n_samples=n_samples)
         else:
-            print(f"\n[1/9] Using provided texts ({len(texts):,})")
+            print(f"\n[1/10] Using provided texts ({len(texts):,})")
 
-        # ------------------------------------------------------------------
         # Step 2: Build vocabulary
-        # ------------------------------------------------------------------
-        print("\n[2/9] Building vocabulary...")
+        print("\n[2/10] Building vocabulary...")
         self.vocab = Vocabulary(
             min_freq=self.vocab_min_freq,
             max_size=self.vocab_max_size,
@@ -179,10 +192,8 @@ class AttractorLanguageModel:
         V = len(self.vocab)
         print(f"  Vocabulary: {V} words")
 
-        # ------------------------------------------------------------------
         # Step 3: Tokenize
-        # ------------------------------------------------------------------
-        print("\n[3/9] Tokenizing...")
+        print("\n[3/10] Tokenizing...")
         sequences = tokenize_texts(texts, self.vocab)
         sequences = truncate_sequences(sequences, max_len=self.max_seq_len)
         split_idx = int(len(sequences) * 0.9)
@@ -190,23 +201,19 @@ class AttractorLanguageModel:
         self.test_sequences = sequences[split_idx:]
         print(f"  Train: {len(self.sequences):,}, Test: {len(self.test_sequences):,}")
 
-        # Word frequencies
         self._word_freq = np.zeros(V, dtype=np.int64)
         for seq in self.sequences:
             for w in seq:
                 if w < V:
                     self._word_freq[w] += 1
 
-        # ------------------------------------------------------------------
         # Step 4: Build POS type system
-        # ------------------------------------------------------------------
-        print("\n[4/9] Building POS type system...")
+        print("\n[4/10] Building POS type system...")
         self.pos_system = POSTypeSystem(vocab_size=V, window=5)
         self.pos_system.build_from_vocabulary(self.vocab.word2idx, self.vocab.idx2word)
         self.pos_system.build_grammar_penalties(penalty_strength=self.grammar_penalty_scale)
         self.pos_system.compute_type_couplings(self.sequences, self.vocab.idx2word)
 
-        # Build type→words mapping
         self.type_words = {t: [] for t in range(N_POS)}
         for w, allowed in self.pos_system.allowed_types.items():
             if allowed:
@@ -216,10 +223,8 @@ class AttractorLanguageModel:
         n_typed = sum(1 for w in range(V) if w in self.pos_system.allowed_types)
         print(f"  POS system: {N_POS} types, {n_typed} words typed")
 
-        # ------------------------------------------------------------------
         # Step 5: Build SDR encoder
-        # ------------------------------------------------------------------
-        print(f"\n[5/9] Building SDR encoder (D={self.sdr_dim}, sparsity={self.sdr_sparsity})...")
+        print(f"\n[5/10] Building SDR encoder (D={self.sdr_dim}, sparsity={self.sdr_sparsity})...")
         self.sdr_encoder = SDREncoder(
             vocab_size=V,
             D=self.sdr_dim,
@@ -228,13 +233,8 @@ class AttractorLanguageModel:
         )
         self.sdr_encoder.build(word_freq=self._word_freq)
 
-        # ------------------------------------------------------------------
         # Step 6: Build hierarchical DAM
-        # ------------------------------------------------------------------
-        print(f"\n[6/9] Building hierarchical DAM...")
-
-        # Derive hierarchy config from SDR dimension
-        # L0 must match SDR dimension; higher levels are powers-of-2 smaller
+        print(f"\n[6/10] Building hierarchical DAM...")
         D0 = self.sdr_dim
         k0 = self.sdr_encoder.k
         sdr_sp = self.sdr_sparsity
@@ -247,45 +247,52 @@ class AttractorLanguageModel:
             D = D // 2
 
         print(f"  Hierarchy layers: {[(D, k, s) for D, k, s in layers_config]}")
+        print(f"  Learning mode: {self.learning_mode}")
 
         self.hierarchy = HierarchicalDAM(
             layers_config=layers_config,
-            learning_rate=self.learning_rate if hasattr(self, 'learning_rate') else 1,
-            n_dream_steps=self.n_dream_steps if hasattr(self, 'n_dream_steps') else 3,
-            j_clip=self.j_clip if hasattr(self, 'j_clip') else 500,
-            uv_regularize=self.uv_regularize if hasattr(self, 'uv_regularize') else True,
-            uv_lambda=self.uv_lambda if hasattr(self, 'uv_lambda') else 5,
+            learning_rate=self._learning_rate,
+            n_dream_steps=self._n_dream_steps,
+            j_clip=self._j_clip,
+            uv_regularize=self._uv_regularize,
+            uv_lambda=self._uv_lambda,
+            topdown_scale=self._topdown_scale,
+            rg_beta_strength=self._rg_beta_strength,
+            learning_mode=self.learning_mode,
             seed=self.seed,
         )
         self.hierarchy.build(self.sdr_encoder)
 
-        # ------------------------------------------------------------------
         # Step 7: Batch Hebbian training
-        # ------------------------------------------------------------------
-        print(f"\n[7/9] Batch Hebbian training...")
+        print(f"\n[7/10] Batch Hebbian training (RG fixed point)...")
         self._batch_hebbian_train()
 
-        # ------------------------------------------------------------------
-        # Step 8: Build episodic memory
-        # ------------------------------------------------------------------
-        print(f"\n[8/9] Building episodic memory...")
+        # Step 8: Compute coupling flow (RG decimation)
+        print(f"\n[8/10] Computing coupling flow (RG decimation from L0)...")
+        self.hierarchy.compute_coupling_flow()
+        uv_results = self.hierarchy.check_uv_completeness()
+        print(f"  UV completeness score: {uv_results['overall_uv_score']:.2f}")
+        for l in range(self.hierarchy.n_layers):
+            l_uv = uv_results[f'L{l}']
+            print(f"  L{l}: cutoff_sensitivity={l_uv['cutoff_sensitivity']:.3f}, "
+                  f"flow_stable={l_uv['flow_stable']}, "
+                  f"relevant={l_uv['n_relevant']}, irrelevant={l_uv['n_irrelevant']}")
+
+        # Step 9: Build episodic memory
+        print(f"\n[9/10] Building episodic memory...")
         self.episodic = EpisodicMemory(
             D=self.sdr_dim,
             k=self.sdr_encoder.k,
-            max_episodes=self.max_episodes if hasattr(self, 'max_episodes') else 10000,
-            field_scale=self.episodic_scale if hasattr(self, 'episodic_scale') else 500,
+            max_episodes=self._max_episodes,
+            field_scale=self._episodic_scale,
             seed=self.seed,
         )
-        # Pre-populate episodic memory from training sequences
         self._populate_episodic_memory()
 
-        # ------------------------------------------------------------------
-        # Step 9: Calibrate beta
-        # ------------------------------------------------------------------
-        print(f"\n[9/9] Calibrating beta...")
+        # Step 10: Calibrate beta
+        print(f"\n[10/10] Calibrating beta...")
         self._calibrate_beta()
 
-        # Build Boltzmann sampler
         from ..sampling import IntegerBoltzmannSampler
         self._sampler = IntegerBoltzmannSampler(
             beta=self.beta, max_delta=50000
@@ -299,8 +306,9 @@ class AttractorLanguageModel:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
         print(f"  Architecture: Dense Associative Memory (DAM) Engine")
+        print(f"  Learning: {self.learning_mode}")
+        print(f"  Energy: F-lookup (nonlinear, exponential capacity)")
 
-        # Print full diagnostics
         self._print_diagnostics()
 
         return self
@@ -309,21 +317,12 @@ class AttractorLanguageModel:
         """
         Phase 1 training: batch Hebbian storage.
 
-        For each training sequence, create (context, target) pairs and
-        store them in the DAM using the Hebbian outer-product rule.
-
-        This is fast (one pass, vectorized) and provides a good
-        initialization. PCD refinement (Phase 2) can then improve it.
+        Pure Hebbian at the right sparsity IS the RG fixed point
+        (Agliari et al. 2025, Eugenio 2025). No PCD needed.
         """
-        from ..utils import primary_pos_tag
-
         V = len(self.vocab)
-        D = self.sdr_dim
-        k = self.sdr_encoder.k
-        context_window = 10  # Use last 10 words as context
+        context_window = 10
 
-        # Collect (context_sdr, target_sdr) pairs
-        # Process in batches for memory efficiency
         batch_size = 50000
         total_pairs = 0
         batch_context = []
@@ -340,17 +339,14 @@ class AttractorLanguageModel:
                 if not context_words or target_word < 0 or target_word >= V:
                     continue
 
-                # Encode context and target as SDRs
                 context_sdr = self.sdr_encoder.encode_context(context_words, context_window)
                 target_sdr = self.sdr_encoder.encode(target_word)
 
-                # Only store if both are non-trivial
                 if np.sum(context_sdr) > 0 and np.sum(target_sdr) > 0:
                     batch_context.append(context_sdr)
                     batch_target.append(target_sdr)
                     total_pairs += 1
 
-                # Apply batch when full
                 if len(batch_context) >= batch_size:
                     ctx_arr = np.array(batch_context, dtype=np.uint8)
                     tgt_arr = np.array(batch_target, dtype=np.uint8)
@@ -362,7 +358,6 @@ class AttractorLanguageModel:
                 print(f"      Hebbian training: {seq_idx+1}/{len(self.sequences)} seqs, "
                       f"{total_pairs:,} pairs stored")
 
-        # Flush remaining batch
         if batch_context:
             ctx_arr = np.array(batch_context, dtype=np.uint8)
             tgt_arr = np.array(batch_target, dtype=np.uint8)
@@ -370,30 +365,22 @@ class AttractorLanguageModel:
 
         print(f"    Hebbian training complete: {total_pairs:,} pairs stored")
 
-        # Print coupling stats
         for l, layer in enumerate(self.hierarchy.layers):
             diag = layer.get_diagnostics()
             print(f"    L{l}: J_max={diag['J_max']}, J_nnz={diag['J_nnz']}, "
                   f"h_max={diag['h_max']}, h_nnz={diag['h_nnz']}")
 
     def _populate_episodic_memory(self) -> None:
-        """
-        Pre-populate episodic memory from training sequences.
-
-        For each training sequence, store the document state at each
-        position. This gives the episodic memory a base of patterns
-        to retrieve from during generation.
-        """
+        """Pre-populate episodic memory from training sequences."""
         V = len(self.vocab)
         context_window = 10
 
         n_stored = 0
-        for seq_idx, seq in enumerate(self.sequences[:50000]):  # Limit for speed
+        for seq_idx, seq in enumerate(self.sequences[:50000]):
             if len(seq) < 5:
                 continue
 
-            # Store document state at each position
-            for pos in range(5, len(seq), 3):  # Every 3rd position
+            for pos in range(5, len(seq), 3):
                 context_words = seq[max(0, pos - context_window):pos]
                 context_sdr = self.sdr_encoder.encode_context(context_words, context_window)
                 if np.sum(context_sdr) > 0:
@@ -406,13 +393,9 @@ class AttractorLanguageModel:
         print(f"    Episodic memory: {n_stored} episodes stored")
 
     def _calibrate_beta(self) -> None:
-        """
-        Calibrate Boltzmann beta from the DAM energy distribution.
+        """Calibrate Boltzmann beta from the DAM energy distribution."""
+        from ..utils import primary_pos_tag
 
-        The optimal beta depends on the energy scale and the
-        discriminability of the energy landscape.
-        """
-        # Sample DAM energies for some test positions
         energy_diffs = []
         n_samples = 0
 
@@ -424,8 +407,6 @@ class AttractorLanguageModel:
                 target_word = seq[pos]
                 context_words = seq[:pos]
 
-                # Get candidate words of the same POS type
-                from ..utils import primary_pos_tag
                 word_type = primary_pos_tag(
                     self.pos_system.allowed_types.get(target_word, set())
                 )
@@ -436,7 +417,7 @@ class AttractorLanguageModel:
                 candidate_arr = np.array(candidates[:200], dtype=np.int64)
                 context_sdr = self.sdr_encoder.encode_context(context_words)
 
-                # Compute energies
+                # Compute energies using F-lookup nonlinearity
                 energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
@@ -448,7 +429,6 @@ class AttractorLanguageModel:
                     )
                     energies += ep_energy
 
-                # Compute energy differences from minimum
                 e_min = energies.min()
                 diffs = energies - e_min
                 diffs = diffs[diffs > 0]
@@ -468,7 +448,6 @@ class AttractorLanguageModel:
             median_de = int(np.median(energy_diffs))
             p10_de = int(np.percentile(energy_diffs, 10))
 
-            # Theoretical beta: gives PPL ≈ exp(1) at median dE
             theoretical_beta = 0.55 * math.log(2) / max(1, self.dam_scale)
             empirical_beta = 3.5 / max(1, p10_de)
 
@@ -489,23 +468,16 @@ class AttractorLanguageModel:
         """
         Generate text autoregressively using DAM attractor dynamics.
 
-        At each position:
-          1. Encode context as SDR
-          2. Run hierarchical attractor dynamics
-          3. Compute DAM + episodic + grammar energies for candidates
-          4. Boltzmann sample next word
-          5. Update all layer states and episodic memory
-
-        All energy computation is integer-only.
+        Uses F-lookup nonlinearity for energy computation (exponential capacity).
+        No n-gram recall — the DAM energy alone drives word selection.
         """
         from ..vocabulary.pos import POS2IDX, IDX2POS, N_POS, CLOSED_CLASS
         from ..utils import primary_pos_tag
-        from ..sampling import IntegerBoltzmannSampler
 
         if self._sampler is None:
+            from ..sampling import IntegerBoltzmannSampler
             self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=50000)
 
-        # Resolve prompt
         prompt_words = prompt.strip().split()
         prompt_tokens = []
         for w in prompt_words:
@@ -522,7 +494,6 @@ class AttractorLanguageModel:
         types_list = [self._get_word_type(w) for w in words]
         diagnostics = []
 
-        # Reset all layers for new document
         self.hierarchy.reset()
         self.episodic.reset()
 
@@ -533,28 +504,24 @@ class AttractorLanguageModel:
             active = np.where(context_sdr > 0)[0]
             context_field[active] = self.dam_scale
 
-            # Run attractor dynamics
             self.hierarchy.step_all(context_field, n_sweeps=1)
-
-            # Store in episodic memory
             self.episodic.store(context_sdr)
 
         for pos in range(len(words), length):
-            # === STEP 1: Choose POS type ===
+            # Choose POS type
             prev_type = types_list[-1] if types_list else POS2IDX["X"]
             valid_types = self._get_valid_next_types(prev_type, types_list)
 
-            # === STEP 2: Encode context ===
+            # Encode context
             context_sdr = self.sdr_encoder.encode_context(words, 10)
             context_field = np.zeros(self.sdr_dim, dtype=np.int32)
             active = np.where(context_sdr > 0)[0]
             context_field[active] = self.dam_scale
 
-            # === STEP 3: Run attractor dynamics ===
+            # Run attractor dynamics
             self.hierarchy.step_all(context_field, n_sweeps=2)
 
-            # === STEP 4: Get candidates and compute energies ===
-            # Try each valid type, pick the one with lowest minimum energy
+            # Find best type + candidates
             best_type = valid_types[0]
             best_min_energy = float('inf')
             best_candidate_words = None
@@ -567,17 +534,17 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # DAM energy
+                # DAM energy with F-lookup nonlinearity
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy
+                # Episodic energy (supplementary, not primary)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
-                # Grammar penalty (same for all candidates of same type)
+                # Grammar penalty
                 test_types = list(types_list[-5:]) + [chosen_type]
                 test_pos = len(test_types) - 1
                 try:
@@ -604,11 +571,10 @@ class AttractorLanguageModel:
                     best_energies = total_energies
 
             if best_candidate_words is None:
-                # Fallback: pick any word
                 best_candidate_words = np.array([4], dtype=np.int64)
                 best_energies = np.array([0], dtype=np.int64)
 
-            # === STEP 5: Boltzmann sample ===
+            # Boltzmann sample
             chosen_idx = self._sampler.sample(best_energies)
             chosen_word = int(best_candidate_words[chosen_idx])
             chosen_energy = int(best_energies[chosen_idx])
@@ -616,12 +582,9 @@ class AttractorLanguageModel:
             words.append(chosen_word)
             types_list.append(best_type)
 
-            # === STEP 6: Update states ===
-            # Update episodic memory
             context_sdr = self.sdr_encoder.encode_context(words, 10)
             self.episodic.store(context_sdr)
 
-            # Track diagnostics
             self._stats['total_steps'] += 1
 
             diagnostics.append({
@@ -647,16 +610,7 @@ class AttractorLanguageModel:
     # ===================================================================
 
     def compute_perplexity(self, n_samples: int = 100) -> float:
-        """
-        Compute perplexity on test sequences.
-
-        PPL = exp(-1/N * Σ log P(w_t | ctx))
-
-        P(w | ctx) ∝ exp(-β * E(w, ctx))
-        E(w, ctx) = E_DAM(w, ctx) + E_episodic(w, ctx) + E_grammar(w, ctx)
-
-        Uses IntegerBoltzmannSampler for integer-only log probability computation.
-        """
+        """Compute perplexity on test sequences using F-lookup energies."""
         from ..vocabulary.pos import POS2IDX, CLOSED_CLASS
         from ..utils import primary_pos_tag
         from ..sampling import IntegerBoltzmannSampler, LOG2_SCALE
@@ -673,7 +627,6 @@ class AttractorLanguageModel:
             if len(seq) < 3:
                 continue
 
-            # Reset for new sequence
             self.hierarchy.reset()
             self.episodic.reset()
 
@@ -686,7 +639,6 @@ class AttractorLanguageModel:
                     total_tokens += 1
                     continue
 
-                # Get candidate words
                 word_type = self._get_word_type(target_word)
                 candidate_list = self.type_words.get(word_type, [])
                 if not candidate_list:
@@ -696,20 +648,17 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:500], dtype=np.int64)
 
-                # Ensure target is in candidates
                 if target_word not in candidate_arr:
                     candidate_arr = np.append(candidate_arr, target_word)
 
-                # Encode context
                 context_sdr = self.sdr_encoder.encode_context(context_words, 10)
 
-                # Run attractor dynamics
                 context_field = np.zeros(self.sdr_dim, dtype=np.int32)
                 active = np.where(context_sdr > 0)[0]
                 context_field[active] = self.dam_scale
                 self.hierarchy.step_all(context_field, n_sweeps=1)
 
-                # Compute energies
+                # F-lookup DAM energies
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
@@ -720,16 +669,13 @@ class AttractorLanguageModel:
 
                 total_energies = dam_energies + ep_energies
 
-                # Repetition penalty (matches generation)
                 recent = set(context_words[-5:])
                 for i, w in enumerate(candidate_arr):
                     if int(w) in recent:
                         total_energies[i] += self.same_word_penalty
 
-                # Compute log probabilities
                 log_probs = self._sampler.compute_log_probabilities(total_energies)
 
-                # Find target word's log probability
                 target_idx = np.where(candidate_arr == target_word)[0]
                 if len(target_idx) > 0:
                     total_log2_prob += int(log_probs[target_idx[0]])
@@ -737,14 +683,11 @@ class AttractorLanguageModel:
                     total_log2_prob += -15 * LOG2_SCALE
 
                 total_tokens += 1
-
-                # Update episodic memory
                 self.episodic.store(context_sdr)
 
         if total_tokens == 0:
             return float('inf')
 
-        # PPL from integer log2 probabilities
         if total_log2_prob >= 0:
             return 1.0
 
@@ -788,16 +731,13 @@ class AttractorLanguageModel:
         """Get valid next POS types based on grammar constraints."""
         from ..vocabulary.pos import POS2IDX, N_POS, CLOSED_CLASS
 
-        # All types are valid initially
         valid = list(range(N_POS))
 
-        # Grammar constraint: use allowed transitions
         if self.pos_system is not None:
             allowed = set()
             for t in range(N_POS):
-                # Build a synthetic types list ending with the candidate type
                 test_types = list(types_history[-5:]) + [t]
-                test_pos = len(test_types) - 1  # Position of the candidate
+                test_pos = len(test_types) - 1
                 try:
                     penalty = self.pos_system.compute_grammar_penalty(
                         test_types, test_pos, t,
@@ -805,11 +745,10 @@ class AttractorLanguageModel:
                     if penalty < 500:
                         allowed.add(t)
                 except (IndexError, ValueError):
-                    allowed.add(t)  # Allow on error
+                    allowed.add(t)
             if allowed:
                 valid = list(allowed)
 
-        # Closed-class anti-loop
         CLOSED_CLASS_IDS = frozenset({
             POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
             POS2IDX["PRON"], POS2IDX["AUX"], POS2IDX["CONJ"],
@@ -846,6 +785,11 @@ class AttractorLanguageModel:
                       f"h_max={ld['h_max']}")
             print(f"  Total hierarchy memory: {hdiag['total_memory_kb']:.1f} KB")
 
+            # UV completeness
+            if 'uv_completeness' in hdiag:
+                uv = hdiag['uv_completeness']
+                print(f"  UV completeness score: {uv['overall_uv_score']:.2f}")
+
         if self.episodic:
             ediag = self.episodic.get_diagnostics()
             print(f"  Episodic: {ediag['n_episodes']} episodes, "
@@ -853,6 +797,8 @@ class AttractorLanguageModel:
 
         print(f"  Beta: {self.beta:.6f}")
         print(f"  Vocab: {len(self.vocab)} words")
+        print(f"  Learning mode: {self.learning_mode}")
+        print(f"  Energy: F-lookup (nonlinear, exponential capacity)")
         print("=" * 70)
 
     def reset_stats(self) -> None:

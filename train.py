@@ -11,7 +11,9 @@ ARCHITECTURE:
   - RG flow: Wilsonian renormalization group between layers (UV-complete)
   - Episodic memory: Content-addressable sparse pattern storage
   - F-lookup energy: Nonlinear energy function (exponential capacity)
-  - PCD learning: Contrastive divergence for energy landscape sculpting
+  - Hebbian learning: RG fixed point at right sparsity (Agliari 2025)
+  - Coupling-space RG: Wilsonian decimation of J matrices (not spin states)
+  - UV completeness: Cutoff independence + coupling flow stability
 
 Usage:
   python -u train.py                                     # Default: 500K samples
@@ -342,8 +344,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "25.0.0",
-        "architecture": "Attractor Language Machine — Dense Associative Memory Engine with UV-complete Wilsonian RG flow",
+        "version": "27.0.0",
+        "architecture": "Attractor Language Machine v27 — F-lookup DAM + Coupling-space RG + UV completeness + Hebbian fixed point",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
