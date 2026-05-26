@@ -242,11 +242,14 @@ class SDREncoder:
         V = self.vocab_size
         word_sdrs = self.word_sdrs  # (V, D) uint8
 
+        print(f"        [encode_contexts_batch] Starting: {len(sequences)} seqs, "
+              f"D={D}, k={k}, batch_size={batch_size}", flush=True)
+
         batch_ctx = []
         batch_tgt = []
         total_pairs = 0
-        last_progress_time = time.time()
-        progress_interval = 5.0  # Print progress every 5 seconds
+        t_start = time.time()
+        n_seqs_processed = 0
 
         for seq_idx, seq in enumerate(sequences):
             seq_len = len(seq)
@@ -263,12 +266,10 @@ class SDREncoder:
             cumsum = np.cumsum(sdr_stack, axis=0)  # (n, D)
 
             # VECTORIZED: compute ALL context windows at once
-            # positions 1..n-1, each with window [max(0,pos-W):pos]
             positions = np.arange(1, n)
             starts = np.maximum(0, positions - context_window)
 
             # Build (n-1, D) context accumulator array
-            # context_acc[i] = cumsum[positions[i]-1] - cumsum[starts[i]-1] (with boundary)
             context_acc = np.empty((len(positions), D), dtype=np.int32)
             for i, (pos, start) in enumerate(zip(positions, starts)):
                 if start == 0:
@@ -277,19 +278,15 @@ class SDREncoder:
                     context_acc[i] = cumsum[pos - 1] - cumsum[start - 1]
 
             # kWTA for ALL positions at once using 2D argpartition
-            # For each row, find top-k indices
-            nonzero_mask = np.max(context_acc, axis=1) > 0  # (n-1,)
+            nonzero_mask = np.max(context_acc, axis=1) > 0
             n_valid = int(np.sum(nonzero_mask))
             if n_valid == 0:
                 continue
 
-            valid_acc = context_acc[nonzero_mask]  # (n_valid, D)
+            valid_acc = context_acc[nonzero_mask]
+            top_k_all = np.argpartition(valid_acc, -k, axis=1)[:, -k:]
 
-            # 2D argpartition: for each row, find top-k
-            # np.argpartition works row-wise with axis=1
-            top_k_all = np.argpartition(valid_acc, -k, axis=1)[:, -k:]  # (n_valid, k)
-
-            # Build context SDRs: (n_valid, D) uint8
+            # Build context SDRs
             valid_sdrs = np.zeros((n_valid, D), dtype=np.uint8)
             rows = np.arange(n_valid).reshape(-1, 1)
             valid_sdrs[rows, top_k_all] = 1
@@ -304,28 +301,41 @@ class SDREncoder:
             both_nonzero = (ctx_sums > 0) & (tgt_sums > 0)
 
             for i in np.where(both_nonzero)[0]:
-                batch_ctx.append(valid_sdrs[i])
-                batch_tgt.append(word_sdrs[valid_targets[i]])
+                batch_ctx.append(valid_sdrs[i].copy())
+                batch_tgt.append(word_sdrs[int(valid_targets[i])].copy())
                 total_pairs += 1
 
                 if len(batch_ctx) >= batch_size:
+                    print(f"        [encode] Yielding batch of {len(batch_ctx)} pairs "
+                          f"after seq {seq_idx+1}/{len(sequences)} "
+                          f"({time.time()-t_start:.1f}s)", flush=True)
                     ctx_arr = np.array(batch_ctx, dtype=np.uint8)
                     tgt_arr = np.array(batch_tgt, dtype=np.uint8)
                     yield ctx_arr, tgt_arr
                     batch_ctx = []
                     batch_tgt = []
 
-            # Check progress after each sequence
+            n_seqs_processed += 1
+
+            # Progress every 500 sequences or 5 seconds
             now = time.time()
-            if callback and (now - last_progress_time) >= progress_interval:
-                callback(seq_idx + 1, total_pairs)
-                last_progress_time = now
+            if n_seqs_processed % 500 == 0 or (now - t_start) > 5.0:
+                elapsed = now - t_start
+                rate = n_seqs_processed / max(0.1, elapsed)
+                eta = (len(sequences) - seq_idx) / max(1, rate)
+                print(f"        [encode] {n_seqs_processed} seqs, {total_pairs} pairs, "
+                      f"{rate:.0f} seqs/s, ETA {eta:.0f}s", flush=True)
+                t_start = now  # Reset to avoid spamming
+                n_seqs_processed = 0
 
         # Final partial batch
         if batch_ctx:
+            print(f"        [encode] Final batch: {len(batch_ctx)} pairs", flush=True)
             ctx_arr = np.array(batch_ctx, dtype=np.uint8)
             tgt_arr = np.array(batch_tgt, dtype=np.uint8)
             yield ctx_arr, tgt_arr
+
+        print(f"        [encode] Done: {total_pairs} total pairs", flush=True)
 
         if callback:
             callback(len(sequences), total_pairs)

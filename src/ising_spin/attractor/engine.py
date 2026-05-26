@@ -343,6 +343,7 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
+        print(f"    About to start encoding loop...", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
