@@ -26,6 +26,7 @@ Memory (V=2000, D=512, k=10):
   - We use dense uint8 for fast numpy operations → 1 MB
 """
 
+import time
 import numpy as np
 from typing import List, Optional, Tuple
 
@@ -244,6 +245,8 @@ class SDREncoder:
         batch_ctx = []
         batch_tgt = []
         total_pairs = 0
+        last_progress_time = time.time()
+        progress_interval = 10.0  # Print progress every 10 seconds
 
         for seq_idx, seq in enumerate(sequences):
             seq_len = len(seq)
@@ -295,14 +298,22 @@ class SDREncoder:
                     batch_ctx = []
                     batch_tgt = []
 
-            if callback and (seq_idx + 1) % 50000 == 0:
+            # Print progress periodically (time-based, not count-based)
+            now = time.time()
+            if callback and (now - last_progress_time) >= progress_interval:
                 callback(seq_idx + 1, total_pairs)
+                last_progress_time = now
+            elif callback and seq_idx == 0:
+                callback(0, 0)  # First message to show we started
 
         # Final partial batch
         if batch_ctx:
             ctx_arr = np.array(batch_ctx, dtype=np.uint8)
             tgt_arr = np.array(batch_tgt, dtype=np.uint8)
             yield ctx_arr, tgt_arr
+
+        if callback:
+            callback(len(sequences), total_pairs)
 
     def hamming_overlap(self, sdr1: np.ndarray, sdr2: np.ndarray) -> int:
         """

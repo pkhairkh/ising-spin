@@ -170,13 +170,13 @@ class AttractorLanguageModel:
             self._f_type, 'unknown'
         )
 
-        print("=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v28 — DEEP FIXES")
-        print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
-        print("  RG flow: J_eff REPLACES J at higher levels")
-        print("  UV checks: Ward identities + cutoff independence")
-        print("  Learning: Hebbian L0 only, PCD REMOVED")
-        print("=" * 70)
+        print("=" * 70, flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v31 — INLINE PIECEWISE F (NO CLIP)", flush=True)
+        print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
+        print("  RG flow: J_eff REPLACES J at higher levels", flush=True)
+        print("  UV checks: Ward identities + cutoff independence", flush=True)
+        print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
+        print("=" * 70, flush=True)
 
         t0 = time.time()
 
@@ -268,7 +268,7 @@ class AttractorLanguageModel:
         self.hierarchy.build(self.sdr_encoder)
 
         # Step 7: Batch Hebbian training (L0 only, then RG flow)
-        print(f"\n[7/9] Batch Hebbian training (L0 only, then RG flow)...")
+        print(f"\n[7/9] Batch Hebbian training (L0 only, then RG flow)...", flush=True)
         self._batch_hebbian_train()
 
         # Step 8: Check UV completeness
@@ -307,7 +307,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v28")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v31")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: F-lookup ({f_type_name}, exponential capacity)")
@@ -331,27 +331,43 @@ class AttractorLanguageModel:
         total_pairs = 0
         n_seqs = len(self.sequences)
 
-        print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...")
+        # Adaptive batch size: D=4096 with 50K pairs = 4096*50K*4bytes = 800MB per array
+        # Reduce batch size for large D to keep memory manageable
+        if self.sdr_dim >= 4096:
+            hebbian_batch = 2000  # ~32MB per array at D=4096
+        elif self.sdr_dim >= 2048:
+            hebbian_batch = 5000
+        else:
+            hebbian_batch = 50000
+
+        print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
+        print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
+              flush=True)
 
         def progress_callback(seq_idx, total):
-            print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded")
+            print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
+                  flush=True)
 
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
             self.sequences,
             context_window=context_window,
-            batch_size=50000,
+            batch_size=hebbian_batch,
             callback=progress_callback,
         ):
             batch_n = ctx_arr.shape[0]
             total_pairs += batch_n
+            t_batch = time.time()
             # defer_rg=True: skip RG flow per batch — compute once at the end
             self.hierarchy.train_l0_hebbian(ctx_arr, tgt_arr, eta=1, defer_rg=True)
+            t_batch = time.time() - t_batch
             print(f"      Hebbian batch: {batch_n:,} pairs stored "
-                  f"(total: {total_pairs:,})")
+                  f"(total: {total_pairs:,}) [{t_batch:.1f}s]", flush=True)
 
         # Compute RG flow ONCE after all Hebbian batches
-        print(f"    Computing RG flow from L0 to all higher levels...")
+        print(f"    Computing RG flow from L0 to all higher levels...", flush=True)
+        t_rg = time.time()
         self.hierarchy.finalize_rg_flow()
+        print(f"    RG flow computed in {time.time()-t_rg:.1f}s", flush=True)
 
         print(f"    Hebbian training complete: {total_pairs:,} pairs stored")
         print(f"    RG flow applied to all higher levels: {self.hierarchy._rg_applied}")
@@ -765,7 +781,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v28 — DEEP FIX DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v31 — INLINE PIECEWISE F DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
