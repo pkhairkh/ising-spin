@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v41 — Training Script
+Attractor Language Machine v42 — Training Script
 
-v41: PPL EVAL FIX
+v42: BINDING RECENCY WEIGHTING + DIAGNOSTIC FIX
+  - Binding _rebuild(): recency-weighted accumulator — newer bindings contribute
+    more to kWTA selection. Weight: oldest=1, newest=W (linear ramp).
+    Most recent bigram is most predictive, so its bits survive kWTA.
+  - Diagnostic bug fix: get_diagnostics() now reports CONFIGURED window (8)
+    and target_density (20), not runtime deque length and actual density.
+    v41 showed window=1, density=10 because diagnostics were printed after
+    _calibrate_beta() left the deque with only 1-2 entries.
+  - Binding context reset after calibration — no more residue in diagnostics.
+
+v41 PPL eval fix preserved:
   - Repetition penalty removed from compute_perplexity().
-    v40 BUG: Applying same_word_penalty=800 during PPL evaluation inflated PPL
-    from 248 → 450 by penalizing correct target words that naturally repeat
-    (e.g., predicting 2nd "little" in "the little girl saw a little cat").
-    The repetition penalty is a GENERATION-TIME anti-loop mechanism only.
+    v40 BUG: same_word_penalty=800 during PPL evaluation inflated PPL 248→450.
+    The repetition penalty is GENERATION-TIME only.
 
 v40 generation quality fixes preserved:
-  - Repetition penalty: same_word_penalty=800, window=15, distance-decay (generation only)
-  - Grammar penalty: scaled to ~33% of median_dE (was ~5%)
+  - Repetition penalty: same_word_penalty=800, window=15, distance-decay
+  - Grammar penalty: scaled to ~33% of median_dE
   - Special token filter: idx < 4 excluded from candidates
   - PUNCT grammar: NO_DOUBLE_PUNCT + PUNCT_OPEN + PUNCT in CLOSED_CLASS_IDS
 
-v38 compositional binding preserved:
+v39 compositional binding preserved:
   - VSA binding context (BindingContext) encodes bigram order
   - Binding: bind(a, b) = rot(a, hash(b)) — non-commutative, all integer
   - hash(b) = sum(active_bits_of_b) mod D — full [0, D-1] spread
@@ -156,7 +164,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v38 — COMPOSITIONAL BINDING"
+        description="Attractor Language Machine v42 — BINDING RECENCY + DIAG FIX"
     )
 
     # Core parameters
@@ -237,7 +245,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v41 — PPL EVAL FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v42 — BINDING RECENCY + DIAG FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -254,14 +262,14 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v41 (PPL EVAL FIX)")
+    print(f"CONFIG: Attractor Language Machine v42 (BINDING RECENCY + DIAG FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v39 preserved):")
+    print(f"  BINDING (v42: recency-weighted kWTA):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
@@ -269,6 +277,7 @@ def main():
     print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
     print(f"    M_bind: attractor dynamics ONLY (not DAM energy)")
     print(f"    M_bind density: {2*int(args.sdr_dim * args.sdr_sparsity)} bits ({2*int(args.sdr_dim * args.sdr_sparsity)*100/args.sdr_dim:.1f}%)")
+    print(f"    Recency: linear ramp weight (oldest=1, newest={args.bind_window})")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -276,7 +285,7 @@ def main():
     print(f"  ENERGY SCALES:")
     print(f"    DAM scale={args.dam_scale}")
     print(f"    Episodic scale={args.episodic_scale}")
-    print(f"    Same-word penalty={args.same_word_penalty} (v40: NOW ACTUALLY USED!)")
+    print(f"    Same-word penalty={args.same_word_penalty} (generation only, not PPL)")
     print(f"    Repetition window=15, distance-decay (v40 fix)")
     print(f"    Grammar penalty scaled to ~33% median_dE (v40 fix)")
     print(f"    Special tokens (idx<4) filtered from candidates (v40 fix)")
@@ -397,8 +406,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "41.0.0",
-        "architecture": "Attractor Language Machine v41 — PPL eval fix (repetition penalty removed from compute_perplexity, was inflating PPL 248→450), generation quality fix (repetition penalty=800 distance-decay window=15, grammar penalty ~33% dE, special tokens filtered, PUNCT grammar constraints), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
+        "version": "42.0.0",
+        "architecture": "Attractor Language Machine v42 — binding recency weighting (v42: kWTA accumulator uses linear ramp oldest=1/newest=W so recent bigrams dominate), diagnostic fix (v42: get_diagnostics reports configured window/density not runtime state, reset binding after calibration), PPL eval fix (v41: repetition penalty removed from compute_perplexity), generation quality fix (v40: repetition penalty=800 distance-decay window=15, grammar penalty ~33% dE, special tokens filtered, PUNCT constraints), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -440,7 +449,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v41")
+    print(f"DONE — Attractor Language Machine v42")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

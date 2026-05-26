@@ -302,22 +302,32 @@ class BindingContext:
     def _rebuild(self) -> None:
         """Rebuild M_bind from current binding window with kWTA.
 
-        OR-superposition: each binding contributes k active bits.
-        With W=8 bindings, raw OR has up to 8*k = 80 active bits.
+        OR-superposition with recency weighting: each binding contributes
+        k active bits. With W=8 bindings, raw OR has up to 8*k = 80 bits.
         kWTA reduces to target_density = 2*k = 20 bits (~4% density).
 
-        Bits that appear in multiple bindings get higher accumulator
-        values and are preferentially kept by kWTA. This means
-        frequently-occurring bigram patterns are preserved even
-        under sparsification — emergent phrase-level structure.
+        v42: Recency weighting — more recent bindings get higher accumulator
+        weight. The most recent bigram is usually the most predictive for
+        the next word, so we want its bits to survive kWTA preferentially.
+        Weight: oldest=1, newest=W (linear ramp). This means recent bindings
+        contribute up to Wx more to the accumulator than old ones.
+
+        Bits that appear in multiple bindings (especially recent ones) get
+        higher accumulator values and are preferentially kept by kWTA.
+        This means frequently-occurring AND recent bigram patterns are
+        preserved even under sparsification — emergent phrase-level structure
+        with temporal focus.
         """
         self._acc = np.zeros(self.D, dtype=np.int32)
 
-        for bound_bits in self._bindings:
+        n_bindings = len(self._bindings)
+        for i, bound_bits in enumerate(self._bindings):
+            # v42: Recency weighting — newer bindings contribute more
+            recency_weight = i + 1  # oldest=1, newest=n_bindings
             for b in bound_bits:
                 idx = int(b)
                 if 0 <= idx < self.D:
-                    self._acc[idx] += 1
+                    self._acc[idx] += recency_weight
 
         # kWTA: keep top target_density bits
         if np.max(self._acc) > 0:
@@ -430,13 +440,21 @@ class BindingContext:
         return (context_sdr | self.M_bind).astype(np.uint8)
 
     def get_diagnostics(self) -> dict:
-        """Return binding context diagnostics."""
+        """Return binding context diagnostics.
+
+        v42: Reports BOTH configured parameters and runtime state.
+        - window: CONFIGURED capacity (e.g., 8)
+        - window_fill: CURRENT number of bindings in deque
+        - target_density: CONFIGURED kWTA target (e.g., 20)
+        - m_bind_density: CURRENT active bits in M_bind
+        """
         return {
             'n_bindings': self._n_bindings,
-            'window_size': len(self._bindings),
+            'window': self.window,                    # CONFIGURED capacity (8)
+            'window_fill': len(self._bindings),       # current fill level
             'n_recent_words': len(self._recent_words),
-            'm_bind_density': int(np.sum(self.M_bind)),
-            'target_density': self.target_density,
+            'target_density': self.target_density,      # CONFIGURED kWTA target (20)
+            'm_bind_density': int(np.sum(self.M_bind)), # current active bits
             'bind_weight': self.bind_weight,
             'n_unbind_words': self.n_unbind_words,
             'has_last_word': self._last_word_bits is not None,
