@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v54 — Training Script
+Attractor Language Machine v57 — Training Script
 
-v54: POS-DRIVEN GENERATION — fix generation word salad via architectural fix
-  - v52/v53 achieved PPL=13.06 (great!) with positional VSA context, but generation
-    was still word salad — same as v50 (PPL=16.65) and v51 (PPL=27.73).
-  - ROOT CAUSE: During generation, the model iterated over MULTIPLE POS types,
-    picking the type with the lowest-energy word. This allowed the DAM to
-    override syntactically correct type sequences with low-energy hub words
-    ("keep", "been", "must") of the WRONG type. After "there was", VERB's
-    "keep" won over DET's "a" because "keep" had lower DAM energy.
-  - v54 FIX: Two fundamental changes (all generation-only, PPL unchanged):
-    1. HARD POS TYPE SELECTION: The POS trigram model picks EXACTLY ONE type
-       per position. The DAM only chooses WHICH word of that type. This
-       eliminates the type-selection error cascade that caused word salad.
-    2. BIGRAM-DOMINANT GENERATION: bigram_gen_weight=64 (vs 16 for PPL)
-       makes bigram energy (max 1024) >> DAM dE (~407), so the model
-       follows bigram chains faithfully. Skip bigram boosted to 24.
-       The bigram model only depends on the previous word, which is always
-       correct — making it far more reliable than the DAM during generation.
-    3. BIGRAM PRE-FILTERING: Before computing expensive DAM energies,
-       pre-filter candidates to top-50 by bigram score. This prevents the
-       DAM from selecting implausible bigram candidates.
-  - PPL should be unchanged from v52/v53's 13.06 (all changes are generation-only).
-  - Expected generation: Coherent POS sequences (DET→ADJ→NOUN, NOUN→VERB)
-    with bigram-faithful word choice within each type.
+v57: DYNAMIC GENERATION — give the model expression room to settle things
+  - v54-v56 used a hard cascade: POS trigram picks ONE type → bigram
+    pre-filter top-50 → DAM picks word within that corridor. This created
+    narrow corridors with no escape from loops.
+  - ROOT CAUSE: Hard POS gates and bigram pre-filters are too static.
+    Language doesn't work as a cascade — "the" doesn't DECIDE the next
+    word is a noun, it BIAS toward nouns. The model needs room to let
+    multiple pressures compete dynamically.
+  - v57 FIX: Replace hard cascade with soft energy landscape:
+    1. ALL words compete — no hard POS type gate. POS trigram is a SOFT
+       energy bias, not a hard gate. Words of the favored type get a bonus,
+       others get nothing (but are not excluded).
+    2. No bigram pre-filtering — bigram is just an energy term that strongly
+       biases but doesn't gate. A word with mediocre bigram but very low
+       DAM energy can still win.
+    3. Two-stage ranking for efficiency:
+       Stage 1 (COARSE): Cheap energies (bigram + skip + POS + freq + grammar)
+         for ALL words → top-200 candidates
+       Stage 2 (FINE): Expensive energies (DAM + episodic + binding) for
+         top-200 → top-10 → Boltzmann sample
+  - PPL should be unchanged from v54's 13.06 (all changes are generation-only).
+  - Falls back to v54 hard cascade with --no-dynamic-gen.
 
 Architecture: D=512, 50K samples, Hebbian L0
 
 Usage:
-  python -u train.py                                     # Default: 50K samples
-  python -u train.py --samples 100000                    # 100K samples
-  python -u train.py --memory-budget 14000               # Pi 5 (16GB)
-  python -u train.py --same-word-penalty 1200          # Stronger repetition suppression
-  python -u train.py --bigram-weight 8                   # Lighter bigram
-  python -u train.py --bigram-gen-weight 64              # Stronger generation bigram (v54)
-  python -u train.py --skip-gen-weight 24                # Stronger generation skip (v54)
-  python -u train.py --skip-weight 0                     # Disable skip bigram
-  python -u train.py --pos-weight 0                      # Disable POS skeleton
+  python -u train.py                                     # Default: 50K samples, dynamic gen
+  python -u train.py --no-dynamic-gen                    # v54 hard cascade fallback
+  python -u train.py --gen-coarse-k 300                  # More candidates in coarse stage
+  python -u train.py --bigram-gen-weight 32              # Lighter bigram (more DAM influence)
+  python -u train.py --pos-gen-weight 20                 # Stronger POS type bias
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -155,7 +150,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v54 — POS-DRIVEN GENERATION"
+        description="Attractor Language Machine v57 — DYNAMIC GENERATION"
     )
 
     # Core parameters
@@ -241,11 +236,16 @@ def main():
     parser.add_argument("--pos-type-top-k", type=int, default=3,
                         help="Number of top POS types to consider during generation (default: 3)")
     # Bigram generation weight (v54: generation-only bigram boost)
-    parser.add_argument("--bigram-gen-weight", type=int, default=64,
-                        help="Bigram coupling weight during generation (default: 64, 0=same as bigram-weight)")
+    parser.add_argument("--bigram-gen-weight", type=int, default=32,
+                        help="Bigram coupling weight during generation (default: 32 for dynamic gen, 64 for v54 cascade)")
     # Skip bigram generation weight (v54: generation-only skip boost)
-    parser.add_argument("--skip-gen-weight", type=int, default=24,
-                        help="Skip bigram weight during generation (default: 24, 0=same as skip-weight)")
+    parser.add_argument("--skip-gen-weight", type=int, default=16,
+                        help="Skip bigram weight during generation (default: 16 for dynamic gen, 24 for v54 cascade)")
+    # Dynamic generation (v57)
+    parser.add_argument("--no-dynamic-gen", action="store_true", default=False,
+                        help="Disable dynamic generation, use v54 hard POS cascade instead")
+    parser.add_argument("--gen-coarse-k", type=int, default=200,
+                        help="Number of candidates passing coarse stage in dynamic gen (default: 200)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -263,7 +263,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v54 — POS-DRIVEN GENERATION", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v57 — DYNAMIC GENERATION", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -279,8 +279,10 @@ def main():
     # --- Config ---
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
+    dynamic_gen = not args.no_dynamic_gen
+
     print(f"""{'=' * 70}
-CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
+CONFIG: Attractor Language Machine v57 (DYNAMIC GENERATION)
   ARCHITECTURE:
     SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)
     Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)
@@ -303,19 +305,20 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
     Energy: E_bigram(c) = -J2[prev_word, c] * weight
     Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}
     Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB
-  POS SKELETON (v54: hard type selection during generation):
+  POS SKELETON:
     J_pos_bi: 13×13 POS bigram transitions, log2(count+1)
     J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)
     PPL weight: {args.pos_weight}{' (DISABLED for PPL)' if args.pos_weight == 0 else ''}
-    Gen bonus weight: {args.pos_gen_weight} (generation-only energy bonus)
-    Type pre-selection: top-{args.pos_type_top_k} most likely types (hard filter during generation)
+    Gen bonus weight: {args.pos_gen_weight} ({'soft bias in dynamic gen' if dynamic_gen else 'hard type gate in v54 cascade'})
     Backoff: trigram → bigram (75% weight) when trigram count=0
     Memory: ~10 KB (trivial)
-  POS-DRIVEN GENERATION (v54: generation-only, PPL unchanged):
-    Hard POS type selection: YES (POS trigram picks ONE type per position)
-    Bigram gen weight: {args.bigram_gen_weight}{' (=bigram_weight)' if args.bigram_gen_weight == 0 else ''} (generation-only, v54)
-    Skip gen weight: {args.skip_gen_weight}{' (=skip_weight)' if args.skip_gen_weight == 0 else ''} (generation-only, v54)
-    Bigram pre-filtering: top-50 candidates by bigram score
+  {'DYNAMIC GENERATION (v57: soft POS, no hard gates):' if dynamic_gen else 'V54 HARD CASCADE (dynamic gen disabled):'}
+    {'ALL words compete — no hard POS type gate, no bigram pre-filter' if dynamic_gen else 'POS trigram picks ONE type → bigram pre-filter top-50'}
+    {'POS type bonus is soft: favored type gets energy bonus, others get nothing' if dynamic_gen else 'POS type is hard gate: only words of chosen type are candidates'}
+    {'Two-stage: coarse (cheap energies, all V words → top-' + str(args.gen_coarse_k) + ') → fine (DAM + binding)' if dynamic_gen else 'Single-stage: DAM + bigram within chosen type'}
+    Bigram gen weight: {args.bigram_gen_weight}{' (=bigram_weight)' if args.bigram_gen_weight == 0 else ''}
+    Skip gen weight: {args.skip_gen_weight}{' (=skip_weight)' if args.skip_gen_weight == 0 else ''}
+    Freq penalty: {args.freq_penalty}{' (DISABLED)' if args.freq_penalty == 0 else ''}
     Sentence boundary reset: YES (reset hierarchy after periods)
   F FUNCTION:
     Type: {args.f_type}
@@ -323,7 +326,7 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
     DAM scale={args.dam_scale}
     Episodic scale={args.episodic_scale}
     Same-word penalty={args.same_word_penalty} (generation only, not PPL)
-    Generation: top-k=10 + Boltzmann + POS-driven + bigram-dominant (v54)
+    Generation: top-k=10 + Boltzmann + {'dynamic (soft POS, no hard gates)' if dynamic_gen else 'POS-driven + bigram-dominant (v54)'}
     Repetition window=15, distance-decay (v40 fix)
     Grammar penalty scaled to ~33% median_dE (v40 fix)
     Special tokens (idx<4) filtered from candidates (v40 fix)
@@ -375,6 +378,8 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
         pos_type_top_k=args.pos_type_top_k,
         bigram_gen_weight=args.bigram_gen_weight,
         skip_gen_weight=args.skip_gen_weight,
+        dynamic_gen=dynamic_gen,
+        gen_coarse_k=args.gen_coarse_k,
         seed=42,
     )
 
@@ -452,8 +457,8 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
 
     # --- Save Results ---
     results = {
-        "version": "54.0.0",
-        "architecture": "Attractor Language Machine v54 — POS-DRIVEN GENERATION (v54: hard POS type selection, bigram_gen_weight={bgw}, skip_gen_weight={sgw}; v53: POS type pre-selection top-3, POS gen bonus weight={pgw}, frequency penalty weight={fpw}, sentence boundary reset; v52: positional VSA context encoding; bigram J2 weight={bw}, skip weight={sw}, POS PPL weight={pw}, bind weight={bind_w}, top-k=10)".format(bgw=args.bigram_gen_weight, sgw=args.skip_gen_weight, pgw=args.pos_gen_weight, fpw=args.freq_penalty, bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
+        "version": "57.0.0",
+        "architecture": "Attractor Language Machine v57 — DYNAMIC GENERATION (v57: soft POS, no hard gates, coarse_k={ck}; v54: bigram_gen_weight={bgw}, skip_gen_weight={sgw}; v53: POS gen bonus weight={pgw}, frequency penalty weight={fpw}, sentence boundary reset; v52: positional VSA context encoding; bigram J2 weight={bw}, skip weight={sw}, POS PPL weight={pw}, bind weight={bind_w}, top-k=10)".format(ck=args.gen_coarse_k, bgw=args.bigram_gen_weight, sgw=args.skip_gen_weight, pgw=args.pos_gen_weight, fpw=args.freq_penalty, bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -480,6 +485,8 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
             "pos_type_top_k": args.pos_type_top_k,
             "bigram_gen_weight": args.bigram_gen_weight,
             "skip_gen_weight": args.skip_gen_weight,
+            "dynamic_gen": dynamic_gen,
+            "gen_coarse_k": args.gen_coarse_k,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -504,7 +511,7 @@ CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v54")
+    print(f"DONE — Attractor Language Machine v57")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
