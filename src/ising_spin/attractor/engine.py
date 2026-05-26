@@ -101,8 +101,8 @@ class AttractorLanguageModel:
         bind_weight: int = 30,
         n_unbind_words: int = 3,
         bind_density: int = 0,  # 0 = auto (2*k=20)
-        # Bigram DAM (v48)
-        bigram_weight: int = 0,  # 0 = disabled
+        # Bigram DAM (v49)
+        bigram_weight: int = 0,  # 0 = disabled; v49 default in train.py is 8
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -135,7 +135,7 @@ class AttractorLanguageModel:
 
         # Built during training
         self.vocab = None
-        self.J2 = None  # v48: Bigram coupling matrix (V, V) int32
+        self.J2 = None  # v49: Bigram coupling matrix (V, V) int32, log-normalized
         self.pos_system = None
         self.sdr_encoder: Optional[SDREncoder] = None
         self.hierarchy: Optional[HierarchicalDAM] = None
@@ -186,15 +186,15 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v48 — BIGRAM DAM", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v49 — LOG BIGRAM", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
         print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
-        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''}", flush=True)
-        print("  Training: BOW-only DAM + bigram J2 (exact n-gram, not VSA)", flush=True)
+        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)", flush=True)
+        print("  Training: BOW-only DAM + log-normalized bigram J2", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -346,7 +346,7 @@ class AttractorLanguageModel:
 
         from ..sampling import IntegerBoltzmannSampler
         self._sampler = IntegerBoltzmannSampler(
-            beta=self.beta, max_delta=5000
+            beta=self.beta, max_delta=50000  # v49: increased from 5000 for bigger dE range
         )
 
         t_total = time.time() - t0
@@ -356,15 +356,15 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v48")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v49")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
         print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
-        print(f"  v48: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''}")
-        print(f"  v48: BOW DAM + exact bigram coupling (replaces lossy VSA binding for order)")
+        print(f"  v49: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)")
+        print(f"  v49: BOW DAM + log-normalized bigram coupling (fixes v48 loop bug)")
 
         self._print_diagnostics()
 
@@ -405,13 +405,13 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v48: Using BOW-ONLY context encoding (same as v44)", flush=True)
+        print(f"    v49: Using BOW-ONLY context encoding (same as v44)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v48: BOW-only context encoding (same as v44).
+        # v49: BOW-only context encoding (same as v44).
         # Bigram order is captured by J2 (separate energy term), not by
         # contaminating the BOW DAM's J matrix.
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
@@ -455,24 +455,28 @@ class AttractorLanguageModel:
                 print(f"    RG beta L{l}->L{l+1}: {self.hierarchy.rg_beta[l]:.4f}")
 
     def _build_bigram_j2(self) -> None:
-        """v48: Build bigram coupling matrix J2 from training sequences.
+        """v49: Build log-normalized bigram coupling matrix J2.
 
-        J2[prev_word, candidate_word] = count of times candidate follows prev.
-        This is an EXACT integer bigram model — no VSA compression loss.
+        J2[prev_word, candidate_word] = log2(count+1) of times candidate follows prev.
+        This compresses the dynamic range from [0, ~87570] to [0, ~16],
+        making bigram energy comparable to DAM dE instead of dominating it.
 
-        Memory: V*V * 4 bytes = 2005*2005*4 ≈ 16 MB (acceptable on Pi 5).
+        v48 BUG: Raw counts gave max_count=87570 × weight=5 = 437850 energy,
+        completely dominating dE (51768 vs DAM's 122). This caused generation
+        loops: "there was a time" repeated forever because the bigram chain
+        was unbreakable. Repetition penalty of 800 was invisible on dE=51768.
 
-        The bigram energy is:
-          E_bigram(c) = -J2[prev_word, c] * bigram_weight
-        where bigram_weight scales the bigram signal to be comparable to
-        the DAM's dE scale.
+        v49 FIX: log2(count+1) compression:
+          - count=1 → log2(2)=1, count=10→3.5, count=100→6.7,
+            count=1000→10, count=87570→16.4
+          - Range [0,16] × weight=8 = max bigram energy ~128
+          - Comparable to DAM dE=122 → bigram is significant but not dominant
+          - Repetition penalty 800 is now 4x dE → effective anti-loop
 
-        Key insight: VSA binding was LOSSY (kWTA compression loses info,
-        unbinding is approximate). J2 is EXACT — every bigram count is
-        preserved. This makes it a much more reliable order signal.
+        Memory: V*V * 4 bytes = 2005*2005*4 ≈ 16 MB (same as v48).
         """
         V = len(self.vocab)
-        J2 = np.zeros((V, V), dtype=np.int32)
+        J2_raw = np.zeros((V, V), dtype=np.int64)
 
         n_bigrams = 0
         for seq in self.sequences:
@@ -480,26 +484,35 @@ class AttractorLanguageModel:
                 prev_w = seq[i]
                 next_w = seq[i + 1]
                 if 0 <= prev_w < V and 0 <= next_w < V:
-                    J2[prev_w, next_w] += 1
+                    J2_raw[prev_w, next_w] += 1
                     n_bigrams += 1
 
-        self.J2 = J2
-        j2_nnz = int(np.sum(J2 > 0))
-        j2_max = int(np.max(J2))
-        j2_mem_mb = J2.nbytes / (1024 * 1024)
-        print(f"    Bigram J2: {n_bigrams:,} bigrams, {j2_nnz:,} non-zero entries, "
-              f"max_count={j2_max}, memory={j2_mem_mb:.1f} MB")
+        # v49: Log-normalize counts → compress dynamic range
+        # log2(count+1): count=0→0, count=1→1, count=87570→16.4
+        J2_log = np.log2(J2_raw.astype(np.float64) + 1.0).astype(np.int32)
+
+        self.J2 = J2_log
+        self._j2_raw_max = int(np.max(J2_raw))  # Store for diagnostics
+        j2_nnz = int(np.sum(J2_log > 0))
+        j2_log_max = int(np.max(J2_log))
+        j2_mem_mb = J2_log.nbytes / (1024 * 1024)
+        print(f"    Bigram J2 (v49 LOG-normalized): {n_bigrams:,} bigrams, "
+              f"{j2_nnz:,} non-zero entries, raw_max={self._j2_raw_max}, "
+              f"log_max={j2_log_max}, memory={j2_mem_mb:.1f} MB")
 
     def _compute_bigram_energy(
         self,
         prev_word: int,
         candidate_words: np.ndarray,
     ) -> np.ndarray:
-        """v48: Compute bigram energy bonus for each candidate word.
+        """v49: Compute bigram energy bonus for each candidate word.
 
         E_bigram(c) = -J2[prev_word, c] * bigram_weight
 
-        Higher bigram count → more negative energy → more likely.
+        v49: J2 now stores log2(count+1), not raw count.
+        Range [0, ~16] × weight → max bigram energy ~128 (comparable to DAM dE=122).
+
+        Higher log-count → more negative energy → more likely.
         Zero count → zero bonus (no penalty, just no help).
 
         This is O(n_candidates) — just a lookup per candidate.
@@ -513,8 +526,8 @@ class AttractorLanguageModel:
         energies = np.zeros(len(candidate_words), dtype=np.int64)
 
         if np.any(valid_mask):
-            bigram_counts = self.J2[prev_word, candidate_words[valid_mask]]
-            energies[valid_mask] = -(bigram_counts.astype(np.int64) * self._bigram_weight)
+            bigram_log_counts = self.J2[prev_word, candidate_words[valid_mask]]
+            energies[valid_mask] = -(bigram_log_counts.astype(np.int64) * self._bigram_weight)
 
         return energies
 
@@ -692,7 +705,7 @@ class AttractorLanguageModel:
 
         if self._sampler is None:
             from ..sampling import IntegerBoltzmannSampler
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=5000)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=50000)
 
         prompt_words = prompt.strip().split()
         prompt_tokens = []
@@ -825,8 +838,11 @@ class AttractorLanguageModel:
                 # window=15 words, distance-based decay (closer = stronger).
                 # v39 BUG: same_word_penalty=800 was dead code — actual penalty was
                 # median_de//5 = 24, negligible on dE scale of 200-300.
+                # v49: Scale rep_base to be at least 4x median_dE — ensures
+                # penalty is always effective regardless of energy scale.
                 rep_window = 15
-                rep_base = self.same_word_penalty  # 800 by default
+                median_de = max(1, getattr(self, '_median_de', 10))
+                rep_base = max(self.same_word_penalty, median_de * 4)
                 recent_words = words[-rep_window:]
                 for i, w in enumerate(candidate_arr):
                     w_int = int(w)
@@ -910,7 +926,7 @@ class AttractorLanguageModel:
         from ..sampling import IntegerBoltzmannSampler, LOG2_SCALE
 
         if self._sampler is None:
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=5000)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=50000)
 
         total_log2_prob = 0
         total_tokens = 0
@@ -1099,7 +1115,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v48 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v49 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -1147,13 +1163,15 @@ class AttractorLanguageModel:
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
 
-        # v48: Bigram J2 diagnostics
+        # v49: Bigram J2 diagnostics (log-normalized)
         if self.J2 is not None:
             j2_nnz = int(np.sum(self.J2 > 0))
-            j2_max = int(np.max(self.J2))
+            j2_log_max = int(np.max(self.J2))
             j2_mem_mb = self.J2.nbytes / (1024 * 1024)
-            print(f"  Bigram J2: {j2_nnz:,} non-zero, max_count={j2_max}, "
-                  f"weight={self._bigram_weight}, memory={j2_mem_mb:.1f} MB")
+            raw_max = getattr(self, '_j2_raw_max', '?')
+            print(f"  Bigram J2 (LOG): {j2_nnz:,} non-zero, log_max={j2_log_max}, "
+                  f"raw_max={raw_max}, weight={self._bigram_weight}, "
+                  f"max_energy={j2_log_max * self._bigram_weight}, memory={j2_mem_mb:.1f} MB")
         else:
             print(f"  Bigram J2: disabled (weight=0)")
 
