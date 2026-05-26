@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v40 — Training Script
+Attractor Language Machine v41 — Training Script
 
-v40: GENERATION QUALITY FIX
-  - Repetition penalty FIXED: same_word_penalty=800 now actually used (was dead code!)
-    v39 BUG: actual penalty was median_de//5 = 24, negligible on dE scale of 200-300.
-    v40: Uses same_word_penalty=800 with distance-based decay, window=15 words.
-  - Grammar penalty FIXED: now scales to ~33% of median_dE (was ~5%).
-    v39 used 500//median_de as divisor, making penalty ~15 — too weak to matter.
-  - Special token filter: idx < 4 (PAD, UNK, BOS, EOS) excluded from candidates.
-    v39 allowed UNK (idx=1) to be generated, causing <UNK> spam.
-  - Sampler max_delta increased from 2000 to 5000 for wider energy range coverage.
+v41: PPL EVAL FIX
+  - Repetition penalty removed from compute_perplexity().
+    v40 BUG: Applying same_word_penalty=800 during PPL evaluation inflated PPL
+    from 248 → 450 by penalizing correct target words that naturally repeat
+    (e.g., predicting 2nd "little" in "the little girl saw a little cat").
+    The repetition penalty is a GENERATION-TIME anti-loop mechanism only.
+
+v40 generation quality fixes preserved:
+  - Repetition penalty: same_word_penalty=800, window=15, distance-decay (generation only)
+  - Grammar penalty: scaled to ~33% of median_dE (was ~5%)
+  - Special token filter: idx < 4 excluded from candidates
+  - PUNCT grammar: NO_DOUBLE_PUNCT + PUNCT_OPEN + PUNCT in CLOSED_CLASS_IDS
 
 v38 compositional binding preserved:
   - VSA binding context (BindingContext) encodes bigram order
@@ -234,7 +237,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v40 — GENERATION QUALITY FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v41 — PPL EVAL FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -251,7 +254,7 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v40 (GENERATION QUALITY FIX)")
+    print(f"CONFIG: Attractor Language Machine v41 (PPL EVAL FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
@@ -394,8 +397,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "40.0.0",
-        "architecture": "Attractor Language Machine v40 — generation quality fix (repetition penalty FIXED same_word_penalty=800 now used, grammar penalty scaled to ~33% dE, special tokens filtered from candidates, sampler max_delta=5000), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
+        "version": "41.0.0",
+        "architecture": "Attractor Language Machine v41 — PPL eval fix (repetition penalty removed from compute_perplexity, was inflating PPL 248→450), generation quality fix (repetition penalty=800 distance-decay window=15, grammar penalty ~33% dE, special tokens filtered, PUNCT grammar constraints), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -437,7 +440,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v40")
+    print(f"DONE — Attractor Language Machine v41")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

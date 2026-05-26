@@ -180,7 +180,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v40 — GENERATION QUALITY FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v41 — PPL EVAL FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -335,7 +335,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v40")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v41")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
@@ -846,17 +846,13 @@ class AttractorLanguageModel:
                     )
                     total_energies += bind_energy
 
-                # v40: Repetition penalty — use same_word_penalty with distance decay
-                rep_window = 15
-                rep_base = self.same_word_penalty
-                recent_words = list(context_words[-rep_window:])
-                for i, w in enumerate(candidate_arr):
-                    w_int = int(w)
-                    for d, rw in enumerate(reversed(recent_words)):
-                        if w_int == rw:
-                            decay = max(1, rep_window - d)
-                            total_energies[i] += (rep_base * decay) // rep_window
-                            break
+                # v41: Repetition penalty REMOVED from PPL evaluation.
+                # The repetition penalty is a generation-time anti-loop mechanism.
+                # Applying it during PPL evaluation artificially inflates PPL by
+                # penalizing correct target words that naturally repeat in text
+                # (e.g., "the little girl saw a little cat" — predicting 2nd "little"
+                # gets +800 penalty on dE scale of 122 = 6.5x overkill).
+                # v40 PPL regression: 248 → 450 was entirely caused by this.
 
                 log_probs = self._sampler.compute_log_probabilities(total_energies)
 
@@ -962,7 +958,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v40 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v41 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
