@@ -551,29 +551,34 @@ class HierarchicalDAM:
 
         return states
 
-    # v36: Energy normalization constant.
-    # log2_piecewise_F returns values in 256x fixed-point.
-    # With h_scaled (5% of original), field values are lower.
-    # v35 used LOG2_NORM=512 but got dE=87 (way too high), forcing beta=0.05.
-    # v36: LOG2_NORM=4096 (8x increase) + h scaled to 5% → expected dE ~ O(5-15)
-    # This allows beta ~ 0.1-0.5 for proper Boltzmann discrimination.
+    # v37: Energy normalization constant.
+    # LOG2_NORM=4096, but k removed from divisor → effective normalization
+    # is 10x less than v36. This gives DAM dE ~ O(20-40) without h bias.
+    #
+    # v36 had THREE bugs that caused PPL regression (461→672):
+    #   1. LOG2_NORM=4096 with k in divisor → divisor=40960, integer
+    #      truncation destroyed DAM signal (only 2-4 units of dE)
+    #   2. Episodic energy NOT normalized by LOG2_NORM → dominated at dE~25
+    #   3. h at 5% still added frequency bias
+    # Net: dE=85 was all episodic frequency bias, not DAM coupling.
+    #
+    # v37 fixes: remove k from divisor (10x more precision), remove h
+    # entirely from word energy, reduce episodic scale.
     LOG2_NORM = 4096
 
-    # v36: h field scaling for word energy computation.
-    # The h field (Hebbian bias) encodes word frequency. When included at
-    # full strength, it creates a massive unconditional bias that makes
-    # common words always win regardless of context. This is the primary
-    # reason v35 produced repetitive cycling gibberish.
+    # v37: h field REMOVED from word energy computation.
+    # The h field (Hebbian bias) encodes word frequency. It creates
+    # unconditional bias that makes common words always win regardless
+    # of context. This was the primary driver of repetitive output.
     #
-    # By scaling h to 5% (H_SCALE_NUM/H_SCALE_DEN = 1/20), we keep a
-    # small frequency prior (rare words shouldn't beat common ones without
-    # context evidence) while letting the context-specific coupling signal
-    # dominate the energy landscape.
+    # v36 tried scaling h to 5%, but even 5% was too much — it reinforced
+    # the episodic frequency bias. v37 removes h entirely from word
+    # selection energy.
     #
     # For attractor dynamics (step_all, kWTA), h is used at full strength.
     # This scaling only applies to word selection energy.
-    H_SCALE_NUM = 1
-    H_SCALE_DEN = 20
+    H_SCALE_NUM = 0
+    H_SCALE_DEN = 1  # Unused when H_SCALE_NUM=0
 
     def compute_word_energies(
         self,
@@ -585,16 +590,20 @@ class HierarchicalDAM:
         """
         Compute energy for each candidate word using NORMALIZED log2-F.
 
-        v35 FIX: v33 introduced log2-F to prevent overflow, but the
-        energies were in 256x fixed-point (dE ~ 3000-8000), leading to
-        beta = 0.002 which made the sampler nearly uniform (no selectivity).
+        v37 FIX: Three changes from v36 that caused PPL regression (461→672):
+          1. Removed h from context_field (H_SCALE=0). h encodes word
+             frequency → degenerate frequency dominance regardless of context.
+          2. Removed k from energy divisor. v36 used total_f // (k*LOG2_NORM)
+             = total_f // 40960, losing 10x precision to integer truncation.
+             DAM dE was only 2-4 units, swamped by episodic dE of 25+.
+             Now: total_f // LOG2_NORM = total_f // 4096, DAM dE ~ O(20-40).
+          3. LOG2_NORM=4096 preserved, but without k division the effective
+             normalization is 10x less, giving proper energy discrimination.
 
-        v35 normalizes by LOG2_NORM = 512, bringing dE into the O(1-10)
-        range where beta ~ 1.0 gives proper Boltzmann discrimination.
+        E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / LOG2_NORM
 
-        E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / (k * LOG2_NORM)
-
-        where log2_F(x) = log2(T + x%T) + (x//T) in 256x fixed-point.
+        where log2_F(x) = log2(T + x%T) + (x//T) in 256x fixed-point,
+        context_field = J[:, ctx_active] @ ctx_ones + topdown (NO h).
 
         Args:
             context_sdr: Context SDR (D0,) uint8.
@@ -604,11 +613,11 @@ class HierarchicalDAM:
 
         Returns:
             Energy array (len(candidate_words),) int64. Lower = more likely.
-            Values are normalized so dE ~ O(1-10), suitable for beta ~ 1.0.
+            Values are normalized so dE ~ O(20-40), suitable for beta ~ 0.1-0.3.
         """
         n_cand = len(candidate_words)
 
-        # Pre-compute context field: J[:, active_ctx] @ ones + h
+        # Pre-compute context field: J[:, active_ctx] @ ones (NO h in v37)
         context_active = np.where(context_sdr > 0)[0]
         D0 = self.layers_config[0][0]
 
@@ -619,11 +628,13 @@ class HierarchicalDAM:
             )
         else:
             context_field = np.zeros(D0, dtype=np.int32)
-        # v36: Scale h field down to 5% for word energy.
-        # Full h creates frequency bias that dominates the coupling signal,
-        # making the model degenerate into a unigram predictor.
-        # 5% keeps a small frequency prior while letting context coupling dominate.
-        context_field += (self.layers[0].h.astype(np.int32) * self.H_SCALE_NUM) // self.H_SCALE_DEN
+        # v37: h field REMOVED from word energy.
+        # h encodes word frequency → degenerate frequency dominance.
+        # Even at 5% (v36), it reinforced episodic frequency bias.
+        # Word selection uses ONLY context-specific coupling signal.
+        # Attractor dynamics (kWTA in step_all) still use full h.
+        if self.H_SCALE_NUM > 0:
+            context_field += (self.layers[0].h.astype(np.int32) * self.H_SCALE_NUM) // self.H_SCALE_DEN
 
         # Top-down field from higher layers
         if self.n_layers > 1 and self._built:
@@ -631,8 +642,7 @@ class HierarchicalDAM:
             context_field += td_field
 
         # Compute log2_F for ALL field values at once (no J_MAX clip!)
-        # v36: With h scaled to 5% and LOG2_NORM=4096, the log2_F values
-        # are smaller, giving dE ~ O(5-15) instead of v35's dE ~ 87.
+        # v37: With h removed and no k division, dE ~ O(20-40) for beta ~ 0.1-0.3
         log2_F_all = self.layers[0]._log2_piecewise_F(context_field.astype(np.int64))
 
         energies = np.zeros(n_cand, dtype=np.int64)
@@ -656,10 +666,15 @@ class HierarchicalDAM:
             else:
                 total_f = 0
 
-            # v36: Normalize by k * LOG2_NORM so dE ~ O(5-15)
-            # With LOG2_NORM=4096 and h at 5%, this gives proper energy scale
-            # for beta ~ 0.1-0.5 Boltzmann discrimination.
-            energies[i] = -(total_f // (max(1, k) * self.LOG2_NORM))
+            # v37: Normalize by LOG2_NORM only (NO k division).
+            # v36 divided by k*LOG2_NORM=40960, losing precision to integer
+            # truncation. With k=10 always, dividing by k just throws away
+            # 10x signal resolution. Result: DAM dE was only 2-4 units,
+            # swamped by episodic dE of 25+ units.
+            #
+            # Without k division: divisor=4096, DAM dE ~ O(20-40).
+            # Beta ≈ 0.2-0.3 gives proper Boltzmann discrimination.
+            energies[i] = -(total_f // self.LOG2_NORM)
 
         return energies
 

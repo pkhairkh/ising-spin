@@ -88,7 +88,7 @@ class AttractorLanguageModel:
         exp_temperature: int = 100,
         # Episodic
         max_episodes: int = 10000,
-        episodic_scale: int = 500,
+        episodic_scale: int = 100,
         # Energy scales
         grammar_penalty_scale: int = 60,
         same_word_penalty: int = 800,
@@ -171,10 +171,10 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v36 — BETA + BIAS FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v37 — ENERGY PRECISION FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
-        print("  Energy: NORMALIZED log2-F (LOG2_NORM=4096, h scaled to 5%)", flush=True)
+        print("  Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k division, NO h)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -298,7 +298,7 @@ class AttractorLanguageModel:
 
         from ..sampling import IntegerBoltzmannSampler
         self._sampler = IntegerBoltzmannSampler(
-            beta=self.beta, max_delta=500
+            beta=self.beta, max_delta=2000
         )
 
         t_total = time.time() - t0
@@ -308,10 +308,10 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v36")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v37")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, h=5%)")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, NO k div, NO h)")
 
         self._print_diagnostics()
 
@@ -415,14 +415,17 @@ class AttractorLanguageModel:
     def _calibrate_beta(self) -> None:
         """Calibrate Boltzmann beta from the normalized DAM energy distribution.
 
-        v36 FIX: Two changes from v35:
-        1. LOG2_NORM increased from 512 to 4096 — dE now ~ O(5-15) instead of ~87
-        2. h field scaled to 5% — removes frequency bias that made common words
-           always win regardless of context
+        v37 FIX: Three changes from v36:
+        1. Removed h from word energy — h is frequency bias, not context signal.
+           Even at 5% (v36), it reinforced episodic frequency dominance.
+        2. Removed k from energy divisor — k=10 always, dividing by k just
+           loses 10x precision to integer truncation. v36's divisor=40960
+           produced DAM dE of only 2-4 units (swamped by episodic dE~25).
+        3. Episodic scale reduced from 500→100 to prevent frequency bias
+           from dominating the coupling signal.
 
-        Target: beta * p10_dE ≈ 2.0 so the 10th-percentile candidate gets
-        exp(-2.0) ≈ 13.5% of the best's probability — strong selectivity
-        with some diversity for natural language.
+        Target: beta * p10_dE ≈ 3.0 (stronger selectivity than v36's 2.0).
+        The p10 candidate gets exp(-3) ≈ 5% of the best's probability.
 
         Also stores _median_de for auto-scaling penalties.
         """
@@ -480,13 +483,18 @@ class AttractorLanguageModel:
             median_de = int(np.median(energy_diffs))
             p10_de = int(np.percentile(energy_diffs, 10))
 
-            # v36: Beta calibration for NORMALIZED energy scale.
-            # With LOG2_NORM=4096 and h at 5%, dE should be ~5-15.
-            # Target: beta * p10_dE ≈ 2.0 for strong selectivity + diversity.
-            empirical_beta = 2.0 / max(1, p10_de)
+            # v37: Beta calibration for NORMALIZED energy scale.
+            # With h removed and k removed from divisor, DAM dE ~ O(20-40).
+            # Target: beta * p10_dE ≈ 3.0 for strong selectivity + diversity.
+            # v36 used 2.0 but with dE dominated by episodic frequency bias.
+            # With DAM-dominated dE, 3.0 gives better context discrimination.
+            empirical_beta = 3.0 / max(1, p10_de)
 
-            # Clamp to reasonable range: [0.05, 5.0]
-            self.beta = max(0.05, min(5.0, empirical_beta))
+            # Clamp to reasonable range: [0.01, 5.0]
+            # v36 clamped to [0.05, 5.0] which forced beta too high when
+            # dE was large. With dE now dominated by DAM coupling signal,
+            # beta should be free to go lower.
+            self.beta = max(0.01, min(5.0, empirical_beta))
 
             # v36: Store energy scale for auto-scaling penalties
             self._median_de = median_de
@@ -518,7 +526,7 @@ class AttractorLanguageModel:
 
         if self._sampler is None:
             from ..sampling import IntegerBoltzmannSampler
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=500)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=2000)
 
         prompt_words = prompt.strip().split()
         prompt_tokens = []
@@ -576,19 +584,18 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # DAM energy with NORMALIZED log2-F (v36: dE ~ O(5-15), h=5%)
+                # DAM energy with NORMALIZED log2-F (v37: dE ~ O(20-40), NO h)
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy (v36: scale matches normalized dE range)
+                # Episodic energy (v37: reduced scale=100, ~10% of DAM range)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
-                # Grammar penalty (v36: auto-scaled to normalized dE range)
-                # Grammar penalties were designed for v35's dE~87 scale.
-                # Scale them to match current dE range so they influence but don't dominate.
+                # Grammar penalty (v37: auto-scaled to DAM dE range)
+                # Grammar penalties scale with median_de so they influence but don't dominate.
                 test_types = list(types_list[-5:]) + [chosen_type]
                 test_pos = len(test_types) - 1
                 try:
@@ -597,14 +604,16 @@ class AttractorLanguageModel:
                     )
                 except (IndexError, ValueError):
                     grammar_penalty = 0
-                # Auto-scale: map max grammar penalty (~500) to ~3x median dE
+                # Auto-scale: map max grammar penalty (~500) to ~1x median dE
+                # v37: median_de is now ~30 (DAM-dominated), so grammar_scale = 500/30 ≈ 17
+                # This makes grammar ~17 energy units — meaningful but not dominant
                 grammar_scale = max(1, 500 // max(1, getattr(self, '_median_de', 10)))
                 grammar_energies = np.full(len(candidate_arr), grammar_penalty // grammar_scale, dtype=np.int64)
 
                 total_energies = dam_energies + ep_energies + grammar_energies
 
-                # Repetition penalty (v36: auto-scaled to energy range)
-                # One penalty unit ≈ 20% of median dE — strong but not overwhelming
+                # Repetition penalty (v37: auto-scaled to DAM energy range)
+                # One penalty unit ≈ 20% of median dE
                 penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
                 recent = set(words[-5:])
                 for i, w in enumerate(candidate_arr):
@@ -664,7 +673,7 @@ class AttractorLanguageModel:
         from ..sampling import IntegerBoltzmannSampler, LOG2_SCALE
 
         if self._sampler is None:
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=500)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=2000)
 
         total_log2_prob = 0
         total_tokens = 0
@@ -706,19 +715,19 @@ class AttractorLanguageModel:
                 context_field[active] = self.dam_scale
                 self.hierarchy.step_all(context_field, n_sweeps=1)
 
-                # NORMALIZED log2-F DAM energies (v35: dE ~ O(1-10))
+                # NORMALIZED log2-F DAM energies (v37: dE ~ O(20-40), NO h, NO k div)
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy (v35: normalized scale, no *100)
+                # Episodic energy (v37: reduced scale, ~10% of DAM range)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
                 total_energies = dam_energies + ep_energies
 
-                # Repetition penalty (v36: auto-scaled to energy range)
+                # Repetition penalty (v37: auto-scaled to DAM energy range)
                 penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
                 recent = set(context_words[-5:])
                 for i, w in enumerate(candidate_arr):
@@ -824,7 +833,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v36 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v37 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -859,7 +868,7 @@ class AttractorLanguageModel:
         print(f"  Vocab: {len(self.vocab)} words")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, h=5%)")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, NO k div, NO h)")
         print("=" * 70)
 
     def reset_stats(self) -> None:
