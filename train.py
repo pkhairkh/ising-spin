@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v37 — Training Script
+Attractor Language Machine v38 — Training Script
 
-v37: ENERGY PRECISION FIX — three critical fixes from v36 regression:
-  - FIX: Removed h field from word energy entirely (H_SCALE=0).
-    Even at 5% (v36), h reinforced episodic frequency bias.
-    h still used at full strength for attractor kWTA dynamics.
-  - FIX: Removed k from energy divisor. v36 divided by k*LOG2_NORM=40960,
-    losing 10x precision to integer truncation. DAM dE was only 2-4 units,
-    completely swamped by episodic dE of 25+ units.
-    Without k division: divisor=4096, DAM dE ~ O(20-40).
-  - FIX: Reduced episodic_scale from 500 to 100. Episodic energy was NOT
-    normalized by LOG2_NORM, so it dominated at dE~25. Now ~10% of DAM range.
-  - FIX: Beta calibration targets beta*p10_dE ≈ 3.0 (up from 2.0), with
-    floor lowered from 0.05 to 0.01. Expected beta ~ 0.1-0.3.
+v38: COMPOSITIONAL BINDING — VSA permutation-based order-sensitive binding.
+  - NEW: VSA binding context (BindingContext) encodes bigram order
+  - Binding: bind(a, b) = rot(a, hash(b)) — non-commutative, all integer
+  - hash(b) = sum(active_bits_of_b) mod D — full [0, D-1] spread
+  - Exact unbinding: unbind(bound, b) = rot(bound, D - hash(b))
+  - M_bind context: OR-superposition of recent bindings + kWTA (2k=20 bits)
+  - Binding energy bonus: overlap(sdr[c], unbind(M, last_word)) * BIND_WEIGHT
+  - OR M_bind into context field for attractor dynamics
+  - Beta calibration includes binding energy
+
+v37 fixes preserved (from v36 regression):
+  - Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k division, NO h)
+  - Episodic scale reduced to 100
+  - Beta target: beta*p10_dE ≈ 3.0
 
 RG flow fix from v34 is preserved (L2-L4 now non-zero).
 
-Architecture unchanged: D=512, 50K samples, Hebbian L0
+Architecture: D=512, 50K samples, Hebbian L0
 
 Usage:
   python -u train.py                                     # Default: 50K samples
   python -u train.py --samples 100000                    # 100K samples
   python -u train.py --memory-budget 14000               # Pi 5 (16GB)
-  python -u train.py --f-type quadratic                  # Use quadratic F instead of exp
-
-With nohup (for long runs on Pi 5):
-  nohup python -u train.py --memory-budget 14000 > train.log 2>&1 &
+  python -u train.py --bind-weight 100                   # Stronger binding signal
+  python -u train.py --bind-window 12                    # Wider binding context
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -144,7 +144,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v37 — ENERGY PRECISION FIX"
+        description="Attractor Language Machine v38 — COMPOSITIONAL BINDING"
     )
 
     # Core parameters
@@ -201,6 +201,12 @@ def main():
     parser.add_argument("--vocab-min-freq", type=int, default=5,
                         help="Min word frequency for vocab (default: 5)")
 
+    # VSA Binding parameters (v38)
+    parser.add_argument("--bind-window", type=int, default=8,
+                        help="Binding context window size (default: 8)")
+    parser.add_argument("--bind-weight", type=int, default=50,
+                        help="Binding energy weight (default: 50)")
+
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
                         help="Memory budget in MB (0=unlimited; 14000=16GB Pi)")
@@ -217,7 +223,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v37 — ENERGY PRECISION FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v38 — COMPOSITIONAL BINDING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -234,13 +240,19 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v37 (ENERGY PRECISION FIX)")
+    print(f"CONFIG: Attractor Language Machine v38 (COMPOSITIONAL BINDING)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k div, NO h, dE ~ O(20-40))")
+    print(f"  BINDING (v38):")
+    print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
+    print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
+    print(f"    Window: {args.bind_window} recent bigram bindings")
+    print(f"    Weight: {args.bind_weight}")
+    print(f"    M_bind density: {2*int(args.sdr_dim * args.sdr_sparsity)} bits ({2*int(args.sdr_dim * args.sdr_sparsity)*100/args.sdr_dim:.1f}%)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -286,6 +298,8 @@ def main():
         memory_budget_mb=args.memory_budget,
         f_type=f_type,
         exp_temperature=args.exp_temperature,
+        bind_window=args.bind_window,
+        bind_weight=args.bind_weight,
         seed=42,
     )
 
@@ -363,8 +377,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "37.0.0",
-        "architecture": "Attractor Language Machine v37 — energy precision fix (LOG2_NORM=4096, no k div, no h, ep_scale=100), pure Hebbian",
+        "version": "38.0.0",
+        "architecture": "Attractor Language Machine v38 — compositional binding (VSA permutation, window={w}, weight={wt}), energy precision fix (LOG2_NORM=4096, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -379,6 +393,8 @@ def main():
             "max_episodes": args.max_episodes,
             "vocab_max_size": args.vocab,
             "same_word_penalty": args.same_word_penalty,
+            "bind_window": args.bind_window,
+            "bind_weight": args.bind_weight,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -403,7 +419,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v37")
+    print(f"DONE — Attractor Language Machine v38")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
