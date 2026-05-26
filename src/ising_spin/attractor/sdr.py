@@ -246,7 +246,7 @@ class SDREncoder:
         batch_tgt = []
         total_pairs = 0
         last_progress_time = time.time()
-        progress_interval = 10.0  # Print progress every 10 seconds
+        progress_interval = 5.0  # Print progress every 5 seconds
 
         for seq_idx, seq in enumerate(sequences):
             seq_len = len(seq)
@@ -258,38 +258,55 @@ class SDREncoder:
             if len(valid_seq) < 3:
                 continue
 
-            # Precompute cumulative superposition: cumsum[p] = sum of SDRs for words[0:p]
-            # This lets us compute context for position p as:
-            #   context[p] = cumsum[p] - cumsum[max(0, p-W)]
             n = len(valid_seq)
             sdr_stack = word_sdrs[valid_seq].astype(np.int32)  # (n, D)
             cumsum = np.cumsum(sdr_stack, axis=0)  # (n, D)
 
-            # Generate (context, target) pairs for positions 1..n-1
-            for pos in range(1, n):
-                target_word = valid_seq[pos]
+            # VECTORIZED: compute ALL context windows at once
+            # positions 1..n-1, each with window [max(0,pos-W):pos]
+            positions = np.arange(1, n)
+            starts = np.maximum(0, positions - context_window)
 
-                # Context window: words [max(0, pos-W) : pos]
-                start = max(0, pos - context_window)
+            # Build (n-1, D) context accumulator array
+            # context_acc[i] = cumsum[positions[i]-1] - cumsum[starts[i]-1] (with boundary)
+            context_acc = np.empty((len(positions), D), dtype=np.int32)
+            for i, (pos, start) in enumerate(zip(positions, starts)):
                 if start == 0:
-                    acc = cumsum[pos - 1].copy()
+                    context_acc[i] = cumsum[pos - 1]
                 else:
-                    acc = cumsum[pos - 1] - cumsum[start - 1]
+                    context_acc[i] = cumsum[pos - 1] - cumsum[start - 1]
 
-                # kWTA: keep top k
-                if np.max(acc) <= 0:
-                    continue
+            # kWTA for ALL positions at once using 2D argpartition
+            # For each row, find top-k indices
+            nonzero_mask = np.max(context_acc, axis=1) > 0  # (n-1,)
+            n_valid = int(np.sum(nonzero_mask))
+            if n_valid == 0:
+                continue
 
-                context_sdr = np.zeros(D, dtype=np.uint8)
-                top_k_idx = np.argpartition(acc, -k)[-k:]
-                context_sdr[top_k_idx] = 1
+            valid_acc = context_acc[nonzero_mask]  # (n_valid, D)
 
-                target_sdr = word_sdrs[target_word]
+            # 2D argpartition: for each row, find top-k
+            # np.argpartition works row-wise with axis=1
+            top_k_all = np.argpartition(valid_acc, -k, axis=1)[:, -k:]  # (n_valid, k)
 
-                if np.sum(context_sdr) > 0 and np.sum(target_sdr) > 0:
-                    batch_ctx.append(context_sdr)
-                    batch_tgt.append(target_sdr)
-                    total_pairs += 1
+            # Build context SDRs: (n_valid, D) uint8
+            valid_sdrs = np.zeros((n_valid, D), dtype=np.uint8)
+            rows = np.arange(n_valid).reshape(-1, 1)
+            valid_sdrs[rows, top_k_all] = 1
+
+            # Target SDRs for valid positions
+            valid_positions = positions[nonzero_mask]
+            valid_targets = np.array([valid_seq[p] for p in valid_positions], dtype=np.int64)
+
+            # Filter out zero context/target
+            ctx_sums = np.sum(valid_sdrs, axis=1)
+            tgt_sums = np.sum(word_sdrs[valid_targets], axis=1)
+            both_nonzero = (ctx_sums > 0) & (tgt_sums > 0)
+
+            for i in np.where(both_nonzero)[0]:
+                batch_ctx.append(valid_sdrs[i])
+                batch_tgt.append(word_sdrs[valid_targets[i]])
+                total_pairs += 1
 
                 if len(batch_ctx) >= batch_size:
                     ctx_arr = np.array(batch_ctx, dtype=np.uint8)
@@ -298,13 +315,11 @@ class SDREncoder:
                     batch_ctx = []
                     batch_tgt = []
 
-            # Print progress periodically (time-based, not count-based)
+            # Check progress after each sequence
             now = time.time()
             if callback and (now - last_progress_time) >= progress_interval:
                 callback(seq_idx + 1, total_pairs)
                 last_progress_time = now
-            elif callback and seq_idx == 0:
-                callback(0, 0)  # First message to show we started
 
         # Final partial batch
         if batch_ctx:
