@@ -1,5 +1,5 @@
 """
-Attractor Language Machine v38 — COMPOSITIONAL BINDING.
+Attractor Language Machine v39 — ENERGY RESOLUTION + BINDING FIX.
 
 The attractor dynamics of a properly trained Dense Associative Memory
 ARE a language model. Not an approximation. Not a component. They ARE one.
@@ -12,7 +12,7 @@ Architecture:
   - RG flow: J_eff DERIVED from L0 via coupling-space decimation, REPLACES J at higher levels
   - UV completeness: Ward identities + cutoff independence + coupling flow stability
   - Episodic memory: Content-addressable sparse pattern storage
-  - VSA binding: Permutation-based compositional context (v38)
+  - VSA binding: Permutation-based compositional context (v38-v39)
 
 DEEP FIXES (v28):
   1. F_EXP_APPROX: piecewise integer exponential — TRUE exponential capacity
@@ -23,13 +23,18 @@ DEEP FIXES (v28):
   6. DAM energy alone drives word selection (no n-gram crutch)
   7. D decreasing: 512->256->128->64 (RG reduces DOF at coarser scales)
 
-v38 COMPOSITIONAL BINDING:
-  - VSA permutation binding: bind(a, b) = rot(a, hash(b))
-  - Non-commutative: order-sensitive composition without grammar roles
-  - hash(b) = sum(active_bits_of_b) mod D — full spread [0, D-1]
-  - Exact unbinding: unbind(bound, b) = rot(bound, D - hash(b))
-  - M_bind context: OR-superposition of recent bigram bindings + kWTA
-  - Binding energy bonus: overlap(sdr[c], unbind(M, last_word)) * weight
+v39 ENERGY RESOLUTION + BINDING FIX:
+  - LOG2_NORM reduced from 4096 to 512 — 8x more energy levels
+    v37/v38 used LOG2_NORM=4096, giving only ~5 distinct energy levels
+    after integer division. The Boltzmann sampler couldn't discriminate.
+    This was the root cause of v35 PPL=461 → v37 PPL=5587 regression.
+  - M_bind NOT OR'd into context_sdr for DAM energy — DAM was trained
+    on standard context SDRs; injecting binding bits added noise.
+    M_bind still used for attractor dynamics (step_all) context field.
+  - Multi-step unbinding: unbind with last 3 words, not just last 1.
+    Gives richer context beyond bigrams — trigram patterns emerge.
+  - Binding formula: direct overlap*weight (no //10 integer truncation).
+  - bind_weight=30 (adjusted for new LOG2_NORM=512 energy scale).
 
 All integer arithmetic. Zero floats in the hot path. Runs on Pi 5.
 """

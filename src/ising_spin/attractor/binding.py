@@ -27,11 +27,12 @@ CONTEXT VECTOR: M_bind = OR-superposition of recent bigram bindings + kWTA
   - Sliding window of W recent bindings prevents unbounded growth
 
 ENERGY BONUS:
-  For each candidate word c:
-    overlap(sdr[c], unbind(M_bind, last_word)) * BIND_WEIGHT
+  For each candidate word c, unbind M_bind with the last N words
+  (default N=3 for multi-step unbinding) and sum overlaps:
+    bonus = sum over w in recent_words: overlap(sdr[c], unbind(M_bind, w)) * BIND_WEIGHT
   Added as negative bonus (lower energy = more likely).
-  This implements "linguistic expectation" — the binding context
-  predicts which words should come next based on bigram order.
+  Multi-word unbinding gives richer context beyond bigrams —
+  trigram and longer patterns emerge from the binding structure.
 
 WHY PERMUTATION (not XOR) BINDING:
   The original proposal used a XOR rot(a, hash(b)), which:
@@ -56,7 +57,12 @@ WHY SUM-OF-POSITIONS HASH (not popcount):
   are drawn from different regions of the random projection space.
 
 INTEGRATION WITH DAM:
-  - M_bind is OR'd with the standard context SDR for attractor dynamics (step_all)
+  - v39: M_bind is NOT OR'd into context SDR for DAM energy computation.
+    The DAM was trained on standard context SDRs (word superposition + kWTA).
+    Injecting binding bits that the DAM never saw adds noise to coupling energy.
+    Instead, M_bind is used ONLY for the binding energy bonus (separate signal).
+  - M_bind IS still used for attractor dynamics (step_all) context field
+    to help the attractor settle toward binding-consistent states.
   - Binding energy bonus is added as a separate term in total energies
   - Beta calibration automatically includes binding energy
   - RG flow and UV checks are UNCHANGED — binding is a runtime overlay
@@ -205,7 +211,8 @@ class BindingContext:
         k: int = 10,
         window: int = 8,
         target_density: int = 0,  # 0 = auto (2*k)
-        bind_weight: int = 50,
+        bind_weight: int = 30,
+        n_unbind_words: int = 3,
     ):
         """
         Args:
@@ -218,14 +225,19 @@ class BindingContext:
                            Must be >= k and <= D.
             bind_weight: Weight for binding energy bonus (BIND_WEIGHT).
                         Higher = stronger influence of binding context.
-                        With bind_weight=50 and max overlap=10:
-                        max bonus = 10 * 50 / 10 = 50 energy units.
+                        v39: With LOG2_NORM=512, dE ~ O(200-300),
+                        bind_weight=30 gives typical bonus ~60 (20-30% of dE).
+                        Formula: bonus = overlap * bind_weight (NO integer div).
+            n_unbind_words: Number of recent words to unbind with for
+                           multi-step unbinding (default=3 for trigram context).
+                           Unbinds with each of the last N words and sums bonuses.
         """
         self.D = D
         self.k = k
         self.window = window
         self.target_density = max(k, target_density if target_density > 0 else 2 * k)
         self.bind_weight = bind_weight
+        self.n_unbind_words = n_unbind_words
 
         # Dense accumulator for M_bind (rebuild from bindings each time)
         self._acc = np.zeros(D, dtype=np.int32)
@@ -235,6 +247,10 @@ class BindingContext:
 
         # Current M_bind as dense binary vector
         self.M_bind: np.ndarray = np.zeros(D, dtype=np.uint8)
+
+        # Recent word active bits (for multi-step unbinding)
+        # Stores up to n_unbind_words recent word SDRs
+        self._recent_words: deque = deque(maxlen=n_unbind_words)
 
         # Last word's active bits (for creating next bigram binding)
         self._last_word_bits: Optional[np.ndarray] = None
@@ -246,6 +262,7 @@ class BindingContext:
         """Reset binding context for a new sequence."""
         self._acc = np.zeros(self.D, dtype=np.int32)
         self._bindings.clear()
+        self._recent_words.clear()
         self.M_bind = np.zeros(self.D, dtype=np.uint8)
         self._last_word_bits = None
         self._n_bindings = 0
@@ -278,8 +295,9 @@ class BindingContext:
             # Rebuild M_bind from all bindings in window
             self._rebuild()
 
-        # Remember this word for the next bigram
+        # Remember this word for the next bigram AND for multi-step unbinding
         self._last_word_bits = word_active_bits.copy()
+        self._recent_words.append(word_active_bits.copy())
 
     def _rebuild(self) -> None:
         """Rebuild M_bind from current binding window with kWTA.
@@ -320,16 +338,19 @@ class BindingContext:
     ) -> np.ndarray:
         """Compute binding energy bonus for each candidate word.
 
-        For each candidate c, computes:
-          overlap(sdr[c], unbind(M_bind, last_word)) * bind_weight // 10
+        v39: Multi-step unbinding — unbind M_bind with each of the last
+        N words (n_unbind_words, default=3) and sum the overlap bonuses.
+        This gives richer context beyond bigrams: trigram and longer
+        patterns emerge from the binding structure.
+
+        For each candidate c and each recent word w:
+          overlap(sdr[c], unbind(M_bind, w)) * bind_weight
+        Total bonus = sum over all recent words.
+
+        v39: Removed `// 10` integer division that was losing precision.
+        Now uses direct `overlap * bind_weight` for full integer precision.
 
         Higher overlap = lower energy (more likely) = negative bonus.
-
-        The unbinding reveals words that followed the last word in
-        the binding context. If candidate c has high overlap with
-        the unbound vector, it means c is predicted by the bigram
-        binding structure — a primitive but genuine form of
-        linguistic expectation.
 
         Args:
             candidate_words: Array of candidate word IDs.
@@ -342,44 +363,54 @@ class BindingContext:
         n_cand = len(candidate_words)
         energies = np.zeros(n_cand, dtype=np.int64)
 
-        if self._last_word_bits is None or np.sum(self.M_bind) == 0:
+        if len(self._recent_words) == 0 or np.sum(self.M_bind) == 0:
             return energies
 
-        # Unbind M_bind with the last word: rot(M_bind_active, D - hash(last_word))
-        shift = sdr_hash(self._last_word_bits, self.D)
         M_bind_active = np.where(self.M_bind > 0)[0]
-
         if len(M_bind_active) == 0:
             return energies
 
-        # Unbind: rotate M_bind's active bits back by the hash
-        unbound_active = rotate_sdr(M_bind_active, self.D - shift, self.D)
-        unbound_dense = np.zeros(self.D, dtype=np.uint8)
-        for b in unbound_active:
-            idx = int(b)
-            if 0 <= idx < self.D:
-                unbound_dense[idx] = 1
-
-        # Compute overlap with each candidate's SDR
-        # Vectorized: candidate SDRs @ unbound_dense gives overlaps
+        # Pre-compute valid candidate mask and SDRs
         valid_mask = (candidate_words >= 0) & (candidate_words < sdr_encoder.vocab_size)
         valid_words = candidate_words[valid_mask]
 
-        if len(valid_words) > 0:
-            # Batch overlap computation using dense SDR matrix
-            candidate_sdrs = sdr_encoder.word_sdrs[valid_words]  # (n, D) uint8
-            overlaps = candidate_sdrs.astype(np.int32) @ unbound_dense.astype(np.int32)
+        if len(valid_words) == 0:
+            return energies
 
-            # Energy bonus: negative (lower energy = more likely)
-            # Scale: overlap * bind_weight // 10
-            # With bind_weight=50 and max overlap=k=10: max bonus = 50
-            binding_bonus = -(overlaps * self.bind_weight) // 10
-            energies[valid_mask] = binding_bonus.astype(np.int64)
+        candidate_sdrs = sdr_encoder.word_sdrs[valid_words]  # (n, D) uint8
+
+        # Multi-step unbinding: unbind with each recent word and sum bonuses
+        total_overlaps = np.zeros(len(valid_words), dtype=np.int64)
+
+        for word_bits in self._recent_words:
+            # Unbind M_bind with this word: rot(M_bind_active, D - hash(word))
+            shift = sdr_hash(word_bits, self.D)
+            unbound_active = rotate_sdr(M_bind_active, self.D - shift, self.D)
+
+            unbound_dense = np.zeros(self.D, dtype=np.uint8)
+            for b in unbound_active:
+                idx = int(b)
+                if 0 <= idx < self.D:
+                    unbound_dense[idx] = 1
+
+            # Compute overlap with each candidate's SDR
+            overlaps = candidate_sdrs.astype(np.int32) @ unbound_dense.astype(np.int32)
+            total_overlaps += overlaps.astype(np.int64)
+
+        # Energy bonus: negative (lower energy = more likely)
+        # v39: Direct `overlap * bind_weight` — NO integer division that loses precision
+        binding_bonus = -(total_overlaps * self.bind_weight)
+        energies[valid_mask] = binding_bonus.astype(np.int64)
 
         return energies
 
     def get_context_or(self, context_sdr: np.ndarray) -> np.ndarray:
-        """OR M_bind with the standard context SDR.
+        """OR M_bind with the standard context SDR for ATTRACTOR DYNAMICS.
+
+        v39: This is used ONLY for step_all() context field (attractor dynamics),
+        NOT for compute_word_energies() DAM energy computation. The DAM was
+        trained on standard context SDRs — injecting binding bits that the DAM
+        never saw adds noise to the coupling energy.
 
         The resulting combined context has at most k + target_density
         active bits (e.g., 10 + 20 = 30 for default settings).
@@ -387,7 +418,8 @@ class BindingContext:
 
         The M_bind bits carry ORDER information that the standard
         context SDR doesn't have (it uses superposition which is
-        order-insensitive). This is the key value-add of binding.
+        order-insensitive). This helps attractor dynamics settle
+        toward binding-consistent states.
 
         Args:
             context_sdr: Standard context SDR (D,) uint8.
@@ -402,8 +434,10 @@ class BindingContext:
         return {
             'n_bindings': self._n_bindings,
             'window_size': len(self._bindings),
+            'n_recent_words': len(self._recent_words),
             'm_bind_density': int(np.sum(self.M_bind)),
             'target_density': self.target_density,
             'bind_weight': self.bind_weight,
+            'n_unbind_words': self.n_unbind_words,
             'has_last_word': self._last_word_bits is not None,
         }

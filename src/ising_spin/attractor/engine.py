@@ -96,9 +96,10 @@ class AttractorLanguageModel:
         # Generation
         beta: float = 0.01,
         max_seq_len: int = 30,
-        # VSA Binding (v38)
+        # VSA Binding (v39)
         bind_window: int = 8,
-        bind_weight: int = 50,
+        bind_weight: int = 30,
+        n_unbind_words: int = 3,
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -125,6 +126,7 @@ class AttractorLanguageModel:
         self._exp_temperature = exp_temperature
         self._bind_window = bind_window
         self._bind_weight = bind_weight
+        self._n_unbind_words = n_unbind_words
 
         # Built during training
         self.vocab = None
@@ -178,12 +180,13 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v38 — COMPOSITIONAL BINDING", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v39 — ENERGY RESOLUTION + BINDING FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
-        print("  Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k division, NO h)", flush=True)
+        print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
-        print(f"  Bind window={self._bind_window}, weight={self._bind_weight}", flush=True)
+        print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}", flush=True)
+        print("  M_bind: attractor dynamics ONLY (not DAM energy)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -304,15 +307,17 @@ class AttractorLanguageModel:
         )
         self._populate_episodic_memory()
 
-        # v38: Build VSA binding context
+        # v39: Build VSA binding context with multi-step unbinding
         self.binding = BindingContext(
             D=self.sdr_dim,
             k=self.sdr_encoder.k,
             window=self._bind_window,
             bind_weight=self._bind_weight,
+            n_unbind_words=self._n_unbind_words,
         )
         print(f"    Binding context: D={self.sdr_dim}, k={self.sdr_encoder.k}, "
-              f"window={self._bind_window}, weight={self._bind_weight}")
+              f"window={self._bind_window}, weight={self._bind_weight}, "
+              f"n_unbind={self._n_unbind_words}")
 
         self._calibrate_beta()
 
@@ -328,11 +333,11 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v38")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v39")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, NO k div, NO h)")
-        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight})")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
+        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
 
         self._print_diagnostics()
 
@@ -436,7 +441,8 @@ class AttractorLanguageModel:
     def _calibrate_beta(self) -> None:
         """Calibrate Boltzmann beta from the normalized DAM energy distribution.
 
-        v38: Includes VSA binding energy in the total energy distribution
+        v39: LOG2_NORM=512 gives dE ~ O(200-300), beta ~ 0.01.
+        Includes VSA binding energy in the total energy distribution
         so that beta accounts for the binding bonus.
 
         v37 FIX: Three changes from v36:
@@ -471,7 +477,7 @@ class AttractorLanguageModel:
                 target_word = seq[pos]
                 context_words = seq[:pos]
 
-                # v38: Update binding context with the previous word
+                # v39: Update binding context with the previous word
                 if self.binding and pos > 0:
                     prev_word = seq[pos - 1]
                     if 0 <= prev_word < self.sdr_encoder.vocab_size:
@@ -487,11 +493,12 @@ class AttractorLanguageModel:
                 candidate_arr = np.array(candidates[:200], dtype=np.int64)
                 context_sdr = self.sdr_encoder.encode_context(context_words)
 
-                # v38: OR binding context into context SDR
-                if self.binding and np.sum(self.binding.M_bind) > 0:
-                    context_sdr = self.binding.get_context_or(context_sdr)
+                # v39: Do NOT OR M_bind into context_sdr for DAM energy.
+                # The DAM was trained on standard context SDRs — binding bits
+                # add noise to coupling energy. M_bind is only used for
+                # the binding energy bonus (separate signal).
 
-                # Compute energies using normalized log2-F (v37)
+                # Compute energies using normalized log2-F (v39: LOG2_NORM=512)
                 energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
@@ -503,8 +510,8 @@ class AttractorLanguageModel:
                     )
                     energies += ep_energy
 
-                # v38: Add binding energy bonus
-                if self.binding and self.binding._last_word_bits is not None:
+                # v39: Add binding energy bonus (multi-step unbinding)
+                if self.binding and len(self.binding._recent_words) > 0:
                     bind_energy = self.binding.compute_binding_energy(
                         candidate_arr, self.sdr_encoder
                     )
@@ -564,10 +571,11 @@ class AttractorLanguageModel:
         """
         Generate text autoregressively using DAM attractor dynamics.
 
-        v38: Uses VSA binding context for order-sensitive composition.
+        v39: Uses VSA binding context for order-sensitive composition.
         The binding context encodes bigram order and provides an
         expectation signal that goes beyond the DAM's co-occurrence
-        statistics.
+        statistics. M_bind is used for attractor dynamics but NOT
+        for DAM energy computation (the DAM was trained without it).
 
         Uses F-lookup nonlinearity (exp_approx) for energy computation.
         """
@@ -602,21 +610,22 @@ class AttractorLanguageModel:
         # Initialize layer states and binding context from prompt
         for i, w in enumerate(words):
             context_sdr = self.sdr_encoder.encode_context(words[:i+1], 10)
-            context_field = np.zeros(self.sdr_dim, dtype=np.int32)
-            active = np.where(context_sdr > 0)[0]
-            context_field[active] = self.dam_scale
 
-            # v38: OR binding context into field
+            # v39: Build context_field for attractor dynamics WITH M_bind.
+            # M_bind helps attractor dynamics settle toward binding-consistent
+            # states. This is separate from DAM energy context_sdr.
+            context_field = np.zeros(self.sdr_dim, dtype=np.int32)
             if self.binding and np.sum(self.binding.M_bind) > 0:
-                bind_field = np.zeros(self.sdr_dim, dtype=np.int32)
-                bind_active = np.where(self.binding.M_bind > 0)[0]
-                bind_field[bind_active] = self.dam_scale
-                context_field += bind_field
+                combined_sdr = self.binding.get_context_or(context_sdr)
+            else:
+                combined_sdr = context_sdr
+            active = np.where(combined_sdr > 0)[0]
+            context_field[active] = self.dam_scale
 
             self.hierarchy.step_all(context_field, n_sweeps=1)
             self.episodic.store(context_sdr)
 
-            # v38: Update binding context with this word
+            # v39: Update binding context with this word
             if self.binding and 0 <= w < self.sdr_encoder.vocab_size:
                 self.binding.add_word(self.sdr_encoder.word_active_bits[w])
 
@@ -625,15 +634,18 @@ class AttractorLanguageModel:
             prev_type = types_list[-1] if types_list else POS2IDX["X"]
             valid_types = self._get_valid_next_types(prev_type, types_list)
 
-            # Encode context
+            # Encode context (standard word superposition, NO M_bind for DAM energy)
             context_sdr = self.sdr_encoder.encode_context(words, 10)
 
-            # v38: OR binding context into context SDR
-            if self.binding and np.sum(self.binding.M_bind) > 0:
-                context_sdr = self.binding.get_context_or(context_sdr)
-
+            # v39: Build context_field for attractor dynamics WITH M_bind.
+            # M_bind helps attractor dynamics settle toward binding-consistent
+            # states, but should NOT be in context_sdr for DAM energy.
             context_field = np.zeros(self.sdr_dim, dtype=np.int32)
-            active = np.where(context_sdr > 0)[0]
+            if self.binding and np.sum(self.binding.M_bind) > 0:
+                combined_sdr = self.binding.get_context_or(context_sdr)
+            else:
+                combined_sdr = context_sdr
+            active = np.where(combined_sdr > 0)[0]
             context_field[active] = self.dam_scale
 
             # Run attractor dynamics
@@ -652,7 +664,8 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # DAM energy with NORMALIZED log2-F (v37: dE ~ O(20-40), NO h)
+                # DAM energy with NORMALIZED log2-F (v39: LOG2_NORM=512, dE ~ O(200-300))
+                # v39: Use context_sdr WITHOUT M_bind — DAM trained on word superposition only
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
@@ -676,14 +689,14 @@ class AttractorLanguageModel:
 
                 total_energies = dam_energies + ep_energies + grammar_energies
 
-                # v38: Add binding energy bonus (order-sensitive bigram expectation)
-                if self.binding and self.binding._last_word_bits is not None:
+                # v39: Add binding energy bonus (multi-step unbinding)
+                if self.binding and len(self.binding._recent_words) > 0:
                     bind_energy = self.binding.compute_binding_energy(
                         candidate_arr, self.sdr_encoder
                     )
                     total_energies += bind_energy
 
-                # Repetition penalty (v37: auto-scaled to DAM energy range)
+                # Repetition penalty (v39: auto-scaled to DAM energy range)
                 penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
                 recent = set(words[-5:])
                 for i, w in enumerate(candidate_arr):
@@ -712,7 +725,7 @@ class AttractorLanguageModel:
             context_sdr = self.sdr_encoder.encode_context(words, 10)
             self.episodic.store(context_sdr)
 
-            # v38: Update binding context with chosen word
+            # v39: Update binding context with chosen word
             if self.binding and 0 <= chosen_word < self.sdr_encoder.vocab_size:
                 self.binding.add_word(self.sdr_encoder.word_active_bits[chosen_word])
 
@@ -786,29 +799,32 @@ class AttractorLanguageModel:
 
                 context_sdr = self.sdr_encoder.encode_context(context_words, 10)
 
-                # v38: OR binding context into context SDR
-                if self.binding and np.sum(self.binding.M_bind) > 0:
-                    context_sdr = self.binding.get_context_or(context_sdr)
-
+                # v39: Build context_field with M_bind for attractor dynamics,
+                # but use plain context_sdr (no M_bind) for DAM energy.
                 context_field = np.zeros(self.sdr_dim, dtype=np.int32)
-                active = np.where(context_sdr > 0)[0]
+                if self.binding and np.sum(self.binding.M_bind) > 0:
+                    combined_sdr = self.binding.get_context_or(context_sdr)
+                else:
+                    combined_sdr = context_sdr
+                active = np.where(combined_sdr > 0)[0]
                 context_field[active] = self.dam_scale
                 self.hierarchy.step_all(context_field, n_sweeps=1)
 
-                # NORMALIZED log2-F DAM energies (v37: dE ~ O(20-40), NO h, NO k div)
+                # NORMALIZED log2-F DAM energies (v39: LOG2_NORM=512, dE ~ O(200-300))
+                # v39: Use context_sdr WITHOUT M_bind — DAM trained on word superposition only
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy (v37: reduced scale, ~10% of DAM range)
+                # Episodic energy (v39: reduced scale)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
                 total_energies = dam_energies + ep_energies
 
-                # v38: Add binding energy bonus
-                if self.binding and self.binding._last_word_bits is not None:
+                # v39: Add binding energy bonus (multi-step unbinding)
+                if self.binding and len(self.binding._recent_words) > 0:
                     bind_energy = self.binding.compute_binding_energy(
                         candidate_arr, self.sdr_encoder
                     )
@@ -832,7 +848,7 @@ class AttractorLanguageModel:
                 total_tokens += 1
                 self.episodic.store(context_sdr)
 
-                # v38: Update binding context with the target word
+                # v39: Update binding context with the target word
                 if self.binding and 0 <= target_word < self.sdr_encoder.vocab_size:
                     self.binding.add_word(self.sdr_encoder.word_active_bits[target_word])
 
@@ -924,7 +940,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v38 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v39 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -957,16 +973,17 @@ class AttractorLanguageModel:
 
         if self.binding:
             bdiag = self.binding.get_diagnostics()
-            print(f"  Binding: VSA permutation, window={bdiag['bind_weight']}, "
+            print(f"  Binding: VSA permutation, window={bdiag['window_size']}, "
                   f"weight={bdiag['bind_weight']}, "
+                  f"n_unbind={bdiag['n_unbind_words']}, "
                   f"M_bind density={bdiag['m_bind_density']}/{self.sdr_dim}")
 
         print(f"  Beta: {self.beta:.6f}")
         print(f"  Vocab: {len(self.vocab)} words")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, NO k div, NO h)")
-        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight})")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
+        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
         print("=" * 70)
 
     def reset_stats(self) -> None:

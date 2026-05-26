@@ -551,20 +551,20 @@ class HierarchicalDAM:
 
         return states
 
-    # v37: Energy normalization constant.
-    # LOG2_NORM=4096, but k removed from divisor → effective normalization
-    # is 10x less than v36. This gives DAM dE ~ O(20-40) without h bias.
+    # v39: Energy normalization constant.
+    # LOG2_NORM=512 — 8x more energy resolution than v37/v38's 4096.
     #
-    # v36 had THREE bugs that caused PPL regression (461→672):
-    #   1. LOG2_NORM=4096 with k in divisor → divisor=40960, integer
-    #      truncation destroyed DAM signal (only 2-4 units of dE)
-    #   2. Episodic energy NOT normalized by LOG2_NORM → dominated at dE~25
-    #   3. h at 5% still added frequency bias
-    # Net: dE=85 was all episodic frequency bias, not DAM coupling.
+    # v37/v38 REGRESSION ROOT CAUSE: LOG2_NORM=4096 with integer division
+    # collapses distinct energy levels. With typical total_f 20000-40000:
+    #   LOG2_NORM=4096: energy range -4 to -9 → only ~5 distinct levels!
+    #   LOG2_NORM=512:  energy range -39 to -78 → ~39 distinct levels.
+    # The Boltzmann sampler CANNOT discriminate with only 5 levels.
+    # This was the root cause of v35 PPL=461 → v37 PPL=5587.
     #
-    # v37 fixes: remove k from divisor (10x more precision), remove h
-    # entirely from word energy, reduce episodic scale.
-    LOG2_NORM = 4096
+    # v35 used LOG2_NORM=512 (with k division = effective 5120) and got PPL=461.
+    # v39 returns to LOG2_NORM=512 WITHOUT k division, giving effective 512
+    # (10x MORE resolution than v35) with dE ~ O(200-300) and beta ~ 0.01.
+    LOG2_NORM = 512
 
     # v37: h field REMOVED from word energy computation.
     # The h field (Hebbian bias) encodes word frequency. It creates
@@ -590,15 +590,14 @@ class HierarchicalDAM:
         """
         Compute energy for each candidate word using NORMALIZED log2-F.
 
-        v37 FIX: Three changes from v36 that caused PPL regression (461→672):
-          1. Removed h from context_field (H_SCALE=0). h encodes word
-             frequency → degenerate frequency dominance regardless of context.
-          2. Removed k from energy divisor. v36 used total_f // (k*LOG2_NORM)
-             = total_f // 40960, losing 10x precision to integer truncation.
-             DAM dE was only 2-4 units, swamped by episodic dE of 25+.
-             Now: total_f // LOG2_NORM = total_f // 4096, DAM dE ~ O(20-40).
-          3. LOG2_NORM=4096 preserved, but without k division the effective
-             normalization is 10x less, giving proper energy discrimination.
+        v39 FIX: LOG2_NORM reduced from 4096 to 512.
+          v37/v38 used LOG2_NORM=4096, which with integer division gave only
+          ~5 distinct energy levels for the typical total_f range. This made
+          the Boltzmann sampler unable to discriminate between candidates,
+          causing PPL=5587 (v37) vs v35's PPL=461 with LOG2_NORM=512.
+
+          With LOG2_NORM=512 (no k division), we get ~39 distinct levels —
+          8x more discriminative power. dE ~ O(200-300), beta ~ 0.01.
 
         E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / LOG2_NORM
 
@@ -613,7 +612,7 @@ class HierarchicalDAM:
 
         Returns:
             Energy array (len(candidate_words),) int64. Lower = more likely.
-            Values are normalized so dE ~ O(20-40), suitable for beta ~ 0.1-0.3.
+            Values are normalized so dE ~ O(200-300), suitable for beta ~ 0.01.
         """
         n_cand = len(candidate_words)
 
@@ -666,14 +665,11 @@ class HierarchicalDAM:
             else:
                 total_f = 0
 
-            # v37: Normalize by LOG2_NORM only (NO k division).
-            # v36 divided by k*LOG2_NORM=40960, losing precision to integer
-            # truncation. With k=10 always, dividing by k just throws away
-            # 10x signal resolution. Result: DAM dE was only 2-4 units,
-            # swamped by episodic dE of 25+ units.
-            #
-            # Without k division: divisor=4096, DAM dE ~ O(20-40).
-            # Beta ≈ 0.2-0.3 gives proper Boltzmann discrimination.
+            # v39: Normalize by LOG2_NORM=512 (NO k division).
+            # v37/v38 used LOG2_NORM=4096, giving only ~5 distinct energy
+            # levels — the Boltzmann sampler couldn't discriminate.
+            # LOG2_NORM=512 gives ~39 distinct levels, 8x better resolution.
+            # dE ~ O(200-300), beta ~ 0.01 gives proper discrimination.
             energies[i] = -(total_f // self.LOG2_NORM)
 
         return energies

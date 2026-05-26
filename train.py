@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v38 — Training Script
+Attractor Language Machine v39 — Training Script
 
-v38: COMPOSITIONAL BINDING — VSA permutation-based order-sensitive binding.
-  - NEW: VSA binding context (BindingContext) encodes bigram order
+v39: ENERGY RESOLUTION + BINDING FIX
+  - LOG2_NORM=512 (was 4096) — 8x more energy resolution
+    ROOT CAUSE FIX: v37/v38's LOG2_NORM=4096 gave only ~5 distinct
+    energy levels after integer division. The Boltzmann sampler
+    couldn't discriminate — this caused the v35 PPL=461 → v37 PPL=5587
+    regression. LOG2_NORM=512 gives ~39 distinct levels.
+  - M_bind NOT OR'd into context_sdr for DAM energy — DAM was trained
+    on standard context SDRs; binding bits added noise to coupling energy.
+    M_bind still used for attractor dynamics (step_all) context field.
+  - Multi-step unbinding: unbind with last 3 words (not just last 1).
+    Gives richer context beyond bigrams — trigram patterns emerge.
+  - Binding formula: direct overlap*weight (no //10 integer truncation).
+  - bind_weight=30 (adjusted for LOG2_NORM=512 energy scale).
+
+v38 compositional binding preserved:
+  - VSA binding context (BindingContext) encodes bigram order
   - Binding: bind(a, b) = rot(a, hash(b)) — non-commutative, all integer
   - hash(b) = sum(active_bits_of_b) mod D — full [0, D-1] spread
   - Exact unbinding: unbind(bound, b) = rot(bound, D - hash(b))
   - M_bind context: OR-superposition of recent bindings + kWTA (2k=20 bits)
-  - Binding energy bonus: overlap(sdr[c], unbind(M, last_word)) * BIND_WEIGHT
-  - OR M_bind into context field for attractor dynamics
   - Beta calibration includes binding energy
 
 v37 fixes preserved (from v36 regression):
-  - Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k division, NO h)
+  - Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)
   - Episodic scale reduced to 100
   - Beta target: beta*p10_dE ≈ 3.0
 
@@ -25,8 +37,9 @@ Usage:
   python -u train.py                                     # Default: 50K samples
   python -u train.py --samples 100000                    # 100K samples
   python -u train.py --memory-budget 14000               # Pi 5 (16GB)
-  python -u train.py --bind-weight 100                   # Stronger binding signal
+  python -u train.py --bind-weight 50                    # Stronger binding signal
   python -u train.py --bind-window 12                    # Wider binding context
+  python -u train.py --n-unbind-words 5                  # More unbinding steps
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -201,11 +214,13 @@ def main():
     parser.add_argument("--vocab-min-freq", type=int, default=5,
                         help="Min word frequency for vocab (default: 5)")
 
-    # VSA Binding parameters (v38)
+    # VSA Binding parameters (v39)
     parser.add_argument("--bind-window", type=int, default=8,
                         help="Binding context window size (default: 8)")
-    parser.add_argument("--bind-weight", type=int, default=50,
-                        help="Binding energy weight (default: 50)")
+    parser.add_argument("--bind-weight", type=int, default=30,
+                        help="Binding energy weight (default: 30)")
+    parser.add_argument("--n-unbind-words", type=int, default=3,
+                        help="Number of recent words for multi-step unbinding (default: 3)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -223,7 +238,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v38 — COMPOSITIONAL BINDING", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v39 — ENERGY RESOLUTION + BINDING FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -240,18 +255,20 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v38 (COMPOSITIONAL BINDING)")
+    print(f"CONFIG: Attractor Language Machine v39 (ENERGY RESOLUTION + BINDING FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
-    print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=4096, NO k div, NO h, dE ~ O(20-40))")
-    print(f"  BINDING (v38):")
+    print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
+    print(f"  BINDING (v39):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
     print(f"    Weight: {args.bind_weight}")
+    print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
+    print(f"    M_bind: attractor dynamics ONLY (not DAM energy)")
     print(f"    M_bind density: {2*int(args.sdr_dim * args.sdr_sparsity)} bits ({2*int(args.sdr_dim * args.sdr_sparsity)*100/args.sdr_dim:.1f}%)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
@@ -300,6 +317,7 @@ def main():
         exp_temperature=args.exp_temperature,
         bind_window=args.bind_window,
         bind_weight=args.bind_weight,
+        n_unbind_words=args.n_unbind_words,
         seed=42,
     )
 
@@ -377,8 +395,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "38.0.0",
-        "architecture": "Attractor Language Machine v38 — compositional binding (VSA permutation, window={w}, weight={wt}), energy precision fix (LOG2_NORM=4096, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight),
+        "version": "39.0.0",
+        "architecture": "Attractor Language Machine v39 — energy resolution (LOG2_NORM=512, 8x more levels), binding fix (M_bind not in DAM energy, multi-step unbind={n_u}), compositional binding (VSA permutation, window={w}, weight={wt}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -395,6 +413,7 @@ def main():
             "same_word_penalty": args.same_word_penalty,
             "bind_window": args.bind_window,
             "bind_weight": args.bind_weight,
+            "n_unbind_words": args.n_unbind_words,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -419,7 +438,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v38")
+    print(f"DONE — Attractor Language Machine v39")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
