@@ -180,7 +180,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v43 — BINDING REVERT + DIAG FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v44 — TOP-K GENERATION", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -340,12 +340,13 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v43")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v44")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
+        print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
 
         self._print_diagnostics()
 
@@ -735,7 +736,23 @@ class AttractorLanguageModel:
                 best_candidate_words = np.array([4], dtype=np.int64)
                 best_energies = np.array([0], dtype=np.int64)
 
-            # Boltzmann sample
+            # v44: Top-k filtering before Boltzmann sampling.
+            # Keep only the k lowest-energy candidates to prevent
+            # low-probability "tail" words from being sampled.
+            # With 300 candidates per type, Boltzmann sampling spreads
+            # probability too thinly, causing incoherent generation.
+            # Top-k=10 focuses the sampler on the most likely words.
+            top_k = 10
+            if len(best_energies) > top_k:
+                # Find indices of top-k lowest energies
+                kth = min(top_k, len(best_energies))
+                top_indices = np.argpartition(best_energies, kth)[:kth]
+                # Sort by energy for better numerical properties
+                top_indices = top_indices[np.argsort(best_energies[top_indices])]
+                best_candidate_words = best_candidate_words[top_indices]
+                best_energies = best_energies[top_indices]
+
+            # Boltzmann sample from top-k candidates
             chosen_idx = self._sampler.sample(best_energies)
             chosen_word = int(best_candidate_words[chosen_idx])
             chosen_energy = int(best_energies[chosen_idx])
@@ -963,7 +980,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v43 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v44 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
