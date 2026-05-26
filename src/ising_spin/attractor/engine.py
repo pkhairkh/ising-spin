@@ -171,7 +171,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v31 — INLINE PIECEWISE F (NO CLIP)", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v32 — D=512/50K + INLINE PIECEWISE F (NO CLIP)", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff REPLACES J at higher levels", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
@@ -307,7 +307,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v31")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v32")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: F-lookup ({f_type_name}, exponential capacity)")
@@ -782,7 +782,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v31 — INLINE PIECEWISE F DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v32 — INLINE PIECEWISE F DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
