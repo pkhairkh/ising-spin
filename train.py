@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v39 — Training Script
+Attractor Language Machine v40 — Training Script
 
-v39: ENERGY RESOLUTION + BINDING FIX
-  - LOG2_NORM=512 (was 4096) — 8x more energy resolution
-    ROOT CAUSE FIX: v37/v38's LOG2_NORM=4096 gave only ~5 distinct
-    energy levels after integer division. The Boltzmann sampler
-    couldn't discriminate — this caused the v35 PPL=461 → v37 PPL=5587
-    regression. LOG2_NORM=512 gives ~39 distinct levels.
-  - M_bind NOT OR'd into context_sdr for DAM energy — DAM was trained
-    on standard context SDRs; binding bits added noise to coupling energy.
-    M_bind still used for attractor dynamics (step_all) context field.
-  - Multi-step unbinding: unbind with last 3 words (not just last 1).
-    Gives richer context beyond bigrams — trigram patterns emerge.
-  - Binding formula: direct overlap*weight (no //10 integer truncation).
-  - bind_weight=30 (adjusted for LOG2_NORM=512 energy scale).
+v40: GENERATION QUALITY FIX
+  - Repetition penalty FIXED: same_word_penalty=800 now actually used (was dead code!)
+    v39 BUG: actual penalty was median_de//5 = 24, negligible on dE scale of 200-300.
+    v40: Uses same_word_penalty=800 with distance-based decay, window=15 words.
+  - Grammar penalty FIXED: now scales to ~33% of median_dE (was ~5%).
+    v39 used 500//median_de as divisor, making penalty ~15 — too weak to matter.
+  - Special token filter: idx < 4 (PAD, UNK, BOS, EOS) excluded from candidates.
+    v39 allowed UNK (idx=1) to be generated, causing <UNK> spam.
+  - Sampler max_delta increased from 2000 to 5000 for wider energy range coverage.
 
 v38 compositional binding preserved:
   - VSA binding context (BindingContext) encodes bigram order
@@ -37,7 +33,7 @@ Usage:
   python -u train.py                                     # Default: 50K samples
   python -u train.py --samples 100000                    # 100K samples
   python -u train.py --memory-budget 14000               # Pi 5 (16GB)
-  python -u train.py --bind-weight 50                    # Stronger binding signal
+  python -u train.py --same-word-penalty 1200          # Stronger repetition suppression
   python -u train.py --bind-window 12                    # Wider binding context
   python -u train.py --n-unbind-words 5                  # More unbinding steps
 """
@@ -238,7 +234,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v39 — ENERGY RESOLUTION + BINDING FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v40 — GENERATION QUALITY FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -255,14 +251,14 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v39 (ENERGY RESOLUTION + BINDING FIX)")
+    print(f"CONFIG: Attractor Language Machine v40 (GENERATION QUALITY FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v39):")
+    print(f"  BINDING (v39 preserved):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
@@ -277,7 +273,10 @@ def main():
     print(f"  ENERGY SCALES:")
     print(f"    DAM scale={args.dam_scale}")
     print(f"    Episodic scale={args.episodic_scale}")
-    print(f"    Same-word penalty={args.same_word_penalty}")
+    print(f"    Same-word penalty={args.same_word_penalty} (v40: NOW ACTUALLY USED!)")
+    print(f"    Repetition window=15, distance-decay (v40 fix)")
+    print(f"    Grammar penalty scaled to ~33% median_dE (v40 fix)")
+    print(f"    Special tokens (idx<4) filtered from candidates (v40 fix)")
     print(f"  UV-COMPLETE:")
     print(f"    Regularize={uv_regularize}, lambda={args.uv_lambda}")
     print(f"    Top-down scale={args.topdown_scale}")
@@ -395,8 +394,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "39.0.0",
-        "architecture": "Attractor Language Machine v39 — energy resolution (LOG2_NORM=512, 8x more levels), binding fix (M_bind not in DAM energy, multi-step unbind={n_u}), compositional binding (VSA permutation, window={w}, weight={wt}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
+        "version": "40.0.0",
+        "architecture": "Attractor Language Machine v40 — generation quality fix (repetition penalty FIXED same_word_penalty=800 now used, grammar penalty scaled to ~33% dE, special tokens filtered from candidates, sampler max_delta=5000), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision fix (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -438,7 +437,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v39")
+    print(f"DONE — Attractor Language Machine v40")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

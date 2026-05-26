@@ -244,6 +244,14 @@ class POSTypeSystem:
             {"name": "CONJ_COMPAT", "type1": POS2IDX["CONJ"],
              "type2_set": list(range(self.n_types)),
              "max_dist": 2, "penalty": P // 3, "direction": "both"},
+            # v40: No consecutive punctuation — prevents ":::" spam
+            {"name": "NO_DOUBLE_PUNCT", "type1": POS2IDX["PUNCT"],
+             "type2_set": [POS2IDX["PUNCT"]],
+             "max_dist": 1, "penalty": P * 3, "direction": "both", "forbid": True},
+            # v40: PUNCT must be followed by open-class within 3 positions
+            {"name": "PUNCT_OPEN", "type1": POS2IDX["PUNCT"],
+             "type2_set": [POS2IDX[t] for t in OPEN_CLASS],
+             "max_dist": 3, "penalty": P, "direction": "forward"},
         ]
         return self
 

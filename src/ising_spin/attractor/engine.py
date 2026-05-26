@@ -180,7 +180,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v39 — ENERGY RESOLUTION + BINDING FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v40 — GENERATION QUALITY FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -233,9 +233,11 @@ class AttractorLanguageModel:
         self.pos_system.build_grammar_penalties(penalty_strength=self.grammar_penalty_scale)
         self.pos_system.compute_type_couplings(self.sequences, self.vocab.idx2word)
 
+        # v40: Filter special tokens (idx < 4: PAD, UNK, BOS, EOS) from candidate lists.
+        # These should never be generated — they caused <UNK> spam in v39.
         self.type_words = {t: [] for t in range(N_POS)}
         for w, allowed in self.pos_system.allowed_types.items():
-            if allowed:
+            if allowed and w >= 4:  # v40: skip special tokens
                 primary = primary_pos_tag(allowed)
                 self.type_words[primary].append(w)
 
@@ -323,7 +325,7 @@ class AttractorLanguageModel:
 
         from ..sampling import IntegerBoltzmannSampler
         self._sampler = IntegerBoltzmannSampler(
-            beta=self.beta, max_delta=2000
+            beta=self.beta, max_delta=5000
         )
 
         t_total = time.time() - t0
@@ -333,11 +335,12 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v39")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v40")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
+        print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
 
         self._print_diagnostics()
 
@@ -584,7 +587,7 @@ class AttractorLanguageModel:
 
         if self._sampler is None:
             from ..sampling import IntegerBoltzmannSampler
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=2000)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=5000)
 
         prompt_words = prompt.strip().split()
         prompt_tokens = []
@@ -675,7 +678,7 @@ class AttractorLanguageModel:
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
-                # Grammar penalty (v37: auto-scaled to DAM dE range)
+                # v40: Grammar penalty — scaled to ~50% of median_dE for real effect
                 test_types = list(types_list[-5:]) + [chosen_type]
                 test_pos = len(test_types) - 1
                 try:
@@ -684,8 +687,12 @@ class AttractorLanguageModel:
                     )
                 except (IndexError, ValueError):
                     grammar_penalty = 0
-                grammar_scale = max(1, 500 // max(1, getattr(self, '_median_de', 10)))
-                grammar_energies = np.full(len(candidate_arr), grammar_penalty // grammar_scale, dtype=np.int64)
+                # v40 FIX: Scale grammar penalty to be meaningful on the dE scale.
+                # v39 used 500//median_de as divisor, making penalty ~15 (5% of dE).
+                # v40: grammar_penalty * (median_de // 2) // 60 → ~100 (33% of dE)
+                median_de = max(1, getattr(self, '_median_de', 10))
+                grammar_scaled = grammar_penalty * (median_de // 2) // 60
+                grammar_energies = np.full(len(candidate_arr), grammar_scaled, dtype=np.int64)
 
                 total_energies = dam_energies + ep_energies + grammar_energies
 
@@ -696,12 +703,21 @@ class AttractorLanguageModel:
                     )
                     total_energies += bind_energy
 
-                # Repetition penalty (v39: auto-scaled to DAM energy range)
-                penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
-                recent = set(words[-5:])
+                # v40: Repetition penalty — FIXED: use same_word_penalty (800),
+                # window=15 words, distance-based decay (closer = stronger).
+                # v39 BUG: same_word_penalty=800 was dead code — actual penalty was
+                # median_de//5 = 24, negligible on dE scale of 200-300.
+                rep_window = 15
+                rep_base = self.same_word_penalty  # 800 by default
+                recent_words = words[-rep_window:]
                 for i, w in enumerate(candidate_arr):
-                    if int(w) in recent:
-                        total_energies[i] += penalty_unit
+                    w_int = int(w)
+                    # Distance-based decay: word at distance d gets penalty * (1 - d/window)
+                    for d, rw in enumerate(reversed(recent_words)):
+                        if w_int == rw:
+                            decay = max(1, rep_window - d)  # 15 for most recent, 1 for oldest
+                            total_energies[i] += (rep_base * decay) // rep_window
+                            break  # Only count closest occurrence
 
                 min_e = int(total_energies.min())
                 if min_e < best_min_energy:
@@ -760,7 +776,7 @@ class AttractorLanguageModel:
         from ..sampling import IntegerBoltzmannSampler, LOG2_SCALE
 
         if self._sampler is None:
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=2000)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=5000)
 
         total_log2_prob = 0
         total_tokens = 0
@@ -830,12 +846,17 @@ class AttractorLanguageModel:
                     )
                     total_energies += bind_energy
 
-                # Repetition penalty (v37: auto-scaled to DAM energy range)
-                penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
-                recent = set(context_words[-5:])
+                # v40: Repetition penalty — use same_word_penalty with distance decay
+                rep_window = 15
+                rep_base = self.same_word_penalty
+                recent_words = list(context_words[-rep_window:])
                 for i, w in enumerate(candidate_arr):
-                    if int(w) in recent:
-                        total_energies[i] += penalty_unit
+                    w_int = int(w)
+                    for d, rw in enumerate(reversed(recent_words)):
+                        if w_int == rw:
+                            decay = max(1, rep_window - d)
+                            total_energies[i] += (rep_base * decay) // rep_window
+                            break
 
                 log_probs = self._sampler.compute_log_probabilities(total_energies)
 
@@ -919,6 +940,7 @@ class AttractorLanguageModel:
         CLOSED_CLASS_IDS = frozenset({
             POS2IDX["DET"], POS2IDX["PREP"], POS2IDX["PART"],
             POS2IDX["PRON"], POS2IDX["AUX"], POS2IDX["CONJ"],
+            POS2IDX["PUNCT"],  # v40: PUNCT is functionally closed-class; suppress after 2 consecutive
         })
         closed_run = 0
         for t in reversed(types_history):
@@ -940,7 +962,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v39 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v40 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
