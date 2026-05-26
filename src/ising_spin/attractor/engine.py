@@ -180,11 +180,11 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v42 — BINDING RECENCY + DIAG FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v43 — BINDING REVERT + DIAG FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
-        print("  Binding: VSA permutation bind(a,hash(b)), recency-weighted kWTA", flush=True)
+        print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
         print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
@@ -340,7 +340,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v42")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v43")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
@@ -963,7 +963,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v42 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v43 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -1000,7 +1000,7 @@ class AttractorLanguageModel:
                   f"weight={bdiag['bind_weight']}, "
                   f"n_unbind={bdiag['n_unbind_words']}, "
                   f"M_bind density={bdiag['target_density']}/{self.sdr_dim}")
-            print(f"  Binding: recency-weighted kWTA (v42), "
+            print(f"  Binding: uniform kWTA (v43 revert), "
                   f"fill={bdiag['window_fill']}/{bdiag['window']}, "
                   f"actual_density={bdiag['m_bind_density']}")
 

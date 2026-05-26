@@ -302,32 +302,28 @@ class BindingContext:
     def _rebuild(self) -> None:
         """Rebuild M_bind from current binding window with kWTA.
 
-        OR-superposition with recency weighting: each binding contributes
-        k active bits. With W=8 bindings, raw OR has up to 8*k = 80 bits.
+        OR-superposition: each binding contributes k active bits.
+        With W=8 bindings, raw OR has up to 8*k = 80 active bits.
         kWTA reduces to target_density = 2*k = 20 bits (~4% density).
 
-        v42: Recency weighting — more recent bindings get higher accumulator
-        weight. The most recent bigram is usually the most predictive for
-        the next word, so we want its bits to survive kWTA preferentially.
-        Weight: oldest=1, newest=W (linear ramp). This means recent bindings
-        contribute up to Wx more to the accumulator than old ones.
+        Bits that appear in multiple bindings get higher accumulator
+        values and are preferentially kept by kWTA. This means
+        frequently-occurring bigram patterns are preserved even
+        under sparsification — emergent phrase-level structure.
 
-        Bits that appear in multiple bindings (especially recent ones) get
-        higher accumulator values and are preferentially kept by kWTA.
-        This means frequently-occurring AND recent bigram patterns are
-        preserved even under sparsification — emergent phrase-level structure
-        with temporal focus.
+        v43: UNIFORM weighting (reverted from v42 recency weighting).
+        Recency weighting made M_bind carry only the most recent bigram,
+        breaking multi-step unbinding (n_unbind=3). With uniform weights,
+        bits shared across multiple bindings survive kWTA, giving useful
+        signal when unbinding with ANY of the last N words.
         """
         self._acc = np.zeros(self.D, dtype=np.int32)
 
-        n_bindings = len(self._bindings)
-        for i, bound_bits in enumerate(self._bindings):
-            # v42: Recency weighting — newer bindings contribute more
-            recency_weight = i + 1  # oldest=1, newest=n_bindings
+        for bound_bits in self._bindings:
             for b in bound_bits:
                 idx = int(b)
                 if 0 <= idx < self.D:
-                    self._acc[idx] += recency_weight
+                    self._acc[idx] += 1
 
         # kWTA: keep top target_density bits
         if np.max(self._acc) > 0:
