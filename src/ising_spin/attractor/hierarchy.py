@@ -551,13 +551,29 @@ class HierarchicalDAM:
 
         return states
 
-    # v35: Energy normalization constant.
+    # v36: Energy normalization constant.
     # log2_piecewise_F returns values in 256x fixed-point.
-    # Typical log2_F sum per word ≈ 6000-8000 (256x FP).
-    # We want normalized energies where dE ~ O(1-10) so that
-    # beta ~ O(1) gives meaningful Boltzmann discrimination.
-    # Dividing by LOG2_NORM = 512 brings 6000 → ~12, which is ideal.
-    LOG2_NORM = 512
+    # With h_scaled (5% of original), field values are lower.
+    # v35 used LOG2_NORM=512 but got dE=87 (way too high), forcing beta=0.05.
+    # v36: LOG2_NORM=4096 (8x increase) + h scaled to 5% → expected dE ~ O(5-15)
+    # This allows beta ~ 0.1-0.5 for proper Boltzmann discrimination.
+    LOG2_NORM = 4096
+
+    # v36: h field scaling for word energy computation.
+    # The h field (Hebbian bias) encodes word frequency. When included at
+    # full strength, it creates a massive unconditional bias that makes
+    # common words always win regardless of context. This is the primary
+    # reason v35 produced repetitive cycling gibberish.
+    #
+    # By scaling h to 5% (H_SCALE_NUM/H_SCALE_DEN = 1/20), we keep a
+    # small frequency prior (rare words shouldn't beat common ones without
+    # context evidence) while letting the context-specific coupling signal
+    # dominate the energy landscape.
+    #
+    # For attractor dynamics (step_all, kWTA), h is used at full strength.
+    # This scaling only applies to word selection energy.
+    H_SCALE_NUM = 1
+    H_SCALE_DEN = 20
 
     def compute_word_energies(
         self,
@@ -603,7 +619,11 @@ class HierarchicalDAM:
             )
         else:
             context_field = np.zeros(D0, dtype=np.int32)
-        context_field += self.layers[0].h.astype(np.int32)
+        # v36: Scale h field down to 5% for word energy.
+        # Full h creates frequency bias that dominates the coupling signal,
+        # making the model degenerate into a unigram predictor.
+        # 5% keeps a small frequency prior while letting context coupling dominate.
+        context_field += (self.layers[0].h.astype(np.int32) * self.H_SCALE_NUM) // self.H_SCALE_DEN
 
         # Top-down field from higher layers
         if self.n_layers > 1 and self._built:
@@ -611,6 +631,8 @@ class HierarchicalDAM:
             context_field += td_field
 
         # Compute log2_F for ALL field values at once (no J_MAX clip!)
+        # v36: With h scaled to 5% and LOG2_NORM=4096, the log2_F values
+        # are smaller, giving dE ~ O(5-15) instead of v35's dE ~ 87.
         log2_F_all = self.layers[0]._log2_piecewise_F(context_field.astype(np.int64))
 
         energies = np.zeros(n_cand, dtype=np.int64)
@@ -634,7 +656,9 @@ class HierarchicalDAM:
             else:
                 total_f = 0
 
-            # v35: Normalize by k * LOG2_NORM so dE ~ O(1-10)
+            # v36: Normalize by k * LOG2_NORM so dE ~ O(5-15)
+            # With LOG2_NORM=4096 and h at 5%, this gives proper energy scale
+            # for beta ~ 0.1-0.5 Boltzmann discrimination.
             energies[i] = -(total_f // (max(1, k) * self.LOG2_NORM))
 
         return energies

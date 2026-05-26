@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v35 — Training Script
+Attractor Language Machine v36 — Training Script
 
-v35: ENERGY NORM FIX — the critical missing piece:
-  - FIX: log2-F energies were in 256x fixed-point (dE ~ 3000-8000)
-    leading to beta = 0.002, making the sampler nearly uniform
-    (no selectivity = gibberish output).
-  - FIX: Normalize energies by LOG2_NORM=512, bringing dE to O(1-10)
-    where beta ~ 1.0 gives proper Boltzmann discrimination.
-  - FIX: Scale all penalties (episodic, grammar, same-word) to match
-    the normalized energy scale.
-  - FIX: Beta calibration now targets beta * p10_dE ≈ 1.5.
+v36: BETA + BIAS FIX — two critical fixes:
+  - FIX: LOG2_NORM increased from 512 to 4096 (8x). v35 got dE=87
+    instead of the target O(1-10), forcing beta=0.05 (nearly uniform
+    sampling). With 8x normalization, expected dE ~ O(5-15).
+  - FIX: h field (Hebbian bias) scaled to 5% for word energy.
+    Full h creates massive frequency bias — common words always win
+    regardless of context. At 5%, it's a small prior while letting
+    context-specific coupling dominate. Attractor dynamics still use
+    full h (for kWTA pattern completion).
+  - FIX: Beta calibration targets beta * p10_dE ≈ 2.0 (stronger
+    selectivity than v35's 1.5 target).
+  - FIX: Grammar and repetition penalties auto-scaled to match
+    the new energy range.
 
 RG flow fix from v34 is preserved (L2-L4 now non-zero).
 
@@ -214,7 +218,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v35 — ENERGY NORM FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v36 — BETA + BIAS FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -231,13 +235,13 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v35 (ENERGY NORM FIX)")
+    print(f"CONFIG: Attractor Language Machine v36 (BETA + BIAS FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
-    print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, dE ~ O(1-10))")
+    print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=4096, h=5%, dE ~ O(5-15))")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -360,8 +364,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "35.0.0",
-        "architecture": "Attractor Language Machine v35 — energy norm fix (LOG2_NORM=512, beta ~1.0, normalized penalties), pure Hebbian",
+        "version": "36.0.0",
+        "architecture": "Attractor Language Machine v36 — beta+bias fix (LOG2_NORM=4096, h=5%, beta*p10_dE≈2.0), pure Hebbian",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -400,7 +404,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v35")
+    print(f"DONE — Attractor Language Machine v36")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

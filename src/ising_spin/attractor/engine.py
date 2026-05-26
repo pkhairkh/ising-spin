@@ -171,10 +171,10 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v35 — ENERGY NORM FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v36 — BETA + BIAS FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
-        print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, dE ~ O(1-10))", flush=True)
+        print("  Energy: NORMALIZED log2-F (LOG2_NORM=4096, h scaled to 5%)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -298,7 +298,7 @@ class AttractorLanguageModel:
 
         from ..sampling import IntegerBoltzmannSampler
         self._sampler = IntegerBoltzmannSampler(
-            beta=self.beta, max_delta=200
+            beta=self.beta, max_delta=500
         )
 
         t_total = time.time() - t0
@@ -308,10 +308,10 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v35")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v36")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512)")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, h=5%)")
 
         self._print_diagnostics()
 
@@ -415,10 +415,16 @@ class AttractorLanguageModel:
     def _calibrate_beta(self) -> None:
         """Calibrate Boltzmann beta from the normalized DAM energy distribution.
 
-        v35 FIX: Energies are now normalized (dE ~ O(1-10)) so beta should
-        also be O(1). The goal is: beta * p10_dE ≈ 1.5 so the 10th-percentile
-        candidate gets exp(-1.5) ≈ 22% of the best's probability — enough
-        diversity for language while still focusing on good candidates.
+        v36 FIX: Two changes from v35:
+        1. LOG2_NORM increased from 512 to 4096 — dE now ~ O(5-15) instead of ~87
+        2. h field scaled to 5% — removes frequency bias that made common words
+           always win regardless of context
+
+        Target: beta * p10_dE ≈ 2.0 so the 10th-percentile candidate gets
+        exp(-2.0) ≈ 13.5% of the best's probability — strong selectivity
+        with some diversity for natural language.
+
+        Also stores _median_de for auto-scaling penalties.
         """
         from ..utils import primary_pos_tag
 
@@ -474,18 +480,26 @@ class AttractorLanguageModel:
             median_de = int(np.median(energy_diffs))
             p10_de = int(np.percentile(energy_diffs, 10))
 
-            # v35: Beta calibration for NORMALIZED energy scale.
-            # With LOG2_NORM=512, dE should be ~1-10.
-            # Target: beta * p10_dE ≈ 1.5 for good selectivity + diversity.
-            empirical_beta = 1.5 / max(1, p10_de)
+            # v36: Beta calibration for NORMALIZED energy scale.
+            # With LOG2_NORM=4096 and h at 5%, dE should be ~5-15.
+            # Target: beta * p10_dE ≈ 2.0 for strong selectivity + diversity.
+            empirical_beta = 2.0 / max(1, p10_de)
 
             # Clamp to reasonable range: [0.05, 5.0]
             self.beta = max(0.05, min(5.0, empirical_beta))
+
+            # v36: Store energy scale for auto-scaling penalties
+            self._median_de = median_de
+            self._p10_de = p10_de
+
             print(f"    Median dE: {median_de}, p10 dE: {p10_de}")
             print(f"    Empirical beta: {empirical_beta:.4f}")
             print(f"    Using beta: {self.beta:.4f}")
+            print(f"    Expected selectivity: exp(-beta*p10_dE) = {math.exp(-self.beta * p10_de):.4f}")
         else:
             self.beta = 1.0
+            self._median_de = 10
+            self._p10_de = 5
             print(f"    No energy diffs — using default beta: {self.beta:.4f}")
 
     # ===================================================================
@@ -504,7 +518,7 @@ class AttractorLanguageModel:
 
         if self._sampler is None:
             from ..sampling import IntegerBoltzmannSampler
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=200)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=500)
 
         prompt_words = prompt.strip().split()
         prompt_tokens = []
@@ -562,17 +576,19 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # DAM energy with NORMALIZED log2-F (v35: dE ~ O(1-10))
+                # DAM energy with NORMALIZED log2-F (v36: dE ~ O(5-15), h=5%)
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy (v35: already in normalized scale, no extra *100)
+                # Episodic energy (v36: scale matches normalized dE range)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
                 )
 
-                # Grammar penalty (v35: scale to normalized dE range ~1-10)
+                # Grammar penalty (v36: auto-scaled to normalized dE range)
+                # Grammar penalties were designed for v35's dE~87 scale.
+                # Scale them to match current dE range so they influence but don't dominate.
                 test_types = list(types_list[-5:]) + [chosen_type]
                 test_pos = len(test_types) - 1
                 try:
@@ -581,15 +597,19 @@ class AttractorLanguageModel:
                     )
                 except (IndexError, ValueError):
                     grammar_penalty = 0
-                grammar_energies = np.full(len(candidate_arr), grammar_penalty, dtype=np.int64)
+                # Auto-scale: map max grammar penalty (~500) to ~3x median dE
+                grammar_scale = max(1, 500 // max(1, getattr(self, '_median_de', 10)))
+                grammar_energies = np.full(len(candidate_arr), grammar_penalty // grammar_scale, dtype=np.int64)
 
                 total_energies = dam_energies + ep_energies + grammar_energies
 
-                # Repetition penalty (v35: scale to normalized dE range)
+                # Repetition penalty (v36: auto-scaled to energy range)
+                # One penalty unit ≈ 20% of median dE — strong but not overwhelming
+                penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
                 recent = set(words[-5:])
                 for i, w in enumerate(candidate_arr):
                     if int(w) in recent:
-                        total_energies[i] += 5  # +5 in normalized scale = significant
+                        total_energies[i] += penalty_unit
 
                 min_e = int(total_energies.min())
                 if min_e < best_min_energy:
@@ -644,7 +664,7 @@ class AttractorLanguageModel:
         from ..sampling import IntegerBoltzmannSampler, LOG2_SCALE
 
         if self._sampler is None:
-            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=200)
+            self._sampler = IntegerBoltzmannSampler(beta=self.beta, max_delta=500)
 
         total_log2_prob = 0
         total_tokens = 0
@@ -698,11 +718,12 @@ class AttractorLanguageModel:
 
                 total_energies = dam_energies + ep_energies
 
-                # Repetition penalty (v35: normalized scale)
+                # Repetition penalty (v36: auto-scaled to energy range)
+                penalty_unit = max(1, getattr(self, '_median_de', 10) // 5)
                 recent = set(context_words[-5:])
                 for i, w in enumerate(candidate_arr):
                     if int(w) in recent:
-                        total_energies[i] += 5
+                        total_energies[i] += penalty_unit
 
                 log_probs = self._sampler.compute_log_probabilities(total_energies)
 
@@ -803,7 +824,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v35 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v36 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -838,7 +859,7 @@ class AttractorLanguageModel:
         print(f"  Vocab: {len(self.vocab)} words")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
-        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512)")
+        print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=4096, h=5%)")
         print("=" * 70)
 
     def reset_stats(self) -> None:
