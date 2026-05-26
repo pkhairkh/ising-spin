@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v32 — Training Script
+Attractor Language Machine v33 — Training Script
 
-v31 fixes + D=512/50K config:
+v33: LOG2-F ENERGY + RG FIX:
   - F_EXP_APPROX: piecewise integer exponential (TRUE exponential capacity)
-  - RG-derived J_eff REPLACES J at higher levels (Wilsonian RG tower)
-  - Ward identity UV checks (not just spectral gap)
+  - LOG2-SPACE energy: log2(F(x)) keeps values in sampler range
+  - RG flow fix: removed *16 Q4 inflation that killed L2-L4
+  - No J_MAX=1000 field clip in energy computation
   - Pure Hebbian ONLY (PCD removed)
-  - Anomalous dimensions from operator spectrum
-  - v32: D=512, 50K samples — same architecture that worked, WITH F(x) fix
+  - D=512, 50K samples — same architecture, WITH both fixes
 
 Usage:
   python -u train.py                                     # Default: 50K samples
@@ -135,7 +135,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v32 — D=512/50K + F-CLIP FIX"
+        description="Attractor Language Machine v33 — LOG2-F + RG FIX"
     )
 
     # Core parameters
@@ -179,8 +179,8 @@ def main():
                         help="Top-down feedback scale (default: 200)")
 
     # Coupling parameters
-    parser.add_argument("--j-clip", type=int, default=500,
-                        help="Coupling matrix clip value (default: 500)")
+    parser.add_argument("--j-clip", type=int, default=2000,
+                        help="Coupling matrix clip value (default: 2000)")
 
     # Episodic memory
     parser.add_argument("--max-episodes", type=int, default=10000,
@@ -208,7 +208,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v32 — D=512/50K + F(x) FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F + RG FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -225,7 +225,7 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v32 (D=512/50K + F-CLIP FIX)")
+    print(f"CONFIG: Attractor Language Machine v33 (LOG2-F + RG FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
@@ -353,8 +353,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "32.0.0",
-        "architecture": "Attractor Language Machine v32 — D=512/50K + INLINE piecewise F (no J_MAX clip), RG-derived J_eff, pure Hebbian",
+        "version": "33.0.0",
+        "architecture": "Attractor Language Machine v33 — LOG2-F energy (no J_MAX clip) + RG flow fix (no *16 inflation), pure Hebbian",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -393,7 +393,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v32")
+    print(f"DONE — Attractor Language Machine v33")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

@@ -171,7 +171,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v32 — D=512/50K + INLINE PIECEWISE F (NO CLIP)", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F ENERGY + RG FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff REPLACES J at higher levels", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
@@ -307,7 +307,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v32")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v33")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: F-lookup ({f_type_name}, exponential capacity)")
@@ -543,17 +543,17 @@ class AttractorLanguageModel:
 
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # DAM energy with F-lookup nonlinearity (exp_approx)
+                # DAM energy with LOG2-F nonlinearity (v33: no J_MAX clip)
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
-                # Episodic energy
+                # Episodic energy (scale to log2-F range: *100)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
-                )
+                ) * 100
 
-                # Grammar penalty
+                # Grammar penalty (scale to log2-F range: *100)
                 test_types = list(types_list[-5:]) + [chosen_type]
                 test_pos = len(test_types) - 1
                 try:
@@ -562,15 +562,15 @@ class AttractorLanguageModel:
                     )
                 except (IndexError, ValueError):
                     grammar_penalty = 0
-                grammar_energies = np.full(len(candidate_arr), grammar_penalty, dtype=np.int64)
+                grammar_energies = np.full(len(candidate_arr), grammar_penalty * 100, dtype=np.int64)
 
                 total_energies = dam_energies + ep_energies + grammar_energies
 
-                # Repetition penalty
+                # Repetition penalty (scale to log2-F range: *100)
                 recent = set(words[-5:])
                 for i, w in enumerate(candidate_arr):
                     if int(w) in recent:
-                        total_energies[i] += self.same_word_penalty
+                        total_energies[i] += self.same_word_penalty * 100
 
                 min_e = int(total_energies.min())
                 if min_e < best_min_energy:
@@ -667,21 +667,23 @@ class AttractorLanguageModel:
                 context_field[active] = self.dam_scale
                 self.hierarchy.step_all(context_field, n_sweeps=1)
 
-                # F-lookup DAM energies
+                # LOG2-F DAM energies (v33: no J_MAX clip, log2-space)
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
 
+                # Episodic energy (scale to log2-F range: *100)
                 ep_energies = self.episodic.compute_word_episodic_energy(
                     candidate_arr, self.sdr_encoder, self.episodic.field_scale
-                )
+                ) * 100
 
                 total_energies = dam_energies + ep_energies
 
+                # Repetition penalty (scale to log2-F range: *100)
                 recent = set(context_words[-5:])
                 for i, w in enumerate(candidate_arr):
                     if int(w) in recent:
-                        total_energies[i] += self.same_word_penalty
+                        total_energies[i] += self.same_word_penalty * 100
 
                 log_probs = self._sampler.compute_log_probabilities(total_energies)
 
@@ -782,7 +784,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v32 — INLINE PIECEWISE F DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:

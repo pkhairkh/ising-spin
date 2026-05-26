@@ -150,6 +150,13 @@ class DAMLayer:
         # Build F-lookup table (legacy, used only by pairwise diagnostics)
         self._build_F_lookup()
 
+        # Precompute log2 LUT for _log2_piecewise_F (v33 fix)
+        # log2(v) * 256 for v in [0, 2*T] — used by log2-space energy computation
+        T = max(1, self.exp_temperature)
+        self._log2_F_lut = np.zeros(2 * T + 1, dtype=np.int64)
+        for v in range(1, 2 * T + 1):
+            self._log2_F_lut[v] = int(np.log2(v) * 256)  # 8-bit fractional precision
+
         # Diagnostics
         self._stats = {
             'total_hebbian_updates': 0,
@@ -202,6 +209,55 @@ class DAMLayer:
         result = (T + r) << n
 
         # Zero out where x <= 0
+        result = np.where(x > 0, result, np.int64(0))
+
+        return result
+
+    def _log2_piecewise_F(self, x: np.ndarray) -> np.ndarray:
+        """
+        Compute log2(F(x)) in 8-bit fixed-point for energy computation.
+
+        v33 FIX: The raw F(x) = (T+r) << n produces values up to ~1e17
+        for typical fields (5000+). These astronomical values make the
+        Boltzmann sampler unable to discriminate between candidates.
+
+        By computing log2(F(x)) instead, we preserve the RANK ORDER of
+        energies (log is monotonic) while keeping values in a reasonable
+        range for the sampler (~0 to ~53000 for fields up to 20000).
+
+        Formula: log2(F(x)) = log2(T + r) + n
+        where n = x//T (octave), r = x%T (remainder)
+        Since F(x) = (T+r) << n, log2(F) = log2(T+r) + n.
+
+        Returns values in 256x fixed-point (i.e., log2(F) * 256).
+        For T=100, field=5000: log2(F) = log2(100) + 50 ≈ 56.6, returns 14499.
+        For T=100, field=100:  log2(F) = log2(100) + 1  ≈ 7.6,  returns 1957.
+
+        Args:
+            x: Integer field values (D,) int32 or int64.
+
+        Returns:
+            log2(F(x)) * 256 as (D,) int64.
+        """
+        T = max(1, self.exp_temperature)
+        x = np.asarray(x, dtype=np.int64)
+
+        # Positive part only (sparse binary: negative = no connection)
+        x_pos = np.clip(x, 0, None)
+
+        # Octave number and remainder
+        n = x_pos // T
+        r = x_pos % T
+
+        # Lookup log2(T + r) from precomputed table
+        tr = (T + r).astype(np.int64)
+        tr = np.clip(tr, 0, len(self._log2_F_lut) - 1)
+        log2_tr = self._log2_F_lut[tr]
+
+        # Total: log2(F(x)) = log2(T+r) + n (both in 8-bit FP scale=256)
+        result = log2_tr + n * 256
+
+        # Zero where x <= 0
         result = np.where(x > 0, result, np.int64(0))
 
         return result
@@ -807,8 +863,9 @@ class DAMLayer:
                 # Sum of all couplings between blocks
                 block_sum = int(np.sum(self.J[i_start:i_end, j_start:j_end]))
                 # Normalize by block area (mean coupling)
-                # Q4 fixed-point scaling to preserve precision
-                J_eff[alpha, beta] = block_sum * 16 // (block_size * block_size)
+                # Mean coupling between blocks (v33: removed *16 Q4 scaling
+                # that was inflating L1 J_max to 8000 and killing L2-L4)
+                J_eff[alpha, beta] = block_sum // (block_size * block_size)
 
         # Clip to int16 range
         J_eff = np.clip(J_eff, -32768, 32767).astype(np.int16)

@@ -505,23 +505,29 @@ class HierarchicalDAM:
         scale: int = 1600,
     ) -> np.ndarray:
         """
-        Compute energy for each candidate word using F-lookup nonlinearity.
+        Compute energy for each candidate word using LOG2-SPACE F.
 
-        DEEP FIX for Misconception #6: The energy uses the nonlinear F function,
-        NOT linear alignment. With F_EXP_APPROX, this gives exponential capacity.
+        v33 FIX: The old code used F_lookup with J_MAX=1000 clip, which
+        destroyed selectivity for fields > 1000. Even with _piecewise_F
+        (no clip), raw F(x) produces values up to ~1e17, making the
+        Boltzmann sampler unable to discriminate.
 
-        E(w) = -Sigma_{i in active(w)} F(context_field[i])
+        Solution: compute log2(F(x)) instead of F(x). This preserves the
+        rank ordering (log is monotonic) while keeping energies in a
+        reasonable range for the sampler (~0 to ~53000 for fields up to 20000).
 
-        where F is the nonlinear energy function from the F-lookup table.
+        E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / k(w)
+
+        where log2_F(x) = log2(T + x%T) + (x//T) in 256x fixed-point.
 
         Args:
             context_sdr: Context SDR (D0,) uint8.
             candidate_words: Array of candidate word IDs.
             sdr_encoder: SDR encoder for word->SDR mapping.
-            scale: Energy scale multiplier.
+            scale: IGNORED in log2-space (kept for API compatibility).
 
         Returns:
-            Energy array (len(candidate_words),) int64.
+            Energy array (len(candidate_words),) int64. Lower = more likely.
         """
         n_cand = len(candidate_words)
 
@@ -543,35 +549,32 @@ class HierarchicalDAM:
             td_field = self.compute_topdown_field(self.layers[1].state, 0)
             context_field += td_field
 
-        # Compute F-lookup energy for each candidate
-        F_lookup = self.layers[0].F_lookup
-        F_offset = self.layers[0]._F_offset
-        J_MAX = self.layers[0].J_MAX
+        # v33: Compute log2_F for ALL field values at once (no J_MAX clip!)
+        log2_F_all = self.layers[0]._log2_piecewise_F(context_field.astype(np.int64))
 
         energies = np.zeros(n_cand, dtype=np.int64)
 
         for i, w in enumerate(candidate_words):
             w = int(w)
             if w < 0 or w >= sdr_encoder.vocab_size:
-                energies[i] = scale * 10
+                energies[i] = 100000  # High energy for OOV
                 continue
 
             active_bits = sdr_encoder.word_active_bits[w]
             if len(active_bits) == 0:
-                energies[i] = scale * 10
+                energies[i] = 100000
                 continue
 
             k = len(active_bits)
-            total_f = 0
-            for d in active_bits:
-                d = int(d)
-                if 0 <= d < D0:
-                    f_val = int(context_field[d])
-                    f_val = max(-J_MAX, min(J_MAX, f_val))
-                    total_f += int(F_lookup[f_val + F_offset])
+            active_idx = np.asarray(active_bits, dtype=np.intp)
+            valid = (active_idx >= 0) & (active_idx < D0)
+            if np.any(valid):
+                total_f = int(np.sum(log2_F_all[active_idx[valid]]))
+            else:
+                total_f = 0
 
-            # Energy = -F_contribution * scale / k (normalized)
-            energies[i] = -total_f * scale // max(1, k)
+            # Energy = -log2_F_contribution / k (normalized by active bit count)
+            energies[i] = -total_f // max(1, k)
 
         return energies
 
