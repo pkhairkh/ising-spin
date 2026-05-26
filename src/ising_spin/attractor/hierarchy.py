@@ -259,21 +259,25 @@ class HierarchicalDAM:
 
     def compute_coupling_flow(self) -> None:
         """
-        Compute the RG flow of coupling constants from L0 to L3.
+        Compute the RG flow of coupling constants from L0 to L(n-1).
 
-        DEEP FIX for Misconception #1: RG acts on couplings, not spin states.
-        AND the resulting J_eff is used as the actual J at each level.
+        v34 CRITICAL FIX: Previous versions had TWO bugs:
+          1. Used self.layers[l].J (which is ZERO for l>0 since _apply_coupling_flow
+             hasn't been called yet) instead of J_eff[l] for decimation.
+             This is why L2-L4 were always zero.
+          2. Divided by block_size² (mean coupling), which dilutes couplings
+             by 4x per level. After 4 levels: 256x dilution = dead layers.
+             Changed to sum/block_size (Kadanoff block-spin RG: each block-spin
+             represents block_size spins, so coupling per block-spin pair =
+             total / block_size, not total / block_size²).
+          3. Added RG rescaling: after decimation, normalize J_eff to j_clip
+             so that attractor dynamics remain strong at all levels. This is
+             the standard Wilsonian rescaling step (relevant operators must
+             be rescaled to stay in the perturbative regime).
 
         The coupling flow works as follows:
           J_eff[0] = J[0]  (L0 is the UV theory, full couplings)
-          J_eff[l+1] = Decimate(J_eff[l], block_size=D_l/D_{l+1})
-
-        The decimation operator integrates out the within-block degrees
-        of freedom, producing an effective coupling between blocks.
-
-        This ensures that J at each level is CONSISTENT with the level
-        below — it's not independently learned but derived from the UV
-        theory via RG flow.
+          J_eff[l+1] = Rescale(Decimate(J_eff[l], block_size))
         """
         if not self._built or self.n_layers < 2:
             return
@@ -292,43 +296,93 @@ class HierarchicalDAM:
             if J_fine is None:
                 continue
 
-            D_f = J_fine.shape[0]
-            D_c = D_f // block_size
+            # v34 FIX: Decimate J_eff[l] directly, NOT layers[l].J.
+            # layers[l].J is zero for l>0 because _apply_coupling_flow()
+            # hasn't been called yet. This was the root cause of dead L2-L4.
+            J_coarse = self._decimate_J(J_fine, block_size)
 
-            if D_c < 2:
+            if J_coarse is None:
                 break
 
-            # Block decimation: J_eff[a,b] = Sigma_{i in a, j in b} J[i,j] / (|a|*|b|)
-            # Rescale to match the target dimension at level l+1
-            # The resulting matrix has size D_c x D_c
-            # If D_c == D_coarse, we can use it directly
-            # If D_c != D_coarse, we need to re-block
+            # v34 FIX: RG rescaling — normalize J to j_clip so attractor
+            # dynamics remain strong at all levels. This is the standard
+            # Wilsonian rescaling step: relevant operators must be rescaled
+            # to stay in the perturbative regime.
+            J_coarse_max = int(np.max(np.abs(J_coarse)))
+            if J_coarse_max > 0:
+                # Preserve coupling pattern but scale to j_clip range.
+                # This is like multiplying by the RG rescaling factor.
+                scale_factor = self.j_clip / J_coarse_max
+                J_coarse = (J_coarse.astype(np.float64) * scale_factor)
+                J_coarse = np.clip(J_coarse, -32768, 32767)
+                J_coarse = np.round(J_coarse).astype(np.int16)
 
-            J_coarse = self.layers[l].compute_coupling_flow(block_size)
-
-            # If the coarse dimension matches the next layer, use directly
-            if J_coarse.shape[0] == D_coarse:
-                self.J_eff[l + 1] = J_coarse
-            else:
-                # Need to re-block: J_coarse has dim D_c, but next layer has D_coarse
-                # This happens when the halving chain doesn't match
-                # Use the layer's compute_coupling_flow method instead
-                D_target = D_coarse
-                block_size_2 = D_f // D_target
-                if D_f % D_target == 0 and block_size_2 >= 1:
-                    J_coarse = self.layers[l].compute_coupling_flow(block_size_2)
-                    self.J_eff[l + 1] = J_coarse
-                else:
-                    # Fallback: just copy what we have
-                    self.J_eff[l + 1] = J_coarse
+            self.J_eff[l + 1] = J_coarse
 
             # Update RG beta function: ratio of coupling strengths
             J_fine_max = max(1, int(np.max(np.abs(J_fine))))
-            J_coarse_max = max(1, int(np.max(np.abs(J_coarse))))
-            self.rg_beta[l] = J_coarse_max / J_fine_max
+            J_coarse_max_after = max(1, int(np.max(np.abs(J_coarse))))
+            self.rg_beta[l] = J_coarse_max_after / J_fine_max
 
         # Compute anomalous dimensions from operator spectrum
         self._compute_anomalous_dimensions()
+
+    @staticmethod
+    def _decimate_J(J_fine: np.ndarray, block_size: int) -> Optional[np.ndarray]:
+        """
+        Decimate a coupling matrix via Kadanoff block-spin RG.
+
+        v34: Fixed two bugs from the old DAMLayer.compute_coupling_flow():
+          1. Now operates on the GIVEN matrix (J_eff[l]), not layers[l].J
+          2. Uses sum/block_size instead of sum/block_size² (mean)
+
+        The Kadanoff block-spin RG prescription:
+          - Group fine-grained spins into blocks of size block_size
+          - Define block-spin S_a = (1/block_size) * sum_{i in a} s_i
+          - The effective coupling between block-spins is:
+            J_eff[a,b] = sum_{i in a, j in b} J[i,j] / block_size
+
+        Why / block_size (not / block_size²)?
+          Each block-spin S_a represents block_size fine-grained spins.
+          The coupling per block-spin pair is the TOTAL coupling between
+          blocks, divided by one factor of block_size (for the spin
+          normalization). With /block_size² (mean), the coupling dilutes
+          by 4x per level — after 4 levels: 256x dilution = dead layers.
+
+        Args:
+            J_fine: Fine-grained coupling matrix (D, D) int16.
+            block_size: Number of fine-grained spins per block.
+
+        Returns:
+            Decimated coupling matrix (D//block_size, D//block_size) int16,
+            or None if D_coarse < 2.
+        """
+        D = J_fine.shape[0]
+        D_coarse = D // block_size
+
+        if D_coarse < 2:
+            return None
+
+        J_eff = np.zeros((D_coarse, D_coarse), dtype=np.int32)
+
+        for alpha in range(D_coarse):
+            for beta_idx in range(D_coarse):
+                if alpha == beta_idx:
+                    continue
+                i_start = alpha * block_size
+                i_end = i_start + block_size
+                j_start = beta_idx * block_size
+                j_end = j_start + block_size
+
+                # Sum of all couplings between blocks
+                block_sum = int(np.sum(J_fine[i_start:i_end, j_start:j_end]))
+                # Kadanoff: divide by block_size (NOT block_size²)
+                J_eff[alpha, beta_idx] = block_sum // block_size
+
+        # Clip to int16 range
+        J_eff = np.clip(J_eff, -32768, 32767).astype(np.int16)
+
+        return J_eff
 
     def _compute_anomalous_dimensions(self) -> None:
         """

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v33 — Training Script
+Attractor Language Machine v34 — Training Script
 
-v33: LOG2-F ENERGY + RG FIX:
-  - F_EXP_APPROX: piecewise integer exponential (TRUE exponential capacity)
-  - LOG2-SPACE energy: log2(F(x)) keeps values in sampler range
-  - RG flow fix: removed *16 Q4 inflation that killed L2-L4
-  - No J_MAX=1000 field clip in energy computation
-  - Pure Hebbian ONLY (PCD removed)
-  - D=512, 50K samples — same architecture, WITH both fixes
+v34: RG FLOW FIX — two critical bug fixes:
+  - FIX 1: compute_coupling_flow() was decimating layers[l].J (which is ZERO
+    for l>0 since _apply_coupling_flow hasn't run yet) instead of J_eff[l].
+    This is why L2-L4 were always zero — the root cause of dead hierarchy.
+  - FIX 2: Changed decimation from mean (sum/block_size²) to Kadanoff
+    (sum/block_size) + RG rescaling to j_clip. Mean diluted couplings
+    by 4x/level, killing attractor dynamics at higher levels.
+  - Beta calibration: 2.5/p10 instead of 3.5/p10 for better diversity
+
+Architecture unchanged: D=512, 50K samples, LOG2-F energy, Hebbian L0
 
 Usage:
   python -u train.py                                     # Default: 50K samples
@@ -135,7 +138,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v33 — LOG2-F + RG FIX"
+        description="Attractor Language Machine v34 — RG FLOW FIX"
     )
 
     # Core parameters
@@ -208,7 +211,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F + RG FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v34 — RG FLOW FIX", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -225,11 +228,11 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v33 (LOG2-F + RG FIX)")
+    print(f"CONFIG: Attractor Language Machine v34 (RG FLOW FIX)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
-    print(f"    RG flow: Wilsonian (J_eff REPLACES J at higher levels)")
+    print(f"    RG flow: J_eff[l] decimated (v34: was using layers[l].J=0), Kadanoff rescaling")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
@@ -353,8 +356,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "33.0.0",
-        "architecture": "Attractor Language Machine v33 — LOG2-F energy (no J_MAX clip) + RG flow fix (no *16 inflation), pure Hebbian",
+        "version": "34.0.0",
+        "architecture": "Attractor Language Machine v34 — RG flow fix (J_eff decimation, Kadanoff rescaling, beta 2.5/p10), pure Hebbian",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -393,7 +396,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v33")
+    print(f"DONE — Attractor Language Machine v34")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

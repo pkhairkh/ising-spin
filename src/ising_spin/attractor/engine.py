@@ -171,9 +171,9 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F ENERGY + RG FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v34 — RG FLOW FIX", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
-        print("  RG flow: J_eff REPLACES J at higher levels", flush=True)
+        print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -307,7 +307,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v33")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v34")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: F-lookup ({f_type_name}, exponential capacity)")
@@ -373,11 +373,21 @@ class AttractorLanguageModel:
         print(f"    Hebbian training complete: {total_pairs:,} pairs stored")
         print(f"    RG flow applied to all higher levels: {self.hierarchy._rg_applied}")
 
+        # v34: Enhanced RG flow diagnostics
         for l, layer in enumerate(self.hierarchy.layers):
             diag = layer.get_diagnostics()
             source = "Hebbian (L0)" if l == 0 else "RG flow"
+            j_eff_info = ""
+            if l > 0 and self.hierarchy.J_eff[l] is not None:
+                je = self.hierarchy.J_eff[l]
+                j_eff_info = f", J_eff_max={int(np.max(np.abs(je)))}, J_eff_nnz={int(np.sum(je != 0))}"
             print(f"    L{l} [{source}]: J_max={diag['J_max']}, J_nnz={diag['J_nnz']}, "
-                  f"h_max={diag['h_max']}, h_nnz={diag['h_nnz']}")
+                  f"h_max={diag['h_max']}, h_nnz={diag['h_nnz']}{j_eff_info}")
+
+        # Print RG beta functions (should be ~1.0 if rescaling works)
+        for l in range(self.hierarchy.n_layers - 1):
+            if self.hierarchy.rg_beta[l] is not None:
+                print(f"    RG beta L{l}->L{l+1}: {self.hierarchy.rg_beta[l]:.4f}")
 
     def _populate_episodic_memory(self) -> None:
         """Pre-populate episodic memory from training sequences."""
@@ -457,8 +467,12 @@ class AttractorLanguageModel:
             median_de = int(np.median(energy_diffs))
             p10_de = int(np.percentile(energy_diffs, 10))
 
+            # v34: Beta calibration for LOG2-F energy scale (256x FP).
+            # We want beta * p10_dE ≈ 2.5 so the 10th-percentile candidate
+            # gets exp(-2.5) ≈ 8% of the best's probability. This gives
+            # enough diversity for language while still focusing on good candidates.
             theoretical_beta = 0.55 * math.log(2) / max(1, self.dam_scale)
-            empirical_beta = 3.5 / max(1, p10_de)
+            empirical_beta = 2.5 / max(1, p10_de)
 
             self.beta = max(theoretical_beta, min(1.0, empirical_beta))
             print(f"    Median dE: {median_de}, p10 dE: {p10_de}")
@@ -784,7 +798,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v33 — LOG2-F DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v34 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
