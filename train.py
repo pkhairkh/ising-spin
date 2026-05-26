@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v45 — Training Script
+Attractor Language Machine v46 — Training Script
 
-v45: ORDER-SENSITIVE DAM (FUNDAMENTAL FIX)
-  - The DAM is now trained on ORDER-SENSITIVE context SDRs that include
-    M_bind (VSA binding vector encoding bigram order). Previously, the
-    DAM was trained on bag-of-words contexts, making it order-blind —
-    "cat sat" and "sat cat" produced the SAME context SDR.
-  - During training: encode_contexts_batch_with_binding() builds M_bind
-    incrementally per position and includes it in the context SDR before
-    kWTA. The DAM's Hebbian couplings now learn sequence-dependent patterns.
-  - During inference: context_sdr_for_dam includes M_bind via get_context_or(),
-    matching the training-time encoding.
-  - This is the fundamental fix: the DAM energy landscape itself is now
-    order-sensitive, rather than relying on a separate binding bonus.
+v46: BOOSTED BINDING — binding as dominant generation signal
+  - REVERTED v45 order-sensitive DAM training (PPL 1909 regression)
+    The v45 approach trained the DAM on binding-augmented context SDRs,
+    which contaminated the J matrix — same BOW context produced different
+    SDRs depending on word order, and with k=10 active bits the DAM
+    couldn't represent all variations. Result: PPL went from 221→1909.
+  - REVERTED v45 inference: DAM energy uses BOW-only context_sdr again.
+    M_bind is only used for attractor dynamics (context_field) and the
+    separate binding energy bonus. Training/inference consistency restored.
+  - BOOSTED binding weight: 30→100 (binding bonus now dominates DAM dE)
+    With dE_median≈130 and binding overlap 2-3 bits, bonus = 200-300.
+    This makes binding the dominant signal for candidate selection,
+    effectively providing n-gram-like order sensitivity at generation time.
+  - BOOSTED M_bind density: 20→40 (less lossy kWTA compression)
+    With density=40, more binding information survives kWTA, making
+    the unbinding signal more discriminative. Previously density=20
+    kept only 25% of binding bits (20/80 with window=8).
+  - Added --bind-density CLI parameter
+
+v45 failure analysis:
+  The DAM is fundamentally a BOW (bag-of-words) model. Its J matrix
+  captures co-occurrence statistics — which words tend to appear in
+  similar contexts. It CANNOT capture sequential order because the
+  context SDR is a superposition (orderless). The v45 approach tried
+  to make the DAM order-sensitive by injecting binding bits into the
+  training context, but this created inconsistent training signals.
+  The correct approach: DAM captures co-occurrence (BOW), binding
+  captures order (runtime bonus). Separation of concerns.
 
 v44 top-k generation preserved:
   - Repetition penalty removed from compute_perplexity().
@@ -167,7 +183,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v45 — ORDER-SENSITIVE DAM"
+        description="Attractor Language Machine v46 — BOOSTED BINDING"
     )
 
     # Core parameters
@@ -227,10 +243,12 @@ def main():
     # VSA Binding parameters (v39)
     parser.add_argument("--bind-window", type=int, default=8,
                         help="Binding context window size (default: 8)")
-    parser.add_argument("--bind-weight", type=int, default=30,
-                        help="Binding energy weight (default: 30)")
+    parser.add_argument("--bind-weight", type=int, default=100,
+                        help="Binding energy weight (default: 100, was 30 in v44)")
     parser.add_argument("--n-unbind-words", type=int, default=3,
                         help="Number of recent words for multi-step unbinding (default: 3)")
+    parser.add_argument("--bind-density", type=int, default=40,
+                        help="M_bind target density in bits (default: 40, was 20 in v44)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -248,7 +266,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v45 — ORDER-SENSITIVE DAM", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v46 — BOOSTED BINDING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -265,21 +283,21 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v45 (ORDER-SENSITIVE DAM)")
+    print(f"CONFIG: Attractor Language Machine v46 (BOOSTED BINDING)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v45: IN DAM CONTEXT — order-sensitive training):")
+    print(f"  BINDING (v46: BOOSTED — binding dominates generation):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
-    print(f"    Weight: {args.bind_weight}")
+    print(f"    Weight: {args.bind_weight} (v46: boosted from 30)")
     print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
-    print(f"    M_bind: attractor dynamics ONLY (not DAM energy)")
-    print(f"    M_bind density: {2*int(args.sdr_dim * args.sdr_sparsity)} bits ({2*int(args.sdr_dim * args.sdr_sparsity)*100/args.sdr_dim:.1f}%)")
+    print(f"    M_bind density: {args.bind_density} bits (v46: boosted from 20, less lossy kWTA)")
+    print(f"    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)")
     print(f"    Recency: NONE (uniform — recency reverted, hurt PPL)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
@@ -333,6 +351,7 @@ def main():
         bind_window=args.bind_window,
         bind_weight=args.bind_weight,
         n_unbind_words=args.n_unbind_words,
+        bind_density=args.bind_density,
         seed=42,
     )
 
@@ -410,8 +429,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "45.0.0",
-        "architecture": "Attractor Language Machine v45 — ORDER-SENSITIVE DAM (v45: M_bind included in context SDR during BOTH training and inference, DAM now learns order-dependent couplings natively instead of relying on separate binding bonus, encode_contexts_batch_with_binding builds M_bind incrementally per position), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
+        "version": "46.0.0",
+        "architecture": "Attractor Language Machine v46 — BOOSTED BINDING (v46: reverted v45 order-sensitive DAM training which caused PPL 221→1909 regression, DAM trained on BOW-only contexts again, binding weight boosted 30→100 for dominant generation signal, M_bind density boosted 20→40 for less lossy kWTA compression, DAM energy uses BOW-only context_sdr while M_bind is only for attractor dynamics and binding bonus), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}, density={d}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words, d=args.bind_density),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -429,6 +448,7 @@ def main():
             "bind_window": args.bind_window,
             "bind_weight": args.bind_weight,
             "n_unbind_words": args.n_unbind_words,
+            "bind_density": args.bind_density,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -453,7 +473,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v45")
+    print(f"DONE — Attractor Language Machine v46")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
