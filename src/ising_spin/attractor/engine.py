@@ -18,7 +18,7 @@ DEEP FIXES (v28 — from knowledge base analysis):
   3. Ward identity UV checks (not just spectral gap / cutoff sensitivity)
   4. Pure Hebbian ONLY (PCD removed — unnecessary at right sparsity)
   5. Anomalous dimensions from operator spectrum of J (not running correlations)
-  6. DAM energy alone drives word selection (no n-gram crutch)
+  6. DAM energy + POS skeleton + bigram J2 drives word selection (v51)
   7. D decreasing: 512->256->128->64 (RG reduces DOF at coarser scales)
 
 WHAT'S KEPT:
@@ -103,6 +103,10 @@ class AttractorLanguageModel:
         bind_density: int = 0,  # 0 = auto (2*k=20)
         # Bigram DAM (v49)
         bigram_weight: int = 0,  # 0 = disabled; v49 default in train.py is 8
+        # Skip bigram (v51)
+        skip_weight: int = 0,  # 0 = disabled; weight for J2[words[-2], c]
+        # POS skeleton (v51)
+        pos_weight: int = 0,  # 0 = disabled; weight for POS trigram transitions
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -132,10 +136,14 @@ class AttractorLanguageModel:
         self._n_unbind_words = n_unbind_words
         self._bind_density = bind_density
         self._bigram_weight = bigram_weight
+        self._skip_weight = skip_weight
+        self._pos_weight = pos_weight
 
         # Built during training
         self.vocab = None
         self.J2 = None  # v49: Bigram coupling matrix (V, V) int32, log-normalized
+        self.J_pos_bi = None  # v51: POS bigram transition matrix (N_POS, N_POS) int32, log-normalized
+        self.J_pos_tri = None  # v51: POS trigram transition matrix (N_POS, N_POS, N_POS) int32, log-normalized
         self.pos_system = None
         self.sdr_encoder: Optional[SDREncoder] = None
         self.hierarchy: Optional[HierarchicalDAM] = None
@@ -186,15 +194,17 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v50 — STRONGER BIGRAM", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v51 — POS SKELETON", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
         print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
-        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized, v50: stronger)")
-        print("  Training: BOW-only DAM + log-normalized bigram J2", flush=True)
+        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)", flush=True)
+        print(f"  Skip bigram: J2[words[-2]] weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)", flush=True)
+        print(f"  POS skeleton: trigram weight={self._pos_weight}{' (disabled)' if self._pos_weight == 0 else ''} (v51)", flush=True)
+        print("  Training: BOW DAM + bigram J2 + skip J2 + POS trigram skeleton", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -337,6 +347,10 @@ class AttractorLanguageModel:
         if self._bigram_weight > 0:
             self._build_bigram_j2()
 
+        # v51: Build POS trigram skeleton
+        if self._pos_weight > 0:
+            self._build_pos_skeleton()
+
         self._calibrate_beta()
 
         # v42: Reset binding context after calibration — avoids showing
@@ -356,15 +370,16 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v50")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v51")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
-        print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
-        print(f"  v50: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized, stronger)")
-        print(f"  v50: BOW DAM + log-normalized bigram coupling (dominant for strong transitions)")
+        print(f"  Generation: top-k=5 (v51) + Boltzmann sampling")
+        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)")
+        print(f"  Skip bigram: weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)")
+        print(f"  POS skeleton: weight={self._pos_weight}{' (disabled)' if self._pos_weight == 0 else ''} (v51)")
 
         self._print_diagnostics()
 
@@ -405,15 +420,16 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v50: Using BOW-ONLY context encoding (same as v44)", flush=True)
+        print(f"    v51: Using BOW-ONLY context encoding (same as v44)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v50: BOW-only context encoding (same as v44).
-        # Bigram order is captured by J2 (separate energy term), not by
-        # contaminating the BOW DAM's J matrix.
+        # v51: BOW-only context encoding (same as v44).
+        # Bigram order is captured by J2 (separate energy term) + skip J2,
+        # and syntactic structure by POS skeleton, not by contaminating the
+        # BOW DAM's J matrix.
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
             self.sequences,
             context_window=context_window,
@@ -496,9 +512,10 @@ class AttractorLanguageModel:
         j2_nnz = int(np.sum(J2_log > 0))
         j2_log_max = int(np.max(J2_log))
         j2_mem_mb = J2_log.nbytes / (1024 * 1024)
-        print(f"    Bigram J2 (v49 LOG-normalized): {n_bigrams:,} bigrams, "
+        print(f"    Bigram J2 (LOG-normalized): {n_bigrams:,} bigrams, "
               f"{j2_nnz:,} non-zero entries, raw_max={self._j2_raw_max}, "
-              f"log_max={j2_log_max}, memory={j2_mem_mb:.1f} MB")
+              f"log_max={j2_log_max}, weight={self._bigram_weight}, "
+              f"skip_weight={self._skip_weight}, memory={j2_mem_mb:.1f} MB")
 
     def _compute_bigram_energy(
         self,
@@ -528,6 +545,152 @@ class AttractorLanguageModel:
         if np.any(valid_mask):
             bigram_log_counts = self.J2[prev_word, candidate_words[valid_mask]]
             energies[valid_mask] = -(bigram_log_counts.astype(np.int64) * self._bigram_weight)
+
+        return energies
+
+    def _build_pos_skeleton(self) -> None:
+        """v51: Build POS bigram/trigram transition matrices for syntactic backbone.
+
+        The POS skeleton captures the SYNTACTIC STRUCTURE of language:
+        - DET → ADJ/NOUN is highly likely (sentence-initial pattern)
+        - NOUN → VERB is highly likely (subject-verb)
+        - VERB → DET/PREP/ADV is highly likely (post-verbal)
+        - etc.
+
+        This is the "missing layer" between the grammar system (which only
+        penalizes INVALID transitions) and the word-level J2 (which has no
+        notion of syntactic category). J_pos provides a BONUS for likely
+        POS transitions, guiding the model toward syntactically coherent
+        type selection.
+
+        Matrices:
+          J_pos_bi[prev_type, next_type]: 13×13 int32, log2(count+1)
+          J_pos_tri[prev2_type, prev1_type, next_type]: 13×13×13 int32, log2(count+1)
+
+        Memory: 169 + 2197 = 2366 entries ≈ 9.4 KB (trivial).
+
+        The trigram backs off to bigram when count is 0.
+        """
+        from ..vocabulary.pos import POS2IDX, N_POS
+        from ..utils import primary_pos_tag
+
+        # Count POS transitions from training sequences
+        pos_bi_counts = np.zeros((N_POS, N_POS), dtype=np.int64)
+        pos_tri_counts = np.zeros((N_POS, N_POS, N_POS), dtype=np.int64)
+
+        for seq in self.sequences:
+            # Get POS type sequence
+            types_seq = []
+            for w in seq:
+                allowed = self.pos_system.allowed_types.get(w, set())
+                t = primary_pos_tag(allowed) if allowed else POS2IDX["X"]
+                types_seq.append(t)
+
+            # Count bigram transitions
+            for i in range(len(types_seq) - 1):
+                t1 = types_seq[i]
+                t2 = types_seq[i + 1]
+                pos_bi_counts[t1, t2] += 1
+
+            # Count trigram transitions
+            for i in range(len(types_seq) - 2):
+                t1 = types_seq[i]
+                t2 = types_seq[i + 1]
+                t3 = types_seq[i + 2]
+                pos_tri_counts[t1, t2, t3] += 1
+
+        # Log-normalize (same as J2): log2(count+1)
+        self.J_pos_bi = np.log2(pos_bi_counts.astype(np.float64) + 1.0).astype(np.int32)
+        self.J_pos_tri = np.log2(pos_tri_counts.astype(np.float64) + 1.0).astype(np.int32)
+
+        bi_log_max = int(np.max(self.J_pos_bi))
+        tri_log_max = int(np.max(self.J_pos_tri))
+        bi_nnz = int(np.sum(self.J_pos_bi > 0))
+        tri_nnz = int(np.sum(self.J_pos_tri > 0))
+
+        print(f"    POS skeleton (v51): bigram {bi_nnz} nnz (log_max={bi_log_max}), "
+              f"trigram {tri_nnz} nnz (log_max={tri_log_max}), "
+              f"weight={self._pos_weight}, "
+              f"max_energy={bi_log_max * self._pos_weight}")
+
+    def _compute_pos_energy(
+        self,
+        types_history: List[int],
+        candidate_types: np.ndarray,
+    ) -> np.ndarray:
+        """v51: Compute POS transition energy bonus for each candidate word.
+
+        Uses POS trigram (if available) backed off to bigram.
+        E_pos(c) = -J_pos[prev_types, type_of(c)] * pos_weight
+
+        This gives ALL words of a syntactically-favored POS type a bonus.
+        For example, after DET ADJ, NOUN gets a big bonus; after VERB, PREP/DET get bonus.
+
+        Vectorized: uses fancy indexing instead of Python loops.
+        """
+        if self.J_pos_bi is None:
+            return np.zeros(len(candidate_types), dtype=np.int64)
+
+        N_POS = self.J_pos_bi.shape[0]
+        n = len(candidate_types)
+        energies = np.zeros(n, dtype=np.int64)
+
+        # Clip candidate types to valid range
+        valid = (candidate_types >= 0) & (candidate_types < N_POS)
+
+        # Get recent POS types
+        if len(types_history) >= 2 and self.J_pos_tri is not None:
+            t_prev2 = types_history[-2]
+            t_prev1 = types_history[-1]
+            if 0 <= t_prev2 < N_POS and 0 <= t_prev1 < N_POS:
+                # Vectorized trigram lookup
+                tri_vals = np.zeros(n, dtype=np.int32)
+                bi_vals = np.zeros(n, dtype=np.int32)
+                tri_vals[valid] = self.J_pos_tri[t_prev2, t_prev1, candidate_types[valid]]
+                bi_vals[valid] = self.J_pos_bi[t_prev1, candidate_types[valid]]
+                # Use trigram where available, bigram backoff elsewhere
+                use_tri = tri_vals > 0
+                use_bi = (~use_tri) & (bi_vals > 0)
+                energies[use_tri] = -(tri_vals[use_tri].astype(np.int64) * self._pos_weight)
+                energies[use_bi] = -(bi_vals[use_bi].astype(np.int64) * self._pos_weight * 3 // 4)  # 75% backoff
+        elif len(types_history) >= 1:
+            t_prev1 = types_history[-1]
+            if 0 <= t_prev1 < N_POS:
+                # Vectorized bigram lookup
+                bi_vals = np.zeros(n, dtype=np.int32)
+                bi_vals[valid] = self.J_pos_bi[t_prev1, candidate_types[valid]]
+                nonzero = bi_vals > 0
+                energies[nonzero] = -(bi_vals[nonzero].astype(np.int64) * self._pos_weight)
+        # else: no history, no POS bonus
+
+        return energies
+
+    def _compute_skip_energy(
+        self,
+        skip_word: int,
+        candidate_words: np.ndarray,
+    ) -> np.ndarray:
+        """v51: Compute skip bigram energy — J2[words[-2], c] at reduced weight.
+
+        The skip bigram captures patterns like:
+        - "the ___ girl" → what follows after a 1-word gap?
+        - "a little ___" → what follows "a" with "little" in between?
+
+        This provides a 2-word context window using only the existing J2 matrix.
+        Weight is typically bigram_weight // 3 or // 4.
+        """
+        if self.J2 is None or self._skip_weight <= 0:
+            return np.zeros(len(candidate_words), dtype=np.int64)
+
+        if skip_word < 0 or skip_word >= self.J2.shape[0]:
+            return np.zeros(len(candidate_words), dtype=np.int64)
+
+        valid_mask = (candidate_words >= 0) & (candidate_words < self.J2.shape[1])
+        energies = np.zeros(len(candidate_words), dtype=np.int64)
+
+        if np.any(valid_mask):
+            skip_log_counts = self.J2[skip_word, candidate_words[valid_mask]]
+            energies[valid_mask] = -(skip_log_counts.astype(np.int64) * self._skip_weight)
 
         return energies
 
@@ -637,6 +800,21 @@ class AttractorLanguageModel:
                     prev_word = seq[pos - 1]
                     bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
                     energies += bigram_energy
+
+                # v51: Add skip bigram energy
+                if self.J2 is not None and self._skip_weight > 0 and pos >= 2:
+                    skip_word = seq[pos - 2]
+                    skip_energy = self._compute_skip_energy(skip_word, candidate_arr)
+                    energies += skip_energy
+
+                # v51: Add POS skeleton energy
+                if self.J_pos_bi is not None and self._pos_weight > 0:
+                    type_hist = [self._get_word_type(w) for w in seq[:pos]]
+                    candidate_types = np.array([
+                        self._get_word_type(int(w)) for w in candidate_arr
+                    ], dtype=np.int64)
+                    pos_energy = self._compute_pos_energy(type_hist, candidate_types)
+                    energies += pos_energy
 
                 e_min = energies.min()
                 diffs = energies - e_min
@@ -834,6 +1012,21 @@ class AttractorLanguageModel:
                     bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
                     total_energies += bigram_energy
 
+                # v51: Add skip bigram energy — J2[words[-2], c]
+                if self.J2 is not None and self._skip_weight > 0 and len(words) >= 2:
+                    skip_word = words[-2]  # word 2 positions back
+                    skip_energy = self._compute_skip_energy(skip_word, candidate_arr)
+                    total_energies += skip_energy
+
+                # v51: Add POS skeleton energy — bonus for syntactically likely types
+                if self.J_pos_bi is not None and self._pos_weight > 0:
+                    # Compute POS type for each candidate
+                    candidate_types = np.array([
+                        self._get_word_type(int(w)) for w in candidate_arr
+                    ], dtype=np.int64)
+                    pos_energy = self._compute_pos_energy(types_list, candidate_types)
+                    total_energies += pos_energy
+
                 # v40: Repetition penalty — FIXED: use same_word_penalty (800),
                 # window=15 words, distance-based decay (closer = stronger).
                 # v39 BUG: same_word_penalty=800 was dead code — actual penalty was
@@ -865,12 +1058,10 @@ class AttractorLanguageModel:
                 best_energies = np.array([0], dtype=np.int64)
 
             # v44: Top-k filtering before Boltzmann sampling.
-            # Keep only the k lowest-energy candidates to prevent
-            # low-probability "tail" words from being sampled.
-            # With 300 candidates per type, Boltzmann sampling spreads
-            # probability too thinly, causing incoherent generation.
-            # Top-k=10 focuses the sampler on the most likely words.
-            top_k = 10
+            # v51: Reduced from 10 → 5 for more coherent generation.
+            # With POS skeleton + skip bigram providing structure, fewer
+            # candidates need to be considered. Less randomness = more coherence.
+            top_k = 5
             if len(best_energies) > top_k:
                 # Find indices of top-k lowest energies
                 kth = min(top_k, len(best_energies))
@@ -1003,6 +1194,22 @@ class AttractorLanguageModel:
                     bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
                     total_energies += bigram_energy
 
+                # v51: Add skip bigram energy
+                if self.J2 is not None and self._skip_weight > 0 and pos >= 2:
+                    skip_word = seq[pos - 2]
+                    skip_energy = self._compute_skip_energy(skip_word, candidate_arr)
+                    total_energies += skip_energy
+
+                # v51: Add POS skeleton energy
+                if self.J_pos_bi is not None and self._pos_weight > 0:
+                    # Build type history from the sequence
+                    type_hist = [self._get_word_type(w) for w in seq[:pos]]
+                    candidate_types = np.array([
+                        self._get_word_type(int(w)) for w in candidate_arr
+                    ], dtype=np.int64)
+                    pos_energy = self._compute_pos_energy(type_hist, candidate_types)
+                    total_energies += pos_energy
+
                 # v41: Repetition penalty REMOVED from PPL evaluation.
                 # The repetition penalty is a generation-time anti-loop mechanism.
                 # Applying it during PPL evaluation artificially inflates PPL by
@@ -1115,7 +1322,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v50 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v51 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -1172,8 +1379,20 @@ class AttractorLanguageModel:
             print(f"  Bigram J2 (LOG): {j2_nnz:,} non-zero, log_max={j2_log_max}, "
                   f"raw_max={raw_max}, weight={self._bigram_weight}, "
                   f"max_energy={j2_log_max * self._bigram_weight}, memory={j2_mem_mb:.1f} MB")
+            if self._skip_weight > 0:
+                print(f"  Skip bigram: weight={self._skip_weight}, "
+                      f"max_energy={j2_log_max * self._skip_weight} (reuses J2)")
         else:
             print(f"  Bigram J2: disabled (weight=0)")
+
+        # v51: POS skeleton diagnostics
+        if self.J_pos_bi is not None:
+            bi_log_max = int(np.max(self.J_pos_bi))
+            tri_log_max = int(np.max(self.J_pos_tri)) if self.J_pos_tri is not None else 0
+            print(f"  POS skeleton: bi_log_max={bi_log_max}, tri_log_max={tri_log_max}, "
+                  f"weight={self._pos_weight}, max_bi_energy={bi_log_max * self._pos_weight}")
+        else:
+            print(f"  POS skeleton: disabled (weight=0)")
 
         print("=" * 70)
 
