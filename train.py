@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v51 — Training Script
+Attractor Language Machine v52 — Training Script
 
-v51: POS SKELETON + SKIP BIGRAM — add syntactic backbone for coherent generation
-  - v50 had PPL=16.65 (great!) but generation was still word salad:
-    "once upon a time learned took it must patient was do dad..."
-  - Root cause: J2 bigram is only order-1 Markov. After the prompt, the model
-    makes locally-correct but globally-incoherent choices. The DAM provides
-    semantic coherence (BOW) but no positional info. Grammar penalties are
-    too weak (~120) vs J2 (max 256) for common bigrams.
-  - v51 FIX: Three changes to add syntactic structure:
-    1. POS trigram skeleton (J_pos): 13×13×13 matrix of POS transition
-       log-probabilities. Gives ALL words of a syntactically-favored POS
-       type a bonus. Captures DET→ADJ→NOUN→VERB patterns.
-    2. Skip bigram: J2[words[-2], c] at reduced weight. Captures patterns
-       like "the ___ girl → VERB" (2-word lookback using same J2 matrix).
-    3. Balanced energy: J2 weight 16→10, skip weight=3, POS weight=15,
-       top-k 10→5 for less randomness.
-  - Expected: more coherent generation (POS skeleton guides type selection,
-    skip bigram extends context from 1 to 2 words)
-
-v50 had PPL=16.65 with J2 weight=16 (bigram-dominant). v51 reduces J2 to 10
-but adds skip (3) + POS (15) for a more balanced energy landscape where
-syntactic structure and local order both contribute.
+v52: POSITIONAL VSA CONTEXT — fix the order-blind BOW encoding
+  - v50 had PPL=16.65 (great!) but generation was word salad.
+  - v51 added POS skeleton (13 types) — too coarse, PPL regressed to 27.73.
+  - ROOT CAUSE: BOW context encoding destroys word order. The DAM knows
+    "what words appear together" but not "in what order". During generation,
+    each wrong word pollutes the BOW, causing error cascade.
+  - v52 FIX: Replace BOW with positional VSA context encoding.
+    Each word's SDR is rotated by its relative position hash before
+    superposition. "the cat" and "cat the" now produce DIFFERENT context
+    SDRs. The DAM can learn order-dependent patterns natively.
+  - Key difference from v45 (which failed, PPL 221→1909):
+    v45 used content-dependent hash (bind(word, hash(prev_word))) →
+    same BOW context produced different SDRs → DAM couldn't handle it.
+    v52 uses position-dependent hash (rotate(word, hash(rel_pos))) →
+    same ordered context always produces the same SDR → consistent training.
+  - Also: restore bigram_weight=16, skip_weight=5, remove POS skeleton,
+    reduce bind_weight to 15 (positional VSA handles order in DAM now),
+    restore top-k=10.
 
 Architecture: D=512, 50K samples, Hebbian L0
 
@@ -151,7 +148,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v51 — POS SKELETON"
+        description="Attractor Language Machine v52 — POSITIONAL VSA"
     )
 
     # Core parameters
@@ -211,22 +208,22 @@ def main():
     # VSA Binding parameters (v39)
     parser.add_argument("--bind-window", type=int, default=8,
                         help="Binding context window size (default: 8)")
-    parser.add_argument("--bind-weight", type=int, default=30,
-                        help="Binding energy weight (default: 30, v44 value)")
+    parser.add_argument("--bind-weight", type=int, default=15,
+                        help="Binding energy weight (default: 15, v52 reduced — positional VSA handles order in DAM)")
     parser.add_argument("--n-unbind-words", type=int, default=3,
                         help="Number of recent words for multi-step unbinding (default: 3)")
     parser.add_argument("--bind-density", type=int, default=0,
                         help="M_bind target density in bits (default: 0=auto, i.e. 2*k=20, v44 value)")
 
-    # Bigram DAM (v51: balanced with POS skeleton)
-    parser.add_argument("--bigram-weight", type=int, default=10,
-                        help="Bigram coupling weight (default: 10 for log-normalized, 0=disabled)")
-    # Skip bigram (v51)
-    parser.add_argument("--skip-weight", type=int, default=3,
-                        help="Skip bigram weight for J2[words[-2],c] (default: 3, 0=disabled)")
-    # POS skeleton (v51)
-    parser.add_argument("--pos-weight", type=int, default=15,
-                        help="POS trigram skeleton weight (default: 15, 0=disabled)")
+    # Bigram DAM (v52: strong bigram + positional VSA context)
+    parser.add_argument("--bigram-weight", type=int, default=16,
+                        help="Bigram coupling weight (default: 16 for log-normalized, 0=disabled)")
+    # Skip bigram (v52: increased weight)
+    parser.add_argument("--skip-weight", type=int, default=5,
+                        help="Skip bigram weight for J2[words[-2],c] (default: 5, 0=disabled)")
+    # POS skeleton (v52: disabled — positional VSA replaces it)
+    parser.add_argument("--pos-weight", type=int, default=0,
+                        help="POS trigram skeleton weight (default: 0=disabled, positional VSA replaces it)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -244,7 +241,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v51 — POS SKELETON", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v52 — POSITIONAL VSA", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -261,14 +258,14 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v51 (POS SKELETON)")
+    print(f"CONFIG: Attractor Language Machine v52 (POSITIONAL VSA)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v51: VSA secondary — J2 + POS skeleton are primary):")
+    print(f"  BINDING (v52: VSA secondary — positional VSA + J2 are primary):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
@@ -277,14 +274,14 @@ def main():
     print(f"    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits")
     print(f"    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)")
     print(f"    Recency: NONE (uniform — recency reverted, hurt PPL)")
-    print(f"  BIGRAM DAM (v51: BALANCED with POS skeleton):")
+    print(f"  BIGRAM DAM (v52: STRONG bigram + positional VSA context):")
     print(f"    J2: V×V int32 matrix of log2(count+1) values")
     print(f"    Weight: {args.bigram_weight}{' (DISABLED)' if args.bigram_weight == 0 else ''}")
     print(f"    Skip bigram: J2[words[-2],c] weight={args.skip_weight}{' (DISABLED)' if args.skip_weight == 0 else ''}")
     print(f"    Energy: E_bigram(c) = -J2[prev_word, c] * weight")
     print(f"    Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}")
     print(f"    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB")
-    print(f"  POS SKELETON (v51: syntactic backbone):")
+    print(f"  POS SKELETON (v52: DISABLED — positional VSA replaces it):")
     print(f"    J_pos_bi: 13×13 POS bigram transitions, log2(count+1)")
     print(f"    J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)")
     print(f"    Weight: {args.pos_weight}{' (DISABLED)' if args.pos_weight == 0 else ''}")
@@ -298,7 +295,7 @@ def main():
     print(f"    DAM scale={args.dam_scale}")
     print(f"    Episodic scale={args.episodic_scale}")
     print(f"    Same-word penalty={args.same_word_penalty} (generation only, not PPL)")
-    print(f"    Generation: top-k=5 + Boltzmann (v51)")
+    print(f"    Generation: top-k=10 + Boltzmann (v52)")
     print(f"    Repetition window=15, distance-decay (v40 fix)")
     print(f"    Grammar penalty scaled to ~33% median_dE (v40 fix)")
     print(f"    Special tokens (idx<4) filtered from candidates (v40 fix)")
@@ -423,8 +420,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "51.0.0",
-        "architecture": "Attractor Language Machine v51 — POS SKELETON (v51: POS trigram skeleton J_pos[prev2_type, prev1_type, next_type] for syntactic backbone, skip bigram J2[words[-2],c] for 2-word lookback, balanced energy: J2 weight={bw}, skip weight={sw}, POS weight={pw}, top-k=5)".format(bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight),
+        "version": "52.0.0",
+        "architecture": "Attractor Language Machine v52 — POSITIONAL VSA (v52: positional VSA context encoding — rotate(word_sdr, pos_hash(rel_pos)) before superposition, preserving word ORDER in context SDR; bigram J2 weight={bw}, skip weight={sw}, POS weight={pw} (disabled), bind weight={bind_w}, top-k=10)".format(bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -470,7 +467,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v51")
+    print(f"DONE — Attractor Language Machine v52")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

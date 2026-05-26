@@ -158,7 +158,7 @@ class SDREncoder:
         context_window: int = 10,
     ) -> np.ndarray:
         """
-        Encode a context (sequence of words) as a sparse SDR.
+        Encode a context (sequence of words) as a sparse SDR — BOW.
 
         Method: superposition of word SDRs, then kWTA.
         The superposition (element-wise sum) accumulates evidence
@@ -169,6 +169,9 @@ class SDREncoder:
         - Repeated words: their dimensions get higher activation
         - Overlapping contexts: similar words → overlapping SDRs
         - Variable-length context: kWTA normalizes to fixed sparsity
+
+        NOTE: This is BOW (bag-of-words) — order is LOST.
+        Use encode_context_positional for order-preserving encoding.
 
         Args:
             word_ids: List of word indices in the context.
@@ -199,6 +202,73 @@ class SDREncoder:
 
         context_sdr = np.zeros(self.D, dtype=np.uint8)
         top_k = np.argpartition(acc, -self.k)[-self.k:]
+        context_sdr[top_k] = 1
+
+        return context_sdr
+
+    def encode_context_positional(
+        self,
+        word_ids: List[int],
+        context_window: int = 10,
+    ) -> np.ndarray:
+        """
+        Encode context with POSITIONAL VSA binding — order-preserving.
+
+        v52: Replaces BOW superposition with position-bound superposition.
+        Each word's SDR is rotated by its RELATIVE position hash before
+        being added to the accumulator. This preserves word order:
+
+          "the cat" at positions (-2, -1):
+              context = rotate(sdr["the"], hash(-2)) + rotate(sdr["cat"], hash(-1))
+          "cat the" at positions (-2, -1):
+              context = rotate(sdr["cat"], hash(-2)) + rotate(sdr["the"], hash(-1))
+
+        These produce DIFFERENT context SDRs — the DAM can now learn
+        order-dependent associations (not just co-occurrence).
+
+        Position hash: (rel_pos * PRIME + 1) % D
+        where PRIME = 7919 gives excellent spread across [0, D-1].
+
+        Relative position: 1 = most recent word, 2 = one before, etc.
+        So the last word in the context has the strongest positional signal.
+
+        Args:
+            word_ids: List of word indices in the context.
+            context_window: Only use the last `context_window` words.
+
+        Returns:
+            Binary vector (D,) uint8 with exactly k active bits.
+        """
+        if not self._built:
+            raise RuntimeError("SDREncoder not built — call build() first")
+
+        # Use only recent context
+        recent = word_ids[-context_window:] if len(word_ids) > context_window else word_ids
+
+        if not recent:
+            return np.zeros(self.D, dtype=np.uint8)
+
+        D = self.D
+        k = self.k
+        PRIME = 7919
+
+        acc = np.zeros(D, dtype=np.int32)
+        n_recent = len(recent)
+
+        for i, w in enumerate(recent):
+            if 0 <= w < self.vocab_size:
+                # Relative position: 1 = most recent, n_recent = oldest
+                rel_pos = n_recent - i
+                shift = (rel_pos * PRIME + 1) % D
+                # Rotate SDR by position hash — preserves order information
+                acc += np.roll(self.word_sdrs[w].astype(np.int32), shift)
+
+        # kWTA: keep top k
+        if np.sum(acc > 0) == 0:
+            return np.zeros(D, dtype=np.uint8)
+
+        context_sdr = np.zeros(D, dtype=np.uint8)
+        top_k = np.argpartition(acc, -k)[-k:]
         context_sdr[top_k] = 1
 
         return context_sdr
@@ -521,6 +591,183 @@ class SDREncoder:
             yield ctx_arr, tgt_arr
 
         print(f"        [encode] Done: {total_pairs} total pairs (with binding)", flush=True)
+
+        if callback:
+            callback(len(sequences), total_pairs)
+
+    def encode_contexts_batch_positional(
+        self,
+        sequences: List[List[int]],
+        context_window: int = 10,
+        batch_size: int = 50000,
+        callback=None,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """
+        VECTORIZED batch POSITIONAL VSA context encoding for Hebbian training.
+
+        v52: Replaces BOW cumsum with position-bound superposition.
+        Each word's SDR is rotated by its RELATIVE position hash before
+        being summed into the context accumulator. This preserves word
+        order in the context SDR, allowing the DAM to learn sequential
+        patterns (not just co-occurrence).
+
+        Key difference from v45 binding encoding:
+          - v45 used content-dependent hash: bind(word, hash(prev_word))
+            → same BOW context produced different SDRs depending on order
+            → DAM couldn't handle the variation → PPL regressed 221→1909
+          - v52 uses position-dependent hash: rotate(word, hash(rel_pos))
+            → same ordered context always produces the same SDR
+            → consistent training signals → DAM can learn position-dependent patterns
+
+        Implementation:
+        1. Pre-compute rotated SDRs for all words at all relative positions
+           rotated_all[r, w, :] = roll(word_sdrs[w], pos_hash(r+1))
+           Memory: W * V * D bytes ≈ 10 MB for W=10, V=2000, D=512
+
+        2. For each sequence, gather rotated SDRs per relative position
+           using numpy advanced indexing, then sum to get context accumulator.
+           Vectorized per-relative-position: O(W) per sequence instead of O(n*W).
+
+        3. Apply kWTA in bulk (same as BOW version).
+
+        Speed: ~2-3x slower than BOW cumsum, but still processes
+        50K sequences in ~1-2 minutes on Raspberry Pi 5.
+
+        Args:
+            sequences: List of token sequences.
+            context_window: Context window size.
+            batch_size: Yield every this many pairs (for memory control).
+            callback: Optional callable(seq_idx, total_pairs) for progress.
+
+        Yields:
+            (context_sdrs, target_sdrs) — each (N, D) uint8 arrays.
+        """
+        if not self._built:
+            raise RuntimeError("SDREncoder not built — call build() first")
+
+        D = self.D
+        k = self.k
+        V = self.vocab_size
+        word_sdrs = self.word_sdrs  # (V, D) uint8
+
+        PRIME = 7919
+
+        # Pre-compute position shifts for relative positions 1..context_window
+        pos_shifts = [(r * PRIME + 1) % D for r in range(1, context_window + 1)]
+
+        # Pre-compute rotated SDRs for all words at all relative positions
+        # rotated_all[r, w, :] = roll(word_sdrs[w], pos_shifts[r])
+        # r: 0 = relative position 1 (most recent), W-1 = relative position W (oldest)
+        print(f"        [encode_positional] Pre-computing rotated SDRs: "
+              f"{context_window} pos x {V} words x {D} dims = "
+              f"{context_window * V * D / 1024 / 1024:.1f} MB...", flush=True)
+        rotated_all = np.zeros((context_window, V, D), dtype=np.int8)
+        for r in range(context_window):
+            rotated_all[r] = np.roll(word_sdrs.astype(np.int8), pos_shifts[r], axis=1)
+
+        print(f"        [encode_contexts_batch_positional] Starting: {len(sequences)} seqs, "
+              f"D={D}, k={k}, batch_size={batch_size}", flush=True)
+
+        batch_ctx = []
+        batch_tgt = []
+        total_pairs = 0
+        t_start = time.time()
+        n_seqs_processed = 0
+
+        for seq_idx, seq in enumerate(sequences):
+            seq_len = len(seq)
+            if seq_len < 3:
+                continue
+
+            # Filter valid word IDs
+            valid_seq = [w for w in seq if 0 <= w < V]
+            if len(valid_seq) < 3:
+                continue
+
+            n = len(valid_seq)
+            valid_seq_arr = np.array(valid_seq, dtype=np.int64)
+
+            # Compute positional context accumulators for all target positions
+            # using per-relative-position vectorized approach.
+            #
+            # For relative position r (0-based, 0=most recent):
+            #   Target positions with a word at this relative position: r+1, r+2, ..., n-1
+            #   Word at target p, relative position r+1: valid_seq[p-1-r]
+            #   Its rotated SDR: rotated_all[r, valid_seq[p-1-r]]
+            #
+            # We process one relative position at a time, gathering ALL words
+            # at that position across all targets, then add to the accumulator.
+            context_acc = np.zeros((n - 1, D), dtype=np.int32)
+            W = min(context_window, n - 1)
+
+            for r in range(W):
+                # Words at relative position r+1 for all valid target positions
+                p_range = np.arange(r + 1, n)
+                word_indices = valid_seq_arr[p_range - 1 - r]
+                # Gather rotated SDRs using advanced indexing: (n-1-r, D)
+                rotated_at_r = rotated_all[r, word_indices]
+                context_acc[r:n-1] += rotated_at_r
+
+            # kWTA for ALL positions at once using 2D argpartition
+            nonzero_mask = np.max(context_acc, axis=1) > 0
+            n_valid = int(np.sum(nonzero_mask))
+            if n_valid == 0:
+                continue
+
+            valid_acc = context_acc[nonzero_mask]
+            top_k_all = np.argpartition(valid_acc, -k, axis=1)[:, -k:]
+
+            # Build context SDRs
+            valid_sdrs = np.zeros((n_valid, D), dtype=np.uint8)
+            rows = np.arange(n_valid).reshape(-1, 1)
+            valid_sdrs[rows, top_k_all] = 1
+
+            # Target SDRs for valid positions
+            positions = np.arange(1, n)
+            valid_positions = positions[nonzero_mask]
+            valid_targets = np.array([valid_seq[p] for p in valid_positions], dtype=np.int64)
+
+            # Filter out zero context/target
+            ctx_sums = np.sum(valid_sdrs, axis=1)
+            tgt_sums = np.sum(word_sdrs[valid_targets], axis=1)
+            both_nonzero = (ctx_sums > 0) & (tgt_sums > 0)
+
+            for i in np.where(both_nonzero)[0]:
+                batch_ctx.append(valid_sdrs[i].copy())
+                batch_tgt.append(word_sdrs[int(valid_targets[i])].copy())
+                total_pairs += 1
+
+                if len(batch_ctx) >= batch_size:
+                    print(f"        [encode] Yielding batch of {len(batch_ctx)} pairs "
+                          f"after seq {seq_idx+1}/{len(sequences)} "
+                          f"({time.time()-t_start:.1f}s)", flush=True)
+                    ctx_arr = np.array(batch_ctx, dtype=np.uint8)
+                    tgt_arr = np.array(batch_tgt, dtype=np.uint8)
+                    yield ctx_arr, tgt_arr
+                    batch_ctx = []
+                    batch_tgt = []
+
+            n_seqs_processed += 1
+
+            # Progress every 500 sequences or 5 seconds
+            now = time.time()
+            if n_seqs_processed % 500 == 0 or (now - t_start) > 5.0:
+                elapsed = now - t_start
+                rate = n_seqs_processed / max(0.1, elapsed)
+                eta = (len(sequences) - seq_idx) / max(1, rate)
+                print(f"        [encode] {n_seqs_processed} seqs, {total_pairs} pairs, "
+                      f"{rate:.0f} seqs/s, ETA {eta:.0f}s", flush=True)
+                t_start = now
+                n_seqs_processed = 0
+
+        # Final partial batch
+        if batch_ctx:
+            print(f"        [encode] Final batch: {len(batch_ctx)} pairs", flush=True)
+            ctx_arr = np.array(batch_ctx, dtype=np.uint8)
+            tgt_arr = np.array(batch_tgt, dtype=np.uint8)
+            yield ctx_arr, tgt_arr
+
+        print(f"        [encode] Done: {total_pairs} total pairs (positional VSA)", flush=True)
 
         if callback:
             callback(len(sequences), total_pairs)

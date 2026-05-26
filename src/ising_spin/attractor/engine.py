@@ -18,7 +18,7 @@ DEEP FIXES (v28 — from knowledge base analysis):
   3. Ward identity UV checks (not just spectral gap / cutoff sensitivity)
   4. Pure Hebbian ONLY (PCD removed — unnecessary at right sparsity)
   5. Anomalous dimensions from operator spectrum of J (not running correlations)
-  6. DAM energy + POS skeleton + bigram J2 drives word selection (v51)
+  6. DAM energy + bigram J2 + skip J2 drives word selection (v52: positional VSA context)
   7. D decreasing: 512->256->128->64 (RG reduces DOF at coarser scales)
 
 WHAT'S KEPT:
@@ -194,7 +194,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v51 — POS SKELETON", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v52 — POSITIONAL VSA", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -203,8 +203,8 @@ class AttractorLanguageModel:
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
         print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)", flush=True)
         print(f"  Skip bigram: J2[words[-2]] weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)", flush=True)
-        print(f"  POS skeleton: trigram weight={self._pos_weight}{' (disabled)' if self._pos_weight == 0 else ''} (v51)", flush=True)
-        print("  Training: BOW DAM + bigram J2 + skip J2 + POS trigram skeleton", flush=True)
+        print(f"  POS skeleton: weight={self._pos_weight}{' (disabled — replaced by positional VSA)' if self._pos_weight == 0 else ''} (v51)", flush=True)
+        print("  Training: Positional VSA DAM + bigram J2 + skip J2", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -370,16 +370,16 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v51")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v52")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
-        print(f"  Generation: top-k=5 (v51) + Boltzmann sampling")
+        print(f"  Generation: top-k=10 + Boltzmann sampling (v52)")
         print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)")
         print(f"  Skip bigram: weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)")
-        print(f"  POS skeleton: weight={self._pos_weight}{' (disabled)' if self._pos_weight == 0 else ''} (v51)")
+        print(f"  POS skeleton: weight={self._pos_weight}{' (disabled — replaced by positional VSA)' if self._pos_weight == 0 else ''} (v51)")
 
         self._print_diagnostics()
 
@@ -420,17 +420,17 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v51: Using BOW-ONLY context encoding (same as v44)", flush=True)
+        print(f"    v52: Using POSITIONAL VSA context encoding (replaces BOW)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v51: BOW-only context encoding (same as v44).
-        # Bigram order is captured by J2 (separate energy term) + skip J2,
-        # and syntactic structure by POS skeleton, not by contaminating the
-        # BOW DAM's J matrix.
-        for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
+        # v52: POSITIONAL VSA context encoding.
+        # Each word's SDR is rotated by its relative position hash before
+        # superposition, preserving word ORDER in the context SDR.
+        # The DAM learns position-dependent patterns, not just co-occurrence.
+        for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch_positional(
             self.sequences,
             context_window=context_window,
             batch_size=hebbian_batch,
@@ -706,7 +706,7 @@ class AttractorLanguageModel:
 
             for pos in range(5, len(seq), 3):
                 context_words = seq[max(0, pos - context_window):pos]
-                context_sdr = self.sdr_encoder.encode_context(context_words, context_window)
+                context_sdr = self.sdr_encoder.encode_context_positional(context_words, context_window)
                 if np.sum(context_sdr) > 0:
                     self.episodic.store(context_sdr)
                     n_stored += 1
@@ -769,7 +769,7 @@ class AttractorLanguageModel:
                     continue
 
                 candidate_arr = np.array(candidates[:200], dtype=np.int64)
-                context_sdr = self.sdr_encoder.encode_context(context_words)
+                context_sdr = self.sdr_encoder.encode_context_positional(context_words)
 
                 # v39: Do NOT OR M_bind into context_sdr for DAM energy.
                 # The DAM was trained on standard context SDRs — binding bits
@@ -908,7 +908,7 @@ class AttractorLanguageModel:
 
         # Initialize layer states and binding context from prompt
         for i, w in enumerate(words):
-            context_sdr = self.sdr_encoder.encode_context(words[:i+1], 10)
+            context_sdr = self.sdr_encoder.encode_context_positional(words[:i+1], 10)
 
             # v46: M_bind for attractor dynamics ONLY (not DAM energy)
             # The DAM was trained on BOW-only contexts — injecting binding
@@ -936,11 +936,11 @@ class AttractorLanguageModel:
             prev_type = types_list[-1] if types_list else POS2IDX["X"]
             valid_types = self._get_valid_next_types(prev_type, types_list)
 
-            # Encode context (standard word superposition — BOW only)
-            context_sdr = self.sdr_encoder.encode_context(words, 10)
+            # Encode context (position-bound VSA — order-preserving)
+            context_sdr = self.sdr_encoder.encode_context_positional(words, 10)
 
             # v46: M_bind for attractor dynamics ONLY, not DAM energy.
-            # DAM energy uses BOW-only context (the DAM was trained without binding).
+            # DAM energy uses positional VSA context (trained with positional encoding).
             # M_bind shapes the attractor basin through the context field.
             if self.binding and np.sum(self.binding.M_bind) > 0:
                 context_sdr_for_dynamics = self.binding.get_context_or(context_sdr)
@@ -969,9 +969,7 @@ class AttractorLanguageModel:
                 candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
                 # DAM energy with NORMALIZED log2-F
-                # v46: Use BOW-only context_sdr for DAM energy (NOT M_bind).
-                # The DAM was trained on BOW-only contexts — injecting binding
-                # bits adds noise to the coupling energy (v45: PPL 1909).
+                # v52: Positional VSA context — order-preserving DAM context
                 dam_energies = self.hierarchy.compute_word_energies(
                     context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
                 )
@@ -1058,10 +1056,8 @@ class AttractorLanguageModel:
                 best_energies = np.array([0], dtype=np.int64)
 
             # v44: Top-k filtering before Boltzmann sampling.
-            # v51: Reduced from 10 → 5 for more coherent generation.
-            # With POS skeleton + skip bigram providing structure, fewer
-            # candidates need to be considered. Less randomness = more coherence.
-            top_k = 5
+            # v52: Restored to 10 (v51's 5 was too aggressive, reduced diversity).
+            top_k = 10
             if len(best_energies) > top_k:
                 # Find indices of top-k lowest energies
                 kth = min(top_k, len(best_energies))
@@ -1079,7 +1075,7 @@ class AttractorLanguageModel:
             words.append(chosen_word)
             types_list.append(best_type)
 
-            context_sdr = self.sdr_encoder.encode_context(words, 10)
+            context_sdr = self.sdr_encoder.encode_context_positional(words, 10)
             self.episodic.store(context_sdr)
 
             # v39: Update binding context with chosen word
@@ -1154,7 +1150,7 @@ class AttractorLanguageModel:
                 if target_word not in candidate_arr:
                     candidate_arr = np.append(candidate_arr, target_word)
 
-                context_sdr = self.sdr_encoder.encode_context(context_words, 10)
+                context_sdr = self.sdr_encoder.encode_context_positional(context_words, 10)
 
                 # v46: M_bind for attractor dynamics ONLY, not DAM energy.
                 # DAM was trained on BOW-only contexts (v45 order-sensitive reverted).
@@ -1322,7 +1318,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v51 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v52 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
