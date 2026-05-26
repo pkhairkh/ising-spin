@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v47 — Training Script
+Attractor Language Machine v48 — Training Script
 
-v47: CLEAN REVERT — revert both v45 and v46 changes to recover v44 PPL
-  - v46 PPL=7983 regression cause: boosted binding (weight 30→100, density 20→40)
-    The binding bonus with weight=100 is ~200-300 for matching candidates,
-    which DOMINATES the DAM co-occurrence signal (dE_median~130). The VSA
-    binding is too noisy at this weight — when unbinding gives wrong signal,
-    it actively hurts the correct word's probability. dE_median inflated
-    from 122→415 because binding bonus adds 200-300 to non-matching candidates.
-  - REVERTED bind_weight: 100→30 (v44 value)
-  - REVERTED bind_density: 40→0/auto=20 (v44 default)
-  - Kept v45 training revert: BOW-only encode_contexts_batch()
-  - This should make v47 functionally identical to v44, recovering PPL~221
+v48: BIGRAM DAM — exact integer bigram coupling matrix J2 for order-sensitive generation
+  - NEW: Bigram coupling matrix J2[prev_word, next_word] = bigram count
+    This is an EXACT integer n-gram model — no VSA compression loss.
+    VSA binding was lossy (kWTA compression loses info, unbinding is
+    approximate). J2 is exact: every bigram count is preserved.
+  - Energy: E_bigram(c) = -J2[prev_word, c] * bigram_weight
+    Simple vectorized lookup per candidate — O(n_candidates), much cheaper
+    than VSA unbinding which requires rotations + overlaps.
+  - Added --bigram-weight CLI parameter (default=5)
+    With dE_median~122 and typical bigram counts 1-50, weight=5 gives
+    bigram bonus 5-250, making it comparable to DAM signal. This provides
+    ORDER sensitivity without contaminating the BOW DAM.
+  - VSA binding kept but will be secondary — J2 is the primary order signal
 
-v45 failure analysis:
-  The DAM is fundamentally a BOW (bag-of-words) model. Its J matrix
-  captures co-occurrence statistics — which words tend to appear in
-  similar contexts. It CANNOT capture sequential order because the
-  context SDR is a superposition (orderless). The v45 approach tried
-  to make the DAM order-sensitive by injecting binding bits into the
-  training context, but this created inconsistent training signals.
-  The correct approach: DAM captures co-occurrence (BOW), binding
-  captures order (runtime bonus). Separation of concerns.
-
-v46 failure analysis:
-  Boosting binding weight 3x (30→100) amplified binding noise. The VSA
-  unbinding with kWTA compression is lossy — overlap for the correct word
-  can be 0 while a random word gets overlap 2-3. At weight=100, this
-  noise dominates the DAM signal, inflating dE and destroying selectivity.
-  The binding bonus should be SUBSIDIARY to DAM co-occurrence, not dominant.
+v47 was a clean revert to v44, recovering PPL=221. The fundamental problem
+remains: BOW DAM produces word salad because it's order-blind. J2 fixes this
+by adding exact bigram statistics as a separate energy term.
 
 v44 top-k generation preserved:
   - Repetition penalty removed from compute_perplexity().
@@ -183,7 +172,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v47 — CLEAN REVERT"
+        description="Attractor Language Machine v48 — BIGRAM DAM"
     )
 
     # Core parameters
@@ -250,6 +239,10 @@ def main():
     parser.add_argument("--bind-density", type=int, default=0,
                         help="M_bind target density in bits (default: 0=auto, i.e. 2*k=20, v44 value)")
 
+    # Bigram DAM (v48)
+    parser.add_argument("--bigram-weight", type=int, default=5,
+                        help="Bigram coupling weight (default: 5, 0=disabled)")
+
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
                         help="Memory budget in MB (0=unlimited; 14000=16GB Pi)")
@@ -266,7 +259,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v47 — CLEAN REVERT", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v48 — BIGRAM DAM", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -283,22 +276,27 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v47 (CLEAN REVERT)")
+    print(f"CONFIG: Attractor Language Machine v48 (BIGRAM DAM)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v47: REVERTED to v44 params — weight=30, density=auto=20):")
+    print(f"  BINDING (v48: VSA secondary — J2 is primary order signal):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
-    print(f"    Weight: {args.bind_weight} (v47: reverted from v46's 100)")
+    print(f"    Weight: {args.bind_weight}")
     print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
-    print(f"    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits (v47: reverted from v46's 40)")
+    print(f"    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits")
     print(f"    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)")
     print(f"    Recency: NONE (uniform — recency reverted, hurt PPL)")
+    print(f"  BIGRAM DAM (v48: EXACT integer bigram coupling):")
+    print(f"    J2: V×V int32 matrix of bigram counts")
+    print(f"    Weight: {args.bigram_weight}{' (DISABLED)' if args.bigram_weight == 0 else ''}")
+    print(f"    Energy: E_bigram(c) = -J2[prev_word, c] * weight")
+    print(f"    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -352,6 +350,7 @@ def main():
         bind_weight=args.bind_weight,
         n_unbind_words=args.n_unbind_words,
         bind_density=args.bind_density,
+        bigram_weight=args.bigram_weight,
         seed=42,
     )
 
@@ -429,8 +428,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "47.0.0",
-        "architecture": "Attractor Language Machine v47 — CLEAN REVERT (v47: reverted both v45 and v46 changes to recover v44 PPL~221, v46 boosted binding weight 30→100 and density 20→40 which caused PPL 7983 by amplifying binding noise that dominated DAM signal, v45 order-sensitive DAM training also reverted (caused PPL 1909), binding params restored to v44 values weight=30 density=auto=20, DAM trained on BOW-only contexts, M_bind for attractor dynamics only), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}, density={d}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words, d=args.bind_density),
+        "version": "48.0.0",
+        "architecture": "Attractor Language Machine v48 — BIGRAM DAM (v48: exact integer bigram coupling matrix J2[prev_word, next_word] = bigram count, E_bigram(c) = -J2[prev, c] * bigram_weight, replaces lossy VSA binding as primary order signal, BOW DAM captures co-occurrence + J2 captures sequential order, weight={bw}), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}, density={d}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(bw=args.bigram_weight, w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words, d=args.bind_density),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -449,6 +448,7 @@ def main():
             "bind_weight": args.bind_weight,
             "n_unbind_words": args.n_unbind_words,
             "bind_density": args.bind_density,
+            "bigram_weight": args.bigram_weight,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -473,7 +473,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v47")
+    print(f"DONE — Attractor Language Machine v48")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

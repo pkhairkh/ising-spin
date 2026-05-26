@@ -101,6 +101,8 @@ class AttractorLanguageModel:
         bind_weight: int = 30,
         n_unbind_words: int = 3,
         bind_density: int = 0,  # 0 = auto (2*k=20)
+        # Bigram DAM (v48)
+        bigram_weight: int = 0,  # 0 = disabled
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -129,9 +131,11 @@ class AttractorLanguageModel:
         self._bind_weight = bind_weight
         self._n_unbind_words = n_unbind_words
         self._bind_density = bind_density
+        self._bigram_weight = bigram_weight
 
         # Built during training
         self.vocab = None
+        self.J2 = None  # v48: Bigram coupling matrix (V, V) int32
         self.pos_system = None
         self.sdr_encoder: Optional[SDREncoder] = None
         self.hierarchy: Optional[HierarchicalDAM] = None
@@ -182,14 +186,15 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v47 — CLEAN REVERT", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v48 — BIGRAM DAM", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
         print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
-        print("  Training: BOW-only DAM (v45 order-sensitive reverted, v46 binding params reverted)", flush=True)
+        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''}", flush=True)
+        print("  Training: BOW-only DAM + bigram J2 (exact n-gram, not VSA)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -313,10 +318,7 @@ class AttractorLanguageModel:
         self._populate_episodic_memory()
 
         # v39: Build VSA binding context with multi-step unbinding
-        # v47: REVERTED v46 binding params (weight 100→30, density 40→auto=20)
-        # v46's boosted binding caused PPL 7983 — binding noise amplified at
-        # high weight dominated over DAM co-occurrence signal. v44 params (30, 20)
-        # gave PPL=221.
+        # v47: Binding with reverted params
         bind_density_arg = self._bind_density if self._bind_density > 0 else 0  # 0 = auto
         self.binding = BindingContext(
             D=self.sdr_dim,
@@ -330,6 +332,10 @@ class AttractorLanguageModel:
         print(f"    Binding context: D={self.sdr_dim}, k={self.sdr_encoder.k}, "
               f"window={self._bind_window}, weight={self._bind_weight}, "
               f"n_unbind={self._n_unbind_words}, density={actual_density}")
+
+        # v48: Build bigram coupling matrix J2
+        if self._bigram_weight > 0:
+            self._build_bigram_j2()
 
         self._calibrate_beta()
 
@@ -350,15 +356,15 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v47")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v48")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
         print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
-        print(f"  v47: DAM trained on BOW-only contexts (v45 order-sensitive reverted)")
-        print(f"  v47: Binding params reverted to v44 values (weight=30, density=auto=20)")
+        print(f"  v48: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''}")
+        print(f"  v48: BOW DAM + exact bigram coupling (replaces lossy VSA binding for order)")
 
         self._print_diagnostics()
 
@@ -399,16 +405,15 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v47: Using BOW-ONLY context encoding (same as v44)", flush=True)
+        print(f"    v48: Using BOW-ONLY context encoding (same as v44)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v47: BOW-only context encoding (same as v44).
-        # v45 used encode_contexts_batch_with_binding() → PPL 1909.
-        # v46 reverted training but boosted binding → PPL 7983.
-        # v47: revert binding params too → should recover v44 PPL ~221.
+        # v48: BOW-only context encoding (same as v44).
+        # Bigram order is captured by J2 (separate energy term), not by
+        # contaminating the BOW DAM's J matrix.
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
             self.sequences,
             context_window=context_window,
@@ -448,6 +453,70 @@ class AttractorLanguageModel:
         for l in range(self.hierarchy.n_layers - 1):
             if self.hierarchy.rg_beta[l] is not None:
                 print(f"    RG beta L{l}->L{l+1}: {self.hierarchy.rg_beta[l]:.4f}")
+
+    def _build_bigram_j2(self) -> None:
+        """v48: Build bigram coupling matrix J2 from training sequences.
+
+        J2[prev_word, candidate_word] = count of times candidate follows prev.
+        This is an EXACT integer bigram model — no VSA compression loss.
+
+        Memory: V*V * 4 bytes = 2005*2005*4 ≈ 16 MB (acceptable on Pi 5).
+
+        The bigram energy is:
+          E_bigram(c) = -J2[prev_word, c] * bigram_weight
+        where bigram_weight scales the bigram signal to be comparable to
+        the DAM's dE scale.
+
+        Key insight: VSA binding was LOSSY (kWTA compression loses info,
+        unbinding is approximate). J2 is EXACT — every bigram count is
+        preserved. This makes it a much more reliable order signal.
+        """
+        V = len(self.vocab)
+        J2 = np.zeros((V, V), dtype=np.int32)
+
+        n_bigrams = 0
+        for seq in self.sequences:
+            for i in range(len(seq) - 1):
+                prev_w = seq[i]
+                next_w = seq[i + 1]
+                if 0 <= prev_w < V and 0 <= next_w < V:
+                    J2[prev_w, next_w] += 1
+                    n_bigrams += 1
+
+        self.J2 = J2
+        j2_nnz = int(np.sum(J2 > 0))
+        j2_max = int(np.max(J2))
+        j2_mem_mb = J2.nbytes / (1024 * 1024)
+        print(f"    Bigram J2: {n_bigrams:,} bigrams, {j2_nnz:,} non-zero entries, "
+              f"max_count={j2_max}, memory={j2_mem_mb:.1f} MB")
+
+    def _compute_bigram_energy(
+        self,
+        prev_word: int,
+        candidate_words: np.ndarray,
+    ) -> np.ndarray:
+        """v48: Compute bigram energy bonus for each candidate word.
+
+        E_bigram(c) = -J2[prev_word, c] * bigram_weight
+
+        Higher bigram count → more negative energy → more likely.
+        Zero count → zero bonus (no penalty, just no help).
+
+        This is O(n_candidates) — just a lookup per candidate.
+        Much cheaper than VSA unbinding which requires rotations + overlaps.
+        """
+        if self.J2 is None or prev_word < 0 or prev_word >= self.J2.shape[0]:
+            return np.zeros(len(candidate_words), dtype=np.int64)
+
+        # Vectorized lookup: J2[prev_word, candidates]
+        valid_mask = (candidate_words >= 0) & (candidate_words < self.J2.shape[1])
+        energies = np.zeros(len(candidate_words), dtype=np.int64)
+
+        if np.any(valid_mask):
+            bigram_counts = self.J2[prev_word, candidate_words[valid_mask]]
+            energies[valid_mask] = -(bigram_counts.astype(np.int64) * self._bigram_weight)
+
+        return energies
 
     def _populate_episodic_memory(self) -> None:
         """Pre-populate episodic memory from training sequences."""
@@ -549,6 +618,12 @@ class AttractorLanguageModel:
                         candidate_arr, self.sdr_encoder
                     )
                     energies += bind_energy
+
+                # v48: Add bigram energy from J2
+                if self.J2 is not None and pos > 0:
+                    prev_word = seq[pos - 1]
+                    bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
+                    energies += bigram_energy
 
                 e_min = energies.min()
                 diffs = energies - e_min
@@ -740,6 +815,12 @@ class AttractorLanguageModel:
                     )
                     total_energies += bind_energy
 
+                # v48: Add bigram energy from J2
+                if self.J2 is not None and len(words) > 0:
+                    prev_word = words[-1]  # last generated word
+                    bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
+                    total_energies += bigram_energy
+
                 # v40: Repetition penalty — FIXED: use same_word_penalty (800),
                 # window=15 words, distance-based decay (closer = stronger).
                 # v39 BUG: same_word_penalty=800 was dead code — actual penalty was
@@ -900,6 +981,12 @@ class AttractorLanguageModel:
                     )
                     total_energies += bind_energy
 
+                # v48: Add bigram energy from J2
+                if self.J2 is not None and pos > 0:
+                    prev_word = seq[pos - 1]
+                    bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
+                    total_energies += bigram_energy
+
                 # v41: Repetition penalty REMOVED from PPL evaluation.
                 # The repetition penalty is a generation-time anti-loop mechanism.
                 # Applying it during PPL evaluation artificially inflates PPL by
@@ -1012,7 +1099,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v47 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v48 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -1059,6 +1146,17 @@ class AttractorLanguageModel:
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words})")
+
+        # v48: Bigram J2 diagnostics
+        if self.J2 is not None:
+            j2_nnz = int(np.sum(self.J2 > 0))
+            j2_max = int(np.max(self.J2))
+            j2_mem_mb = self.J2.nbytes / (1024 * 1024)
+            print(f"  Bigram J2: {j2_nnz:,} non-zero, max_count={j2_max}, "
+                  f"weight={self._bigram_weight}, memory={j2_mem_mb:.1f} MB")
+        else:
+            print(f"  Bigram J2: disabled (weight=0)")
+
         print("=" * 70)
 
     def reset_stats(self) -> None:
