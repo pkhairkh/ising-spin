@@ -186,14 +186,14 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v49 — LOG BIGRAM", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v50 — STRONGER BIGRAM", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
         print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
-        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)", flush=True)
+        print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized, v50: stronger)")
         print("  Training: BOW-only DAM + log-normalized bigram J2", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
@@ -356,15 +356,15 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v49")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v50")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
         print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
-        print(f"  v49: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)")
-        print(f"  v49: BOW DAM + log-normalized bigram coupling (fixes v48 loop bug)")
+        print(f"  v50: Bigram DAM J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized, stronger)")
+        print(f"  v50: BOW DAM + log-normalized bigram coupling (dominant for strong transitions)")
 
         self._print_diagnostics()
 
@@ -405,13 +405,13 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v49: Using BOW-ONLY context encoding (same as v44)", flush=True)
+        print(f"    v50: Using BOW-ONLY context encoding (same as v44)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v49: BOW-only context encoding (same as v44).
+        # v50: BOW-only context encoding (same as v44).
         # Bigram order is captured by J2 (separate energy term), not by
         # contaminating the BOW DAM's J matrix.
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
@@ -1115,7 +1115,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v49 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v50 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
