@@ -18,7 +18,7 @@ DEEP FIXES (v28 — from knowledge base analysis):
   3. Ward identity UV checks (not just spectral gap / cutoff sensitivity)
   4. Pure Hebbian ONLY (PCD removed — unnecessary at right sparsity)
   5. Anomalous dimensions from operator spectrum of J (not running correlations)
-  6. DAM energy + bigram J2 + skip J2 drives word selection (v53: positional VSA + constrained decoding)
+  6. DAM energy + bigram J2 + skip J2 drives word selection (v54: POS-driven + bigram-dominant generation)
   7. D decreasing: 512->256->128->64 (RG reduces DOF at coarser scales)
 
 WHAT'S KEPT:
@@ -113,6 +113,10 @@ class AttractorLanguageModel:
         pos_gen_weight: int = 10,  # POS skeleton energy bonus during generation (always active)
         # POS type pre-selection (v53)
         pos_type_top_k: int = 3,  # Number of top POS types to consider during generation
+        # Bigram generation weight (v54)
+        bigram_gen_weight: int = 0,  # 0 = same as bigram_weight; generation-only bigram boost
+        # Skip bigram generation weight (v54)
+        skip_gen_weight: int = 0,  # 0 = same as skip_weight; generation-only skip boost
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -147,6 +151,8 @@ class AttractorLanguageModel:
         self._freq_penalty_weight = freq_penalty_weight
         self._pos_gen_weight = pos_gen_weight
         self._pos_type_top_k = pos_type_top_k
+        self._bigram_gen_weight = bigram_gen_weight
+        self._skip_gen_weight = skip_gen_weight
 
         # Built during training
         self.vocab = None
@@ -203,7 +209,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v53 — CONSTRAINED DECODING", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v54 — POS-DRIVEN GENERATION", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -214,7 +220,9 @@ class AttractorLanguageModel:
         print(f"  Skip bigram: J2[words[-2]] weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)", flush=True)
         print(f"  POS skeleton: PPL weight={self._pos_weight}{' (disabled for PPL)' if self._pos_weight == 0 else ''}, gen bonus weight={self._pos_gen_weight}, type top-k={self._pos_type_top_k} (v53)", flush=True)
         print(f"  Frequency penalty: weight={self._freq_penalty_weight}{' (disabled)' if self._freq_penalty_weight == 0 else ''} (generation only, v53)", flush=True)
-        print("  Training: Positional VSA DAM + bigram J2 + skip J2 + constrained decoding (v53)", flush=True)
+        print(f"  Bigram gen weight: {self._bigram_gen_weight}{' (=bigram_weight)' if self._bigram_gen_weight == 0 else ''} (v54: generation-only bigram boost)", flush=True)
+        print(f"  Skip gen weight: {self._skip_gen_weight}{' (=skip_weight)' if self._skip_gen_weight == 0 else ''} (v54: generation-only skip boost)", flush=True)
+        print("  Training: Positional VSA DAM + bigram J2 + skip J2 + POS-driven generation (v54)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -379,17 +387,19 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v53")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v54")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
         print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
-        print(f"  Generation: top-k=10 + Boltzmann + constrained decoding (v53)")
+        print(f"  Generation: top-k=10 + Boltzmann + POS-driven + bigram-dominant (v54)")
         print(f"  Bigram DAM: J2 weight={self._bigram_weight}{' (disabled)' if self._bigram_weight == 0 else ''} (LOG-normalized)")
         print(f"  Skip bigram: weight={self._skip_weight}{' (disabled)' if self._skip_weight == 0 else ''} (v51)")
         print(f"  POS skeleton: PPL weight={self._pos_weight}{' (disabled for PPL)' if self._pos_weight == 0 else ''}, gen bonus weight={self._pos_gen_weight} (v53)")
         print(f"  Frequency penalty: weight={self._freq_penalty_weight}{' (disabled)' if self._freq_penalty_weight == 0 else ''} (generation only, v53)")
+        print(f"  Bigram gen weight: {self._bigram_gen_weight}{' (=bigram_weight)' if self._bigram_gen_weight == 0 else ''} (v54)")
+        print(f"  Skip gen weight: {self._skip_gen_weight}{' (=skip_weight)' if self._skip_gen_weight == 0 else ''} (v54)")
 
         self._print_diagnostics()
 
@@ -531,13 +541,18 @@ class AttractorLanguageModel:
         self,
         prev_word: int,
         candidate_words: np.ndarray,
+        weight: int = 0,  # v54: 0 = use self._bigram_weight
     ) -> np.ndarray:
         """v49: Compute bigram energy bonus for each candidate word.
 
-        E_bigram(c) = -J2[prev_word, c] * bigram_weight
+        E_bigram(c) = -J2[prev_word, c] * weight
 
         v49: J2 now stores log2(count+1), not raw count.
         Range [0, ~16] × weight → max bigram energy ~128 (comparable to DAM dE=122).
+
+        v54: Added optional weight parameter for generation-time boost.
+        bigram_gen_weight=64 → max energy = 16*64 = 1024 >> DAM dE~407,
+        making bigram the DOMINANT signal during generation.
 
         Higher log-count → more negative energy → more likely.
         Zero count → zero bonus (no penalty, just no help).
@@ -548,13 +563,15 @@ class AttractorLanguageModel:
         if self.J2 is None or prev_word < 0 or prev_word >= self.J2.shape[0]:
             return np.zeros(len(candidate_words), dtype=np.int64)
 
+        w = weight if weight > 0 else self._bigram_weight
+
         # Vectorized lookup: J2[prev_word, candidates]
         valid_mask = (candidate_words >= 0) & (candidate_words < self.J2.shape[1])
         energies = np.zeros(len(candidate_words), dtype=np.int64)
 
         if np.any(valid_mask):
             bigram_log_counts = self.J2[prev_word, candidate_words[valid_mask]]
-            energies[valid_mask] = -(bigram_log_counts.astype(np.int64) * self._bigram_weight)
+            energies[valid_mask] = -(bigram_log_counts.astype(np.int64) * w)
 
         return energies
 
@@ -722,6 +739,7 @@ class AttractorLanguageModel:
         self,
         skip_word: int,
         candidate_words: np.ndarray,
+        weight: int = 0,  # v54: 0 = use self._skip_weight
     ) -> np.ndarray:
         """v51: Compute skip bigram energy — J2[words[-2], c] at reduced weight.
 
@@ -731,8 +749,11 @@ class AttractorLanguageModel:
 
         This provides a 2-word context window using only the existing J2 matrix.
         Weight is typically bigram_weight // 3 or // 4.
+
+        v54: Added optional weight parameter for generation-time boost.
         """
-        if self.J2 is None or self._skip_weight <= 0:
+        w = weight if weight > 0 else self._skip_weight
+        if self.J2 is None or w <= 0:
             return np.zeros(len(candidate_words), dtype=np.int64)
 
         if skip_word < 0 or skip_word >= self.J2.shape[0]:
@@ -743,7 +764,7 @@ class AttractorLanguageModel:
 
         if np.any(valid_mask):
             skip_log_counts = self.J2[skip_word, candidate_words[valid_mask]]
-            energies[valid_mask] = -(skip_log_counts.astype(np.int64) * self._skip_weight)
+            energies[valid_mask] = -(skip_log_counts.astype(np.int64) * w)
 
         return energies
 
@@ -985,61 +1006,74 @@ class AttractorLanguageModel:
                 self.binding.add_word(self.sdr_encoder.word_active_bits[w])
 
         for pos in range(len(words), length):
-            # Choose POS type
-            prev_type = types_list[-1] if types_list else POS2IDX["X"]
-            valid_types = self._get_valid_next_types(prev_type, types_list)
+            # ═══════════════════════════════════════════════════════════
+            # v54: HARD POS TYPE SELECTION — POS trigram picks ONE type
+            # ═══════════════════════════════════════════════════════════
+            # v53 BUG: The multi-type energy comparison allowed the DAM to
+            # override syntactically correct type sequences. For example,
+            # after "there was", DET should win (for "a") but VERB's hub
+            # word "keep" had lower energy, so VERB was selected instead.
+            #
+            # v54 FIX: The POS trigram model selects EXACTLY ONE type.
+            # The DAM only chooses WHICH word of that type. This ensures
+            # syntactically coherent POS sequences (DET→ADJ→NOUN, etc.)
+            # and eliminates the type-selection error cascade.
+            ranked_types = self._select_pos_types(types_list)
+            chosen_type = None
+            for t in ranked_types:
+                if self.type_words.get(t, []):
+                    chosen_type = t
+                    break
+            if chosen_type is None:
+                # Emergency fallback: pick any type with candidates
+                for t in range(N_POS):
+                    if self.type_words.get(t, []):
+                        chosen_type = t
+                        break
+            if chosen_type is None:
+                break  # No candidates at all — stop generation
 
-            # v53: POS type pre-selection — hard filter to top-K most likely types.
-            # The POS transition matrix captures syntactic patterns (DET→ADJ→NOUN,
-            # NOUN→VERB→DET, etc.) that the word-level energy landscape misses.
-            # During generation, without this constraint, the model picks types
-            # based on lowest-energy word, which favors high-frequency hub words
-            # ("been", "must", "keep") regardless of syntactic coherence.
-            # By pre-selecting the top-K syntactically likely types, we FORCE
-            # the generation to follow coherent POS transitions.
-            if self.J_pos_bi is not None and len(valid_types) > 1:
-                type_scores = {}
-                for t in valid_types:
-                    if len(types_list) >= 2 and self.J_pos_tri is not None:
-                        t_prev2 = types_list[-2]
-                        t_prev1 = types_list[-1]
-                        if (0 <= t_prev2 < self.J_pos_tri.shape[0] and
-                            0 <= t_prev1 < self.J_pos_tri.shape[1] and
-                            0 <= t < self.J_pos_tri.shape[2]):
-                            tri_val = int(self.J_pos_tri[t_prev2, t_prev1, t])
-                            bi_val = int(self.J_pos_bi[t_prev1, t])
-                            # Use trigram where available, bigram backoff
-                            score = tri_val if tri_val > 0 else (bi_val * 3 // 4)
-                        else:
-                            score = 0
-                    elif len(types_list) >= 1:
-                        t_prev1 = types_list[-1]
-                        if 0 <= t_prev1 < self.J_pos_bi.shape[0] and 0 <= t < self.J_pos_bi.shape[1]:
-                            score = int(self.J_pos_bi[t_prev1, t])
-                        else:
-                            score = 0
-                    else:
-                        score = 0
-                    type_scores[t] = score
+            # Get candidates of the chosen type
+            candidate_list = self.type_words[chosen_type]
+            candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
 
-                # Sort by POS transition score (highest = most likely) and keep top-K
-                sorted_types = sorted(valid_types, key=lambda t: -type_scores.get(t, 0))
-                pos_top_k = self._pos_type_top_k
-                valid_types = sorted_types[:pos_top_k]
-            # If J_pos_bi is not built, fall back to all valid types (v52 behavior)
+            # ═══════════════════════════════════════════════════════════
+            # v54: BIGRAM PRE-FILTERING — rank by bigram, take top-K
+            # ═══════════════════════════════════════════════════════════
+            # Before computing expensive DAM energies, pre-filter candidates
+            # by bigram score. This ensures the model follows bigram chains
+            # faithfully and prevents the DAM from selecting implausible words
+            # that have low DAM energy but terrible bigram scores.
+            #
+            # With bigram_gen_weight=64, the bigram signal dominates DAM
+            # (max bigram energy = 16*64 = 1024 >> DAM dE~407), so
+            # pre-filtering by bigram is a good approximation to the final
+            # ranking and prevents wasting computation on low-bigram words.
+            gen_bigram_weight = self._bigram_gen_weight if self._bigram_gen_weight > 0 else self._bigram_weight
+            gen_skip_weight = self._skip_gen_weight if self._skip_gen_weight > 0 else self._skip_weight
 
-            # Encode context (position-bound VSA — order-preserving)
+            if self.J2 is not None and len(words) > 0 and gen_bigram_weight > 0:
+                prev_word = words[-1]
+                valid_cand_mask = (candidate_arr >= 0) & (candidate_arr < self.J2.shape[1])
+                bigram_scores = np.full(len(candidate_arr), -1, dtype=np.int32)
+                bigram_scores[valid_cand_mask] = self.J2[prev_word, candidate_arr[valid_cand_mask]]
+                # Take top-50 by bigram score (highest J2 = most likely bigram)
+                n_pre_filter = min(50, len(candidate_arr))
+                if n_pre_filter < len(candidate_arr):
+                    top_indices = np.argpartition(bigram_scores, -n_pre_filter)[-n_pre_filter:]
+                    candidate_arr = candidate_arr[top_indices]
+
+            # ═══════════════════════════════════════════════════════════
+            # CONTEXT ENCODING + ATTRACTOR DYNAMICS
+            # ═══════════════════════════════════════════════════════════
             context_sdr = self.sdr_encoder.encode_context_positional(words, 10)
 
-            # v46: M_bind for attractor dynamics ONLY, not DAM energy.
-            # DAM energy uses positional VSA context (trained with positional encoding).
-            # M_bind shapes the attractor basin through the context field.
+            # M_bind for attractor dynamics ONLY, not DAM energy.
             if self.binding and np.sum(self.binding.M_bind) > 0:
                 context_sdr_for_dynamics = self.binding.get_context_or(context_sdr)
             else:
                 context_sdr_for_dynamics = context_sdr
 
-            # Context field for attractor dynamics (includes M_bind)
             context_field = np.zeros(self.sdr_dim, dtype=np.int32)
             active = np.where(context_sdr_for_dynamics > 0)[0]
             context_field[active] = self.dam_scale
@@ -1047,172 +1081,102 @@ class AttractorLanguageModel:
             # Run attractor dynamics
             self.hierarchy.step_all(context_field, n_sweeps=2)
 
-            # Find best type + candidates
-            best_type = valid_types[0]
-            best_min_energy = float('inf')
-            best_candidate_words = None
-            best_energies = None
+            # ═══════════════════════════════════════════════════════════
+            # COMPUTE ENERGIES (single type — no multi-type loop)
+            # ═══════════════════════════════════════════════════════════
 
-            for chosen_type in valid_types:
-                candidate_list = self.type_words.get(chosen_type, [])
-                if not candidate_list:
-                    continue
+            # DAM energy with NORMALIZED log2-F
+            dam_energies = self.hierarchy.compute_word_energies(
+                context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
+            )
 
-                candidate_arr = np.array(candidate_list[:300], dtype=np.int64)
+            # Episodic energy
+            ep_energies = self.episodic.compute_word_episodic_energy(
+                candidate_arr, self.sdr_encoder, self.episodic.field_scale
+            )
 
-                # DAM energy with NORMALIZED log2-F
-                # v52: Positional VSA context — order-preserving DAM context
-                dam_energies = self.hierarchy.compute_word_energies(
-                    context_sdr, candidate_arr, self.sdr_encoder, self.dam_scale
+            # Grammar penalty
+            test_types = list(types_list[-5:]) + [chosen_type]
+            test_pos = len(test_types) - 1
+            try:
+                grammar_penalty = self.pos_system.compute_grammar_penalty(
+                    test_types, test_pos, chosen_type
                 )
+            except (IndexError, ValueError):
+                grammar_penalty = 0
+            median_de = max(1, getattr(self, '_median_de', 10))
+            grammar_scaled = grammar_penalty * (median_de // 2) // 60
+            grammar_energies = np.full(len(candidate_arr), grammar_scaled, dtype=np.int64)
 
-                # Episodic energy (v37: reduced scale=100, ~10% of DAM range)
-                ep_energies = self.episodic.compute_word_episodic_energy(
-                    candidate_arr, self.sdr_encoder, self.episodic.field_scale
+            total_energies = dam_energies + ep_energies + grammar_energies
+
+            # Binding energy bonus
+            if self.binding and len(self.binding._recent_words) > 0:
+                bind_energy = self.binding.compute_binding_energy(
+                    candidate_arr, self.sdr_encoder
                 )
+                total_energies += bind_energy
 
-                # v40: Grammar penalty — scaled to ~50% of median_dE for real effect
-                test_types = list(types_list[-5:]) + [chosen_type]
-                test_pos = len(test_types) - 1
-                try:
-                    grammar_penalty = self.pos_system.compute_grammar_penalty(
-                        test_types, test_pos, chosen_type
-                    )
-                except (IndexError, ValueError):
-                    grammar_penalty = 0
-                # v40 FIX: Scale grammar penalty to be meaningful on the dE scale.
-                # v39 used 500//median_de as divisor, making penalty ~15 (5% of dE).
-                # v40: grammar_penalty * (median_de // 2) // 60 → ~100 (33% of dE)
-                median_de = max(1, getattr(self, '_median_de', 10))
-                grammar_scaled = grammar_penalty * (median_de // 2) // 60
-                grammar_energies = np.full(len(candidate_arr), grammar_scaled, dtype=np.int64)
+            # v54: Bigram energy with GENERATION weight (DOMINANT signal).
+            # bigram_gen_weight=64 → max bigram energy = 16*64 = 1024 >> DAM dE~407.
+            # The bigram model only depends on the previous word, which is
+            # always correct — making it far more reliable than the DAM during
+            # generation when context is self-generated and may contain errors.
+            if self.J2 is not None and len(words) > 0:
+                prev_word = words[-1]
+                bigram_energy = self._compute_bigram_energy(
+                    prev_word, candidate_arr, weight=gen_bigram_weight
+                )
+                total_energies += bigram_energy
 
-                total_energies = dam_energies + ep_energies + grammar_energies
+            # v54: Skip bigram with GENERATION weight.
+            # skip_gen_weight=24 → max skip energy = 16*24 = 384 ≈ DAM dE.
+            # Provides 2-word context (prev2, prev1) for better selectivity.
+            if self.J2 is not None and gen_skip_weight > 0 and len(words) >= 2:
+                skip_word = words[-2]
+                skip_energy = self._compute_skip_energy(
+                    skip_word, candidate_arr, weight=gen_skip_weight
+                )
+                total_energies += skip_energy
 
-                # v39: Add binding energy bonus (multi-step unbinding)
-                if self.binding and len(self.binding._recent_words) > 0:
-                    bind_energy = self.binding.compute_binding_energy(
-                        candidate_arr, self.sdr_encoder
-                    )
-                    total_energies += bind_energy
+            # Repetition penalty (v40: distance-based decay)
+            rep_window = 15
+            median_de = max(1, getattr(self, '_median_de', 10))
+            rep_base = max(self.same_word_penalty, median_de * 4)
+            recent_words = words[-rep_window:]
+            for i, w in enumerate(candidate_arr):
+                w_int = int(w)
+                for d, rw in enumerate(reversed(recent_words)):
+                    if w_int == rw:
+                        decay = max(1, rep_window - d)
+                        total_energies[i] += (rep_base * decay) // rep_window
+                        break
 
-                # v48: Add bigram energy from J2
-                if self.J2 is not None and len(words) > 0:
-                    prev_word = words[-1]  # last generated word
-                    bigram_energy = self._compute_bigram_energy(prev_word, candidate_arr)
-                    total_energies += bigram_energy
-
-                # v51: Add skip bigram energy — J2[words[-2], c]
-                if self.J2 is not None and self._skip_weight > 0 and len(words) >= 2:
-                    skip_word = words[-2]  # word 2 positions back
-                    skip_energy = self._compute_skip_energy(skip_word, candidate_arr)
-                    total_energies += skip_energy
-
-                # v53: Add POS skeleton energy bonus — generation only.
-                # This gives all words of a syntactically-favored POS type a bonus.
-                # Combined with the hard type pre-selection above, this provides
-                # a soft ranking among the pre-selected types.
-                # For words of the same type, this bonus is identical (no within-type
-                # effect), but it shifts the between-type comparison so that
-                # syntactically likely types have lower energy.
-                if self.J_pos_bi is not None and self._pos_gen_weight > 0:
-                    candidate_types = np.array([
-                        self._get_word_type(int(w)) for w in candidate_arr
-                    ], dtype=np.int64)
-                    pos_energy = self._compute_pos_energy(types_list, candidate_types)
-                    # Scale by _pos_gen_weight (always active for generation)
-                    # The _compute_pos_energy uses _pos_weight internally (0 for PPL),
-                    # so we need to rescale here for the generation weight.
-                    if self._pos_weight > 0:
-                        # Already scaled by _pos_weight in _compute_pos_energy
-                        # Rescale to _pos_gen_weight
-                        pos_energy = pos_energy * self._pos_gen_weight // self._pos_weight
-                    else:
-                        # _pos_weight is 0, so _compute_pos_energy returns 0
-                        # We need to compute the raw POS energy and scale by gen weight
-                        pos_energy = self._compute_pos_energy_raw(types_list, candidate_types)
-                        pos_energy = pos_energy * self._pos_gen_weight // 10  # normalize
-                    total_energies += pos_energy
-
-                # v53: Frequency penalty — generation only.
-                # Penalizes high-frequency words that have deep energy basins
-                # (co-occur with everything) but low information content.
-                # This prevents "hub" words like "been", "must", "keep" from
-                # dominating when the context is uncertain.
-                if self._freq_penalty_weight > 0:
-                    valid_freq_mask = (candidate_arr >= 0) & (candidate_arr < len(self._word_freq))
-                    freq_pen = np.zeros(len(candidate_arr), dtype=np.int64)
-                    if np.any(valid_freq_mask):
-                        # log2(freq+1) * weight — higher frequency = more penalty
-                        log_freqs = np.log2(
-                            self._word_freq[candidate_arr[valid_freq_mask]].astype(np.float64) + 1.0
-                        ).astype(np.int64)
-                        freq_pen[valid_freq_mask] = log_freqs * self._freq_penalty_weight
-                    total_energies += freq_pen
-
-                # v40: Repetition penalty — FIXED: use same_word_penalty (800),
-                # window=15 words, distance-based decay (closer = stronger).
-                # v39 BUG: same_word_penalty=800 was dead code — actual penalty was
-                # median_de//5 = 24, negligible on dE scale of 200-300.
-                # v49: Scale rep_base to be at least 4x median_dE — ensures
-                # penalty is always effective regardless of energy scale.
-                rep_window = 15
-                median_de = max(1, getattr(self, '_median_de', 10))
-                rep_base = max(self.same_word_penalty, median_de * 4)
-                recent_words = words[-rep_window:]
-                for i, w in enumerate(candidate_arr):
-                    w_int = int(w)
-                    # Distance-based decay: word at distance d gets penalty * (1 - d/window)
-                    for d, rw in enumerate(reversed(recent_words)):
-                        if w_int == rw:
-                            decay = max(1, rep_window - d)  # 15 for most recent, 1 for oldest
-                            total_energies[i] += (rep_base * decay) // rep_window
-                            break  # Only count closest occurrence
-
-                min_e = int(total_energies.min())
-                if min_e < best_min_energy:
-                    best_min_energy = min_e
-                    best_type = chosen_type
-                    best_candidate_words = candidate_arr
-                    best_energies = total_energies
-
-            if best_candidate_words is None:
-                best_candidate_words = np.array([4], dtype=np.int64)
-                best_energies = np.array([0], dtype=np.int64)
-
-            # v44: Top-k filtering before Boltzmann sampling.
-            # v52: Restored to 10 (v51's 5 was too aggressive, reduced diversity).
+            # Top-k filtering + Boltzmann sampling
             top_k = 10
-            if len(best_energies) > top_k:
-                # Find indices of top-k lowest energies
-                kth = min(top_k, len(best_energies))
-                top_indices = np.argpartition(best_energies, kth)[:kth]
-                # Sort by energy for better numerical properties
-                top_indices = top_indices[np.argsort(best_energies[top_indices])]
-                best_candidate_words = best_candidate_words[top_indices]
-                best_energies = best_energies[top_indices]
+            if len(total_energies) > top_k:
+                kth = min(top_k, len(total_energies))
+                top_indices = np.argpartition(total_energies, kth)[:kth]
+                top_indices = top_indices[np.argsort(total_energies[top_indices])]
+                candidate_arr = candidate_arr[top_indices]
+                total_energies = total_energies[top_indices]
 
-            # Boltzmann sample from top-k candidates
-            chosen_idx = self._sampler.sample(best_energies)
-            chosen_word = int(best_candidate_words[chosen_idx])
-            chosen_energy = int(best_energies[chosen_idx])
+            chosen_idx = self._sampler.sample(total_energies)
+            chosen_word = int(candidate_arr[chosen_idx])
+            chosen_energy = int(total_energies[chosen_idx])
 
             words.append(chosen_word)
-            types_list.append(best_type)
+            types_list.append(chosen_type)
 
             context_sdr = self.sdr_encoder.encode_context_positional(words, 10)
             self.episodic.store(context_sdr)
 
-            # v53: Sentence boundary reset — after generating a period,
-            # reset the DAM hierarchy state to prevent cross-sentence error cascade.
-            # The positional VSA context still encodes recent words, but the
-            # accumulated attractor dynamics (which carry forward errors) are cleared.
-            # Each sentence starts with a fresh attractor state.
+            # v53: Sentence boundary reset
             chosen_word_str = self.vocab.idx2word.get(chosen_word, "")
             if chosen_word_str in (".", "!", "?"):
                 self.hierarchy.reset()
 
-            # v39: Update binding context with chosen word
+            # Update binding context with chosen word
             if self.binding and 0 <= chosen_word < self.sdr_encoder.vocab_size:
                 self.binding.add_word(self.sdr_encoder.word_active_bits[chosen_word])
 
@@ -1220,7 +1184,7 @@ class AttractorLanguageModel:
 
             diagnostics.append({
                 'pos': pos,
-                'type': IDX2POS.get(best_type, "UNK"),
+                'type': IDX2POS.get(chosen_type, "UNK"),
                 'word': self.vocab.idx2word.get(chosen_word, "<UNK>"),
                 'energy': chosen_energy,
             })
@@ -1445,6 +1409,72 @@ class AttractorLanguageModel:
 
         return valid if valid else list(range(N_POS))
 
+    def _select_pos_types(self, types_list: List[int]) -> List[int]:
+        """v54: Rank valid POS types by trigram/bigram transition score.
+
+        Returns types sorted from most to least likely, filtered to those
+        that have candidate words available. The POS trigram model is the
+        SOLE determinant of type ordering — the DAM does NOT influence
+        type selection. This prevents the DAM from overriding syntactically
+        correct type sequences with low-energy hub words of the wrong type.
+
+        The POS trigram captures reliable syntactic patterns:
+        - DET → ADJ/NOUN (determiner phrase)
+        - NOUN → VERB (subject-verb)
+        - VERB → DET/PREP/ADV (post-verbal)
+        - ADJ → NOUN (modifier-head)
+        These patterns are far more reliable than the DAM's noisy type
+        preferences, especially during generation when context is self-
+        generated and may contain errors.
+        """
+        from ..vocabulary.pos import POS2IDX, N_POS
+
+        prev_type = types_list[-1] if types_list else POS2IDX["X"]
+        valid_types = self._get_valid_next_types(prev_type, types_list)
+
+        if not valid_types:
+            return list(range(N_POS))
+
+        if len(valid_types) == 1:
+            return valid_types
+
+        # Score each type using POS trigram (or bigram backoff)
+        type_scores = {}
+        for t in valid_types:
+            # Skip types with no candidate words
+            candidates = self.type_words.get(t, [])
+            if not candidates:
+                continue
+
+            if len(types_list) >= 2 and self.J_pos_tri is not None:
+                t_prev2 = types_list[-2]
+                t_prev1 = types_list[-1]
+                if (0 <= t_prev2 < self.J_pos_tri.shape[0] and
+                    0 <= t_prev1 < self.J_pos_tri.shape[1] and
+                    0 <= t < self.J_pos_tri.shape[2]):
+                    tri_val = int(self.J_pos_tri[t_prev2, t_prev1, t])
+                    bi_val = int(self.J_pos_bi[t_prev1, t])
+                    # Use trigram where available, bigram backoff with 75% weight
+                    score = tri_val if tri_val > 0 else (bi_val * 3 // 4)
+                else:
+                    score = 0
+            elif len(types_list) >= 1:
+                t_prev1 = types_list[-1]
+                if 0 <= t_prev1 < self.J_pos_bi.shape[0] and 0 <= t < self.J_pos_bi.shape[1]:
+                    score = int(self.J_pos_bi[t_prev1, t])
+                else:
+                    score = 0
+            else:
+                score = 0
+            type_scores[t] = score
+
+        if not type_scores:
+            # Fallback: return all valid types that have candidates
+            return [t for t in valid_types if self.type_words.get(t, [])]
+
+        # Return types sorted by POS transition score (highest first)
+        return sorted(type_scores, key=type_scores.get, reverse=True)
+
     def _print_diagnostics(self) -> None:
         """Print full model diagnostics."""
         f_type_name = {0: 'quadratic', 1: 'cubic', 2: 'exp_approx'}.get(
@@ -1452,7 +1482,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v53 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v54 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
@@ -1523,6 +1553,8 @@ class AttractorLanguageModel:
                   f"PPL weight={self._pos_weight}, gen bonus weight={self._pos_gen_weight}, "
                   f"type top-k={self._pos_type_top_k}")
             print(f"  Frequency penalty: weight={self._freq_penalty_weight}")
+            print(f"  Bigram gen weight: {self._bigram_gen_weight}{' (=bigram_weight)' if self._bigram_gen_weight == 0 else ''} (v54)")
+            print(f"  Skip gen weight: {self._skip_gen_weight}{' (=skip_weight)' if self._skip_gen_weight == 0 else ''} (v54)")
         else:
             print(f"  POS skeleton: not built")
 

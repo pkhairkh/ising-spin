@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v53 — Training Script
+Attractor Language Machine v54 — Training Script
 
-v53: CONSTRAINED DECODING — fix generation word salad without changing PPL
-  - v52 achieved PPL=13.06 (great!) with positional VSA context, but generation
+v54: POS-DRIVEN GENERATION — fix generation word salad via architectural fix
+  - v52/v53 achieved PPL=13.06 (great!) with positional VSA context, but generation
     was still word salad — same as v50 (PPL=16.65) and v51 (PPL=27.73).
-  - ROOT CAUSE: During generation, the model picks POS types by lowest-energy
-    word across ALL valid types, which favors high-frequency hub words ("been",
-    "must", "keep") regardless of syntactic coherence. Error cascade then
-    compounds: wrong word → wrong context → more wrong words → word salad.
-  - v53 FIX: All changes are GENERATION-ONLY (PPL unchanged):
-    1. POS type pre-selection: Hard filter to top-3 most likely POS types
-       using POS bigram/trigram transition matrix. Forces syntactically
-       coherent type sequences (DET→ADJ→NOUN, NOUN→VERB, etc.).
-    2. POS skeleton energy bonus during generation (weight=10): Provides
-       soft ranking among pre-selected types, guiding between-type
-       selection toward syntactically likely transitions.
-    3. Frequency penalty during generation (weight=5): Penalizes
-       log2(freq+1) of candidate words, preventing high-frequency hub
-       words from dominating when context is uncertain.
-    4. Sentence boundary reset: After generating a period, reset the
-       DAM hierarchy state to prevent cross-sentence error cascade.
-    5. Always build POS skeleton (J_pos_bi, J_pos_tri) for generation use,
-       even when pos_weight=0 for PPL.
-  - POS skeleton is DISABLED for PPL evaluation (pos_weight=0) so PPL
-    should be unchanged from v52's 13.06.
+  - ROOT CAUSE: During generation, the model iterated over MULTIPLE POS types,
+    picking the type with the lowest-energy word. This allowed the DAM to
+    override syntactically correct type sequences with low-energy hub words
+    ("keep", "been", "must") of the WRONG type. After "there was", VERB's
+    "keep" won over DET's "a" because "keep" had lower DAM energy.
+  - v54 FIX: Two fundamental changes (all generation-only, PPL unchanged):
+    1. HARD POS TYPE SELECTION: The POS trigram model picks EXACTLY ONE type
+       per position. The DAM only chooses WHICH word of that type. This
+       eliminates the type-selection error cascade that caused word salad.
+    2. BIGRAM-DOMINANT GENERATION: bigram_gen_weight=64 (vs 16 for PPL)
+       makes bigram energy (max 1024) >> DAM dE (~407), so the model
+       follows bigram chains faithfully. Skip bigram boosted to 24.
+       The bigram model only depends on the previous word, which is always
+       correct — making it far more reliable than the DAM during generation.
+    3. BIGRAM PRE-FILTERING: Before computing expensive DAM energies,
+       pre-filter candidates to top-50 by bigram score. This prevents the
+       DAM from selecting implausible bigram candidates.
+  - PPL should be unchanged from v52/v53's 13.06 (all changes are generation-only).
+  - Expected generation: Coherent POS sequences (DET→ADJ→NOUN, NOUN→VERB)
+    with bigram-faithful word choice within each type.
 
 Architecture: D=512, 50K samples, Hebbian L0
 
@@ -34,6 +34,8 @@ Usage:
   python -u train.py --memory-budget 14000               # Pi 5 (16GB)
   python -u train.py --same-word-penalty 1200          # Stronger repetition suppression
   python -u train.py --bigram-weight 8                   # Lighter bigram
+  python -u train.py --bigram-gen-weight 64              # Stronger generation bigram (v54)
+  python -u train.py --skip-gen-weight 24                # Stronger generation skip (v54)
   python -u train.py --skip-weight 0                     # Disable skip bigram
   python -u train.py --pos-weight 0                      # Disable POS skeleton
 """
@@ -153,7 +155,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v53 — CONSTRAINED DECODING"
+        description="Attractor Language Machine v54 — POS-DRIVEN GENERATION"
     )
 
     # Core parameters
@@ -238,6 +240,12 @@ def main():
     # POS type pre-selection (v53)
     parser.add_argument("--pos-type-top-k", type=int, default=3,
                         help="Number of top POS types to consider during generation (default: 3)")
+    # Bigram generation weight (v54: generation-only bigram boost)
+    parser.add_argument("--bigram-gen-weight", type=int, default=64,
+                        help="Bigram coupling weight during generation (default: 64, 0=same as bigram-weight)")
+    # Skip bigram generation weight (v54: generation-only skip boost)
+    parser.add_argument("--skip-gen-weight", type=int, default=24,
+                        help="Skip bigram weight during generation (default: 24, 0=same as skip-weight)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -255,7 +263,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v53 — CONSTRAINED DECODING", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v54 — POS-DRIVEN GENERATION", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -271,69 +279,69 @@ def main():
     # --- Config ---
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
-    print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v53 (CONSTRAINED DECODING)")
-    print(f"  ARCHITECTURE:")
-    print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
-    print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
-    print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
-    print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
-    print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v52: VSA secondary — positional VSA + J2 are primary):")
-    print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
-    print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
-    print(f"    Window: {args.bind_window} recent bigram bindings")
-    print(f"    Weight: {args.bind_weight}")
-    print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
-    print(f"    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits")
-    print(f"    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)")
-    print(f"    Recency: NONE (uniform — recency reverted, hurt PPL)")
-    print(f"  BIGRAM DAM (v52: STRONG bigram + positional VSA context):")
-    print(f"    J2: V×V int32 matrix of log2(count+1) values")
-    print(f"    Weight: {args.bigram_weight}{' (DISABLED)' if args.bigram_weight == 0 else ''}")
-    print(f"    Skip bigram: J2[words[-2],c] weight={args.skip_weight}{' (DISABLED)' if args.skip_weight == 0 else ''}")
-    print(f"    Energy: E_bigram(c) = -J2[prev_word, c] * weight")
-    print(f"    Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}")
-    print(f"    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB")
-    print(f"  POS SKELETON (v53: always built, PPL weight=0, gen bonus weight={args.pos_gen_weight}):")
-    print(f"    J_pos_bi: 13×13 POS bigram transitions, log2(count+1)")
-    print(f"    J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)")
-    print(f"    PPL weight: {args.pos_weight}{' (DISABLED for PPL)' if args.pos_weight == 0 else ''}")
-    print(f"    Gen bonus weight: {args.pos_gen_weight} (generation-only energy bonus)")
-    print(f"    Type pre-selection: top-{args.pos_type_top_k} most likely types (hard filter during generation)")
-    print(f"    Backoff: trigram → bigram (75% weight) when trigram count=0")
-    print(f"    Memory: ~10 KB (trivial)")
-    print(f"  CONSTRAINED DECODING (v53: generation-only, PPL unchanged):")
-    print(f"    Frequency penalty: weight={args.freq_penalty}{' (DISABLED)' if args.freq_penalty == 0 else ''} (log2(freq+1) penalty on common words)")
-    print(f"    Sentence boundary reset: YES (reset hierarchy after periods)")
-    print(f"  F FUNCTION:")
-    print(f"    Type: {args.f_type}")
-    if f_type == 2:
-        print(f"    Temperature: {args.exp_temperature/100:.2f} (Q8: {args.exp_temperature})")
-    print(f"  ENERGY SCALES:")
-    print(f"    DAM scale={args.dam_scale}")
-    print(f"    Episodic scale={args.episodic_scale}")
-    print(f"    Same-word penalty={args.same_word_penalty} (generation only, not PPL)")
-    print(f"    Generation: top-k=10 + Boltzmann + constrained decoding (v53)")
-    print(f"    Repetition window=15, distance-decay (v40 fix)")
-    print(f"    Grammar penalty scaled to ~33% median_dE (v40 fix)")
-    print(f"    Special tokens (idx<4) filtered from candidates (v40 fix)")
-    print(f"  UV-COMPLETE:")
-    print(f"    Regularize={uv_regularize}, lambda={args.uv_lambda}")
-    print(f"    Top-down scale={args.topdown_scale}")
-    print(f"    Ward identity checks: ENABLED")
-    print(f"  COUPLING:")
-    print(f"    J_clip={args.j_clip}")
-    print(f"    Learning: Hebbian (L0 only, RG flow to higher levels)")
-    print(f"  EPISODIC:")
-    print(f"    Max episodes={args.max_episodes}")
-    print(f"  DATA:")
-    print(f"    Dataset={args.dataset}, samples={n_texts:,}")
-    print(f"    Vocab max={args.vocab}, min_freq={args.vocab_min_freq}")
-    print(f"    Max seq len={args.max_seq_len}")
-    if args.memory_budget > 0:
-        print(f"    Memory budget={args.memory_budget:,} MB")
-    print(f"{'=' * 70}")
+    print(f"""{'=' * 70}
+CONFIG: Attractor Language Machine v54 (POS-DRIVEN GENERATION)
+  ARCHITECTURE:
+    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)
+    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)
+    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)
+    F function: INLINE piecewise exp (NO J_MAX clip)
+    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))
+  BINDING (v52: VSA secondary — positional VSA + J2 are primary):
+    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))
+    Hash: sum(active_bits) mod D (full [0,D-1] spread)
+    Window: {args.bind_window} recent bigram bindings
+    Weight: {args.bind_weight}
+    N_unbind: {args.n_unbind_words} (multi-step unbinding)
+    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits
+    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)
+    Recency: NONE (uniform — recency reverted, hurt PPL)
+  BIGRAM DAM (v52: STRONG bigram + positional VSA context):
+    J2: V×V int32 matrix of log2(count+1) values
+    Weight: {args.bigram_weight}{' (DISABLED)' if args.bigram_weight == 0 else ''}
+    Skip bigram: J2[words[-2],c] weight={args.skip_weight}{' (DISABLED)' if args.skip_weight == 0 else ''}
+    Energy: E_bigram(c) = -J2[prev_word, c] * weight
+    Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}
+    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB
+  POS SKELETON (v54: hard type selection during generation):
+    J_pos_bi: 13×13 POS bigram transitions, log2(count+1)
+    J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)
+    PPL weight: {args.pos_weight}{' (DISABLED for PPL)' if args.pos_weight == 0 else ''}
+    Gen bonus weight: {args.pos_gen_weight} (generation-only energy bonus)
+    Type pre-selection: top-{args.pos_type_top_k} most likely types (hard filter during generation)
+    Backoff: trigram → bigram (75% weight) when trigram count=0
+    Memory: ~10 KB (trivial)
+  POS-DRIVEN GENERATION (v54: generation-only, PPL unchanged):
+    Hard POS type selection: YES (POS trigram picks ONE type per position)
+    Bigram gen weight: {args.bigram_gen_weight}{' (=bigram_weight)' if args.bigram_gen_weight == 0 else ''} (generation-only, v54)
+    Skip gen weight: {args.skip_gen_weight}{' (=skip_weight)' if args.skip_gen_weight == 0 else ''} (generation-only, v54)
+    Bigram pre-filtering: top-50 candidates by bigram score
+    Sentence boundary reset: YES (reset hierarchy after periods)
+  F FUNCTION:
+    Type: {args.f_type}
+  ENERGY SCALES:
+    DAM scale={args.dam_scale}
+    Episodic scale={args.episodic_scale}
+    Same-word penalty={args.same_word_penalty} (generation only, not PPL)
+    Generation: top-k=10 + Boltzmann + POS-driven + bigram-dominant (v54)
+    Repetition window=15, distance-decay (v40 fix)
+    Grammar penalty scaled to ~33% median_dE (v40 fix)
+    Special tokens (idx<4) filtered from candidates (v40 fix)
+  UV-COMPLETE:
+    Regularize={uv_regularize}, lambda={args.uv_lambda}
+    Top-down scale={args.topdown_scale}
+    Ward identity checks: ENABLED
+  COUPLING:
+    J_clip={args.j_clip}
+    Learning: Hebbian (L0 only, RG flow to higher levels)
+  EPISODIC:
+    Max episodes={args.max_episodes}
+  DATA:
+    Dataset={args.dataset}, samples={n_texts:,}
+    Vocab max={args.vocab}, min_freq={args.vocab_min_freq}
+    Max seq len={args.max_seq_len}
+  {'Memory budget=' + str(args.memory_budget) + ' MB' if args.memory_budget > 0 else ''}
+{'=' * 70}""")
 
     # --- Train ---
     from ising_spin.attractor import AttractorLanguageModel
@@ -365,6 +373,8 @@ def main():
         freq_penalty_weight=args.freq_penalty,
         pos_gen_weight=args.pos_gen_weight,
         pos_type_top_k=args.pos_type_top_k,
+        bigram_gen_weight=args.bigram_gen_weight,
+        skip_gen_weight=args.skip_gen_weight,
         seed=42,
     )
 
@@ -442,8 +452,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "53.0.0",
-        "architecture": "Attractor Language Machine v53 — CONSTRAINED DECODING (v53: POS type pre-selection top-3, POS gen bonus weight={pgw}, frequency penalty weight={fpw}, sentence boundary reset; v52: positional VSA context encoding; bigram J2 weight={bw}, skip weight={sw}, POS PPL weight={pw}, bind weight={bind_w}, top-k=10)".format(pgw=args.pos_gen_weight, fpw=args.freq_penalty, bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
+        "version": "54.0.0",
+        "architecture": "Attractor Language Machine v54 — POS-DRIVEN GENERATION (v54: hard POS type selection, bigram_gen_weight={bgw}, skip_gen_weight={sgw}; v53: POS type pre-selection top-3, POS gen bonus weight={pgw}, frequency penalty weight={fpw}, sentence boundary reset; v52: positional VSA context encoding; bigram J2 weight={bw}, skip weight={sw}, POS PPL weight={pw}, bind weight={bind_w}, top-k=10)".format(bgw=args.bigram_gen_weight, sgw=args.skip_gen_weight, pgw=args.pos_gen_weight, fpw=args.freq_penalty, bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -468,6 +478,8 @@ def main():
             "freq_penalty_weight": args.freq_penalty,
             "pos_gen_weight": args.pos_gen_weight,
             "pos_type_top_k": args.pos_type_top_k,
+            "bigram_gen_weight": args.bigram_gen_weight,
+            "skip_gen_weight": args.skip_gen_weight,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -492,7 +504,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v53")
+    print(f"DONE — Attractor Language Machine v54")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
