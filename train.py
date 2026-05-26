@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v44 — Training Script
+Attractor Language Machine v45 — Training Script
 
-v44: TOP-K GENERATION
-  - Added top-k=10 candidate filtering before Boltzmann sampling in generate().
-    With 300 candidates per POS type, Boltzmann sampling spreads probability
-    too thinly across the energy landscape. Low-probability "tail" words get
-    sampled too often, causing incoherent word-salad generation.
-    Top-k=10 focuses the sampler on the 10 most likely words, dramatically
-    improving generation coherence while preserving diversity through
-    Boltzmann sampling within the top-k.
-  - PPL evaluation UNCHANGED — top-k only affects generation, not perplexity.
+v45: ORDER-SENSITIVE DAM (FUNDAMENTAL FIX)
+  - The DAM is now trained on ORDER-SENSITIVE context SDRs that include
+    M_bind (VSA binding vector encoding bigram order). Previously, the
+    DAM was trained on bag-of-words contexts, making it order-blind —
+    "cat sat" and "sat cat" produced the SAME context SDR.
+  - During training: encode_contexts_batch_with_binding() builds M_bind
+    incrementally per position and includes it in the context SDR before
+    kWTA. The DAM's Hebbian couplings now learn sequence-dependent patterns.
+  - During inference: context_sdr_for_dam includes M_bind via get_context_or(),
+    matching the training-time encoding.
+  - This is the fundamental fix: the DAM energy landscape itself is now
+    order-sensitive, rather than relying on a separate binding bonus.
 
-v43 binding revert preserved:
+v44 top-k generation preserved:
   - Repetition penalty removed from compute_perplexity().
     v40 BUG: same_word_penalty=800 during PPL evaluation inflated PPL 248→450.
     The repetition penalty is GENERATION-TIME only.
@@ -164,7 +167,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v44 — TOP-K GENERATION"
+        description="Attractor Language Machine v45 — ORDER-SENSITIVE DAM"
     )
 
     # Core parameters
@@ -245,7 +248,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v44 — TOP-K GENERATION", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v45 — ORDER-SENSITIVE DAM", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -262,14 +265,14 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v44 (TOP-K GENERATION)")
+    print(f"CONFIG: Attractor Language Machine v45 (ORDER-SENSITIVE DAM)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v43: uniform kWTA, recency reverted):")
+    print(f"  BINDING (v45: IN DAM CONTEXT — order-sensitive training):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
@@ -407,8 +410,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "44.0.0",
-        "architecture": "Attractor Language Machine v44 — top-k generation (v44: filter to top 10 lowest-energy candidates before Boltzmann sampling, prevents low-probability tail words from causing incoherent generation), binding revert (v43: recency weighting hurt PPL 221→368), diagnostic fix (v42: get_diagnostics reports configured window/density not runtime state), PPL eval fix (v41: repetition penalty removed from compute_perplexity), generation quality fix (v40: repetition penalty=800 distance-decay window=15, grammar penalty ~33% dE, special tokens filtered, PUNCT constraints), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
+        "version": "45.0.0",
+        "architecture": "Attractor Language Machine v45 — ORDER-SENSITIVE DAM (v45: M_bind included in context SDR during BOTH training and inference, DAM now learns order-dependent couplings natively instead of relying on separate binding bonus, encode_contexts_batch_with_binding builds M_bind incrementally per position), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -450,7 +453,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v44")
+    print(f"DONE — Attractor Language Machine v45")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

@@ -340,6 +340,191 @@ class SDREncoder:
         if callback:
             callback(len(sequences), total_pairs)
 
+    def encode_contexts_batch_with_binding(
+        self,
+        sequences: List[List[int]],
+        context_window: int = 10,
+        batch_size: int = 50000,
+        bind_window: int = 8,
+        bind_density: int = 20,
+        callback=None,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """
+        ORDER-SENSITIVE batch context encoding with VSA binding.
+
+        v45 FUNDAMENTAL FIX: The DAM was trained on BOW (bag-of-words)
+        contexts, making it order-blind. This method builds context SDRs
+        that INCLUDE M_bind — the VSA binding vector that encodes bigram
+        order. The DAM then learns order-dependent couplings natively.
+
+        Instead of cumsum (order-blind superposition), we scan each
+        sequence position-by-position, building M_bind incrementally.
+        M_bind is OR'd into the context accumulator before kWTA, so
+        the kWTA-selected context bits include both co-occurrence AND
+        order information.
+
+        Args:
+            sequences: List of token sequences.
+            context_window: Context window size.
+            batch_size: Yield every this many pairs (for memory control).
+            bind_window: Number of recent bigram bindings for M_bind.
+            bind_density: Target M_bind density after kWTA (2k=20).
+            callback: Optional callable(seq_idx, total_pairs) for progress.
+
+        Yields:
+            (context_sdrs, target_sdrs) — each (N, D) uint8 arrays.
+        """
+        from ..attractor.binding import bind_pair, sdr_hash, rotate_sdr
+        from collections import deque
+
+        if not self._built:
+            raise RuntimeError("SDREncoder not built — call build() first")
+
+        D = self.D
+        k = self.k
+        V = self.vocab_size
+        word_sdrs = self.word_sdrs  # (V, D) uint8
+
+        print(f"        [encode_contexts_batch_with_binding] Starting: {len(sequences)} seqs, "
+              f"D={D}, k={k}, batch_size={batch_size}, bind_window={bind_window}", flush=True)
+
+        batch_ctx = []
+        batch_tgt = []
+        total_pairs = 0
+        t_start = time.time()
+        n_seqs_processed = 0
+
+        for seq_idx, seq in enumerate(sequences):
+            seq_len = len(seq)
+            if seq_len < 3:
+                continue
+
+            # Filter valid word IDs
+            valid_seq = [w for w in seq if 0 <= w < V]
+            if len(valid_seq) < 3:
+                continue
+
+            n = len(valid_seq)
+
+            # SEQUENTIAL SCAN: build binding-aware context per position
+            # This replaces the cumsum approach — we MUST go position by
+            # position because M_bind depends on the previous word.
+            context_acc = np.empty((n - 1, D), dtype=np.int32)
+
+            # Binding state (mirrors BindingContext._rebuild logic)
+            _bindings = deque(maxlen=bind_window)
+            _last_word_bits = None
+
+            # Pre-compute SDR stack for superposition contexts
+            sdr_stack = word_sdrs[valid_seq].astype(np.int32)  # (n, D)
+            cumsum = np.cumsum(sdr_stack, axis=0)  # for BOW part only
+
+            for p in range(1, n):
+                # BOW superposition context (same as before)
+                start = max(0, p - context_window)
+                if start == 0:
+                    bow_acc = cumsum[p - 1].copy()
+                else:
+                    bow_acc = cumsum[p - 1] - cumsum[start - 1]
+                    bow_acc = bow_acc.copy()
+
+                # Build bigram binding for this position
+                prev_bits = self.word_active_bits[valid_seq[p - 1]]
+                curr_bits = self.word_active_bits[valid_seq[p]]
+
+                if _last_word_bits is not None:
+                    # bind(current, previous) = rot(current, hash(previous))
+                    bound = bind_pair(curr_bits, _last_word_bits, D)
+                    _bindings.append(bound)
+
+                _last_word_bits = curr_bits.copy()
+
+                # Build M_bind accumulator from binding window (uniform weights)
+                if len(_bindings) > 0:
+                    bind_acc = np.zeros(D, dtype=np.int32)
+                    for bound_bits in _bindings:
+                        for b in bound_bits:
+                            idx = int(b)
+                            if 0 <= idx < D:
+                                bind_acc[idx] += 1
+
+                    # kWTA on M_bind to get top bind_density bits
+                    n_bind_active = min(bind_density, int(np.sum(bind_acc > 0)))
+                    if n_bind_active > 0 and np.max(bind_acc) > 0:
+                        top_bind = np.argpartition(bind_acc, -n_bind_active)[-n_bind_active:]
+                        # Add M_bind bits to BOW accumulator
+                        # Weight: bind bits get +2 boost (they carry ORDER info)
+                        # BOW bits typically have count 1-5, so +2 makes binding
+                        # bits competitive in kWTA without overwhelming BOW signal
+                        for idx in top_bind:
+                            bow_acc[int(idx)] += 2
+
+                context_acc[p - 1] = bow_acc
+
+            # kWTA for ALL positions at once (same as before)
+            nonzero_mask = np.max(context_acc, axis=1) > 0
+            n_valid = int(np.sum(nonzero_mask))
+            if n_valid == 0:
+                continue
+
+            valid_acc = context_acc[nonzero_mask]
+            top_k_all = np.argpartition(valid_acc, -k, axis=1)[:, -k:]
+
+            # Build context SDRs
+            valid_sdrs = np.zeros((n_valid, D), dtype=np.uint8)
+            rows = np.arange(n_valid).reshape(-1, 1)
+            valid_sdrs[rows, top_k_all] = 1
+
+            # Target SDRs for valid positions
+            positions = np.arange(1, n)
+            valid_positions = positions[nonzero_mask]
+            valid_targets = np.array([valid_seq[p] for p in valid_positions], dtype=np.int64)
+
+            # Filter out zero context/target
+            ctx_sums = np.sum(valid_sdrs, axis=1)
+            tgt_sums = np.sum(word_sdrs[valid_targets], axis=1)
+            both_nonzero = (ctx_sums > 0) & (tgt_sums > 0)
+
+            for i in np.where(both_nonzero)[0]:
+                batch_ctx.append(valid_sdrs[i].copy())
+                batch_tgt.append(word_sdrs[int(valid_targets[i])].copy())
+                total_pairs += 1
+
+                if len(batch_ctx) >= batch_size:
+                    print(f"        [encode] Yielding batch of {len(batch_ctx)} pairs "
+                          f"after seq {seq_idx+1}/{len(sequences)} "
+                          f"({time.time()-t_start:.1f}s)", flush=True)
+                    ctx_arr = np.array(batch_ctx, dtype=np.uint8)
+                    tgt_arr = np.array(batch_tgt, dtype=np.uint8)
+                    yield ctx_arr, tgt_arr
+                    batch_ctx = []
+                    batch_tgt = []
+
+            n_seqs_processed += 1
+
+            # Progress every 500 sequences or 5 seconds
+            now = time.time()
+            if n_seqs_processed % 500 == 0 or (now - t_start) > 5.0:
+                elapsed = now - t_start
+                rate = n_seqs_processed / max(0.1, elapsed)
+                eta = (len(sequences) - seq_idx) / max(1, rate)
+                print(f"        [encode] {n_seqs_processed} seqs, {total_pairs} pairs, "
+                      f"{rate:.0f} seqs/s, ETA {eta:.0f}s", flush=True)
+                t_start = now
+                n_seqs_processed = 0
+
+        # Final partial batch
+        if batch_ctx:
+            print(f"        [encode] Final batch: {len(batch_ctx)} pairs", flush=True)
+            ctx_arr = np.array(batch_ctx, dtype=np.uint8)
+            tgt_arr = np.array(batch_tgt, dtype=np.uint8)
+            yield ctx_arr, tgt_arr
+
+        print(f"        [encode] Done: {total_pairs} total pairs (with binding)", flush=True)
+
+        if callback:
+            callback(len(sequences), total_pairs)
+
     def hamming_overlap(self, sdr1: np.ndarray, sdr2: np.ndarray) -> int:
         """
         Compute Hamming overlap (count of shared active bits) between two SDRs.
