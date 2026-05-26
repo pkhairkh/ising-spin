@@ -691,9 +691,14 @@ class DAMLayer:
             eta: Learning rate.
         """
         # Batch outer product: J += eta * target^T @ context
-        J_update = (
-            target_sdrs.astype(np.int32).T @ context_sdrs.astype(np.int32)
-        ) * eta
+        # CRITICAL: Use float32 matmul — numpy integer matmul does NOT use
+        # BLAS, making it 50-100x slower. Cast to float32, use BLAS, cast back.
+        ctx_f = context_sdrs.astype(np.float32)   # (N, D) float32
+        tgt_f = target_sdrs.astype(np.float32)    # (N, D) float32
+        J_update_f = tgt_f.T @ ctx_f              # (D, D) float32 — BLAS-accelerated!
+        J_update_f *= float(eta)
+        J_update = J_update_f.astype(np.int32)    # Back to int for accumulation
+        del ctx_f, tgt_f, J_update_f              # Free float arrays ASAP
 
         # Zero diagonal (no self-coupling)
         np.fill_diagonal(J_update, 0)
