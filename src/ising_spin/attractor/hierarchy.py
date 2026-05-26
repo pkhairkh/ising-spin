@@ -551,6 +551,14 @@ class HierarchicalDAM:
 
         return states
 
+    # v35: Energy normalization constant.
+    # log2_piecewise_F returns values in 256x fixed-point.
+    # Typical log2_F sum per word ≈ 6000-8000 (256x FP).
+    # We want normalized energies where dE ~ O(1-10) so that
+    # beta ~ O(1) gives meaningful Boltzmann discrimination.
+    # Dividing by LOG2_NORM = 512 brings 6000 → ~12, which is ideal.
+    LOG2_NORM = 512
+
     def compute_word_energies(
         self,
         context_sdr: np.ndarray,
@@ -559,18 +567,16 @@ class HierarchicalDAM:
         scale: int = 1600,
     ) -> np.ndarray:
         """
-        Compute energy for each candidate word using LOG2-SPACE F.
+        Compute energy for each candidate word using NORMALIZED log2-F.
 
-        v33 FIX: The old code used F_lookup with J_MAX=1000 clip, which
-        destroyed selectivity for fields > 1000. Even with _piecewise_F
-        (no clip), raw F(x) produces values up to ~1e17, making the
-        Boltzmann sampler unable to discriminate.
+        v35 FIX: v33 introduced log2-F to prevent overflow, but the
+        energies were in 256x fixed-point (dE ~ 3000-8000), leading to
+        beta = 0.002 which made the sampler nearly uniform (no selectivity).
 
-        Solution: compute log2(F(x)) instead of F(x). This preserves the
-        rank ordering (log is monotonic) while keeping energies in a
-        reasonable range for the sampler (~0 to ~53000 for fields up to 20000).
+        v35 normalizes by LOG2_NORM = 512, bringing dE into the O(1-10)
+        range where beta ~ 1.0 gives proper Boltzmann discrimination.
 
-        E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / k(w)
+        E(w) = -sum_{d in active(w)} log2_F(context_field[d]) / (k * LOG2_NORM)
 
         where log2_F(x) = log2(T + x%T) + (x//T) in 256x fixed-point.
 
@@ -582,6 +588,7 @@ class HierarchicalDAM:
 
         Returns:
             Energy array (len(candidate_words),) int64. Lower = more likely.
+            Values are normalized so dE ~ O(1-10), suitable for beta ~ 1.0.
         """
         n_cand = len(candidate_words)
 
@@ -603,7 +610,7 @@ class HierarchicalDAM:
             td_field = self.compute_topdown_field(self.layers[1].state, 0)
             context_field += td_field
 
-        # v33: Compute log2_F for ALL field values at once (no J_MAX clip!)
+        # Compute log2_F for ALL field values at once (no J_MAX clip!)
         log2_F_all = self.layers[0]._log2_piecewise_F(context_field.astype(np.int64))
 
         energies = np.zeros(n_cand, dtype=np.int64)
@@ -611,12 +618,12 @@ class HierarchicalDAM:
         for i, w in enumerate(candidate_words):
             w = int(w)
             if w < 0 or w >= sdr_encoder.vocab_size:
-                energies[i] = 100000  # High energy for OOV
+                energies[i] = 200  # High energy for OOV (normalized scale)
                 continue
 
             active_bits = sdr_encoder.word_active_bits[w]
             if len(active_bits) == 0:
-                energies[i] = 100000
+                energies[i] = 200
                 continue
 
             k = len(active_bits)
@@ -627,8 +634,8 @@ class HierarchicalDAM:
             else:
                 total_f = 0
 
-            # Energy = -log2_F_contribution / k (normalized by active bit count)
-            energies[i] = -total_f // max(1, k)
+            # v35: Normalize by k * LOG2_NORM so dE ~ O(1-10)
+            energies[i] = -(total_f // (max(1, k) * self.LOG2_NORM))
 
         return energies
 
