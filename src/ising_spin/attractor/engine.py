@@ -98,9 +98,9 @@ class AttractorLanguageModel:
         max_seq_len: int = 30,
         # VSA Binding (v39)
         bind_window: int = 8,
-        bind_weight: int = 100,
+        bind_weight: int = 30,
         n_unbind_words: int = 3,
-        bind_density: int = 40,
+        bind_density: int = 0,  # 0 = auto (2*k=20)
         # Memory
         memory_budget_mb: int = 0,
         # Seeds
@@ -182,14 +182,14 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v46 — BOOSTED BINDING", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v47 — CLEAN REVERT", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
         print("  Binding: VSA permutation bind(a,hash(b)), kWTA sparsification", flush=True)
-        print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density}", flush=True)
+        print(f"  Bind window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'}", flush=True)
         print("  M_bind: attractor dynamics ONLY (not DAM energy) — v45 reverted", flush=True)
-        print("  Training: BOW-only DAM (v45 order-sensitive training reverted — PPL 1909)", flush=True)
+        print("  Training: BOW-only DAM (v45 order-sensitive reverted, v46 binding params reverted)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -313,18 +313,23 @@ class AttractorLanguageModel:
         self._populate_episodic_memory()
 
         # v39: Build VSA binding context with multi-step unbinding
-        # v46: target_density=40 (up from auto 2k=20) for stronger binding signal
+        # v47: REVERTED v46 binding params (weight 100→30, density 40→auto=20)
+        # v46's boosted binding caused PPL 7983 — binding noise amplified at
+        # high weight dominated over DAM co-occurrence signal. v44 params (30, 20)
+        # gave PPL=221.
+        bind_density_arg = self._bind_density if self._bind_density > 0 else 0  # 0 = auto
         self.binding = BindingContext(
             D=self.sdr_dim,
             k=self.sdr_encoder.k,
             window=self._bind_window,
             bind_weight=self._bind_weight,
             n_unbind_words=self._n_unbind_words,
-            target_density=self._bind_density,
+            target_density=bind_density_arg,
         )
+        actual_density = self.binding.target_density
         print(f"    Binding context: D={self.sdr_dim}, k={self.sdr_encoder.k}, "
               f"window={self._bind_window}, weight={self._bind_weight}, "
-              f"n_unbind={self._n_unbind_words}, density={self._bind_density}")
+              f"n_unbind={self._n_unbind_words}, density={actual_density}")
 
         self._calibrate_beta()
 
@@ -345,15 +350,15 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v46")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v47")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
-        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density})")
+        print(f"  Binding: VSA permutation (window={self._bind_window}, weight={self._bind_weight}, n_unbind={self._n_unbind_words}, density={self._bind_density if self._bind_density > 0 else 'auto'})")
         print(f"  Repetition: penalty={self.same_word_penalty}, window=15, distance-decay")
         print(f"  Generation: top-k=10 (v44) + Boltzmann sampling")
-        print(f"  v46: DAM trained on BOW-only contexts (v45 order-sensitive reverted)")
-        print(f"  v46: Binding weight boosted {self._bind_weight} (from v44=30), M_bind density {self._bind_density} (from v44=20)")
+        print(f"  v47: DAM trained on BOW-only contexts (v45 order-sensitive reverted)")
+        print(f"  v47: Binding params reverted to v44 values (weight=30, density=auto=20)")
 
         self._print_diagnostics()
 
@@ -394,14 +399,16 @@ class AttractorLanguageModel:
         print(f"    Vectorized Hebbian training over {n_seqs:,} sequences...", flush=True)
         print(f"    Encoding batch size: {hebbian_batch} (adaptive for D={self.sdr_dim})",
               flush=True)
-        print(f"    v46: Using BOW-ONLY context encoding (v45 order-sensitive reverted)", flush=True)
+        print(f"    v47: Using BOW-ONLY context encoding (same as v44)", flush=True)
 
         def progress_callback(seq_idx, total):
             print(f"      Hebbian encoding: {seq_idx:,} seqs, {total:,} pairs encoded",
                   flush=True)
 
-        # v46: REVERTED to BOW-only context encoding.
-        # v45 used encode_contexts_batch_with_binding() which caused PPL 1909.
+        # v47: BOW-only context encoding (same as v44).
+        # v45 used encode_contexts_batch_with_binding() → PPL 1909.
+        # v46 reverted training but boosted binding → PPL 7983.
+        # v47: revert binding params too → should recover v44 PPL ~221.
         for ctx_arr, tgt_arr in self.sdr_encoder.encode_contexts_batch(
             self.sequences,
             context_window=context_window,
@@ -1005,7 +1012,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v46 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v47 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:

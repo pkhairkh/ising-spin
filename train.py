@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v46 — Training Script
+Attractor Language Machine v47 — Training Script
 
-v46: BOOSTED BINDING — binding as dominant generation signal
-  - REVERTED v45 order-sensitive DAM training (PPL 1909 regression)
-    The v45 approach trained the DAM on binding-augmented context SDRs,
-    which contaminated the J matrix — same BOW context produced different
-    SDRs depending on word order, and with k=10 active bits the DAM
-    couldn't represent all variations. Result: PPL went from 221→1909.
-  - REVERTED v45 inference: DAM energy uses BOW-only context_sdr again.
-    M_bind is only used for attractor dynamics (context_field) and the
-    separate binding energy bonus. Training/inference consistency restored.
-  - BOOSTED binding weight: 30→100 (binding bonus now dominates DAM dE)
-    With dE_median≈130 and binding overlap 2-3 bits, bonus = 200-300.
-    This makes binding the dominant signal for candidate selection,
-    effectively providing n-gram-like order sensitivity at generation time.
-  - BOOSTED M_bind density: 20→40 (less lossy kWTA compression)
-    With density=40, more binding information survives kWTA, making
-    the unbinding signal more discriminative. Previously density=20
-    kept only 25% of binding bits (20/80 with window=8).
-  - Added --bind-density CLI parameter
+v47: CLEAN REVERT — revert both v45 and v46 changes to recover v44 PPL
+  - v46 PPL=7983 regression cause: boosted binding (weight 30→100, density 20→40)
+    The binding bonus with weight=100 is ~200-300 for matching candidates,
+    which DOMINATES the DAM co-occurrence signal (dE_median~130). The VSA
+    binding is too noisy at this weight — when unbinding gives wrong signal,
+    it actively hurts the correct word's probability. dE_median inflated
+    from 122→415 because binding bonus adds 200-300 to non-matching candidates.
+  - REVERTED bind_weight: 100→30 (v44 value)
+  - REVERTED bind_density: 40→0/auto=20 (v44 default)
+  - Kept v45 training revert: BOW-only encode_contexts_batch()
+  - This should make v47 functionally identical to v44, recovering PPL~221
 
 v45 failure analysis:
   The DAM is fundamentally a BOW (bag-of-words) model. Its J matrix
@@ -30,6 +23,13 @@ v45 failure analysis:
   training context, but this created inconsistent training signals.
   The correct approach: DAM captures co-occurrence (BOW), binding
   captures order (runtime bonus). Separation of concerns.
+
+v46 failure analysis:
+  Boosting binding weight 3x (30→100) amplified binding noise. The VSA
+  unbinding with kWTA compression is lossy — overlap for the correct word
+  can be 0 while a random word gets overlap 2-3. At weight=100, this
+  noise dominates the DAM signal, inflating dE and destroying selectivity.
+  The binding bonus should be SUBSIDIARY to DAM co-occurrence, not dominant.
 
 v44 top-k generation preserved:
   - Repetition penalty removed from compute_perplexity().
@@ -183,7 +183,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v46 — BOOSTED BINDING"
+        description="Attractor Language Machine v47 — CLEAN REVERT"
     )
 
     # Core parameters
@@ -243,12 +243,12 @@ def main():
     # VSA Binding parameters (v39)
     parser.add_argument("--bind-window", type=int, default=8,
                         help="Binding context window size (default: 8)")
-    parser.add_argument("--bind-weight", type=int, default=100,
-                        help="Binding energy weight (default: 100, was 30 in v44)")
+    parser.add_argument("--bind-weight", type=int, default=30,
+                        help="Binding energy weight (default: 30, v44 value)")
     parser.add_argument("--n-unbind-words", type=int, default=3,
                         help="Number of recent words for multi-step unbinding (default: 3)")
-    parser.add_argument("--bind-density", type=int, default=40,
-                        help="M_bind target density in bits (default: 40, was 20 in v44)")
+    parser.add_argument("--bind-density", type=int, default=0,
+                        help="M_bind target density in bits (default: 0=auto, i.e. 2*k=20, v44 value)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -266,7 +266,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v46 — BOOSTED BINDING", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v47 — CLEAN REVERT", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -283,20 +283,20 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v46 (BOOSTED BINDING)")
+    print(f"CONFIG: Attractor Language Machine v47 (CLEAN REVERT)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
     print(f"    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)")
     print(f"    F function: INLINE piecewise exp (NO J_MAX clip)")
     print(f"    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))")
-    print(f"  BINDING (v46: BOOSTED — binding dominates generation):")
+    print(f"  BINDING (v47: REVERTED to v44 params — weight=30, density=auto=20):")
     print(f"    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))")
     print(f"    Hash: sum(active_bits) mod D (full [0,D-1] spread)")
     print(f"    Window: {args.bind_window} recent bigram bindings")
-    print(f"    Weight: {args.bind_weight} (v46: boosted from 30)")
+    print(f"    Weight: {args.bind_weight} (v47: reverted from v46's 100)")
     print(f"    N_unbind: {args.n_unbind_words} (multi-step unbinding)")
-    print(f"    M_bind density: {args.bind_density} bits (v46: boosted from 20, less lossy kWTA)")
+    print(f"    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits (v47: reverted from v46's 40)")
     print(f"    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)")
     print(f"    Recency: NONE (uniform — recency reverted, hurt PPL)")
     print(f"  F FUNCTION:")
@@ -429,8 +429,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "46.0.0",
-        "architecture": "Attractor Language Machine v46 — BOOSTED BINDING (v46: reverted v45 order-sensitive DAM training which caused PPL 221→1909 regression, DAM trained on BOW-only contexts again, binding weight boosted 30→100 for dominant generation signal, M_bind density boosted 20→40 for less lossy kWTA compression, DAM energy uses BOW-only context_sdr while M_bind is only for attractor dynamics and binding bonus), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}, density={d}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words, d=args.bind_density),
+        "version": "47.0.0",
+        "architecture": "Attractor Language Machine v47 — CLEAN REVERT (v47: reverted both v45 and v46 changes to recover v44 PPL~221, v46 boosted binding weight 30→100 and density 20→40 which caused PPL 7983 by amplifying binding noise that dominated DAM signal, v45 order-sensitive DAM training also reverted (caused PPL 1909), binding params restored to v44 values weight=30 density=auto=20, DAM trained on BOW-only contexts, M_bind for attractor dynamics only), top-k generation (v44: filter to top 10 candidates before Boltzmann sampling), binding revert (v43: recency weighting hurt PPL), PPL eval fix (v41), generation quality fix (v40), compositional binding (VSA permutation, window={w}, weight={wt}, n_unbind={n_u}, density={d}), energy precision (LOG2_NORM=512, no k div, no h, ep_scale=100), pure Hebbian".format(w=args.bind_window, wt=args.bind_weight, n_u=args.n_unbind_words, d=args.bind_density),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -473,7 +473,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v46")
+    print(f"DONE — Attractor Language Machine v47")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
