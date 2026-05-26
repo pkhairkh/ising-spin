@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v52 — Training Script
+Attractor Language Machine v53 — Training Script
 
-v52: POSITIONAL VSA CONTEXT — fix the order-blind BOW encoding
-  - v50 had PPL=16.65 (great!) but generation was word salad.
-  - v51 added POS skeleton (13 types) — too coarse, PPL regressed to 27.73.
-  - ROOT CAUSE: BOW context encoding destroys word order. The DAM knows
-    "what words appear together" but not "in what order". During generation,
-    each wrong word pollutes the BOW, causing error cascade.
-  - v52 FIX: Replace BOW with positional VSA context encoding.
-    Each word's SDR is rotated by its relative position hash before
-    superposition. "the cat" and "cat the" now produce DIFFERENT context
-    SDRs. The DAM can learn order-dependent patterns natively.
-  - Key difference from v45 (which failed, PPL 221→1909):
-    v45 used content-dependent hash (bind(word, hash(prev_word))) →
-    same BOW context produced different SDRs → DAM couldn't handle it.
-    v52 uses position-dependent hash (rotate(word, hash(rel_pos))) →
-    same ordered context always produces the same SDR → consistent training.
-  - Also: restore bigram_weight=16, skip_weight=5, remove POS skeleton,
-    reduce bind_weight to 15 (positional VSA handles order in DAM now),
-    restore top-k=10.
+v53: CONSTRAINED DECODING — fix generation word salad without changing PPL
+  - v52 achieved PPL=13.06 (great!) with positional VSA context, but generation
+    was still word salad — same as v50 (PPL=16.65) and v51 (PPL=27.73).
+  - ROOT CAUSE: During generation, the model picks POS types by lowest-energy
+    word across ALL valid types, which favors high-frequency hub words ("been",
+    "must", "keep") regardless of syntactic coherence. Error cascade then
+    compounds: wrong word → wrong context → more wrong words → word salad.
+  - v53 FIX: All changes are GENERATION-ONLY (PPL unchanged):
+    1. POS type pre-selection: Hard filter to top-3 most likely POS types
+       using POS bigram/trigram transition matrix. Forces syntactically
+       coherent type sequences (DET→ADJ→NOUN, NOUN→VERB, etc.).
+    2. POS skeleton energy bonus during generation (weight=10): Provides
+       soft ranking among pre-selected types, guiding between-type
+       selection toward syntactically likely transitions.
+    3. Frequency penalty during generation (weight=5): Penalizes
+       log2(freq+1) of candidate words, preventing high-frequency hub
+       words from dominating when context is uncertain.
+    4. Sentence boundary reset: After generating a period, reset the
+       DAM hierarchy state to prevent cross-sentence error cascade.
+    5. Always build POS skeleton (J_pos_bi, J_pos_tri) for generation use,
+       even when pos_weight=0 for PPL.
+  - POS skeleton is DISABLED for PPL evaluation (pos_weight=0) so PPL
+    should be unchanged from v52's 13.06.
 
 Architecture: D=512, 50K samples, Hebbian L0
 
@@ -148,7 +153,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v52 — POSITIONAL VSA"
+        description="Attractor Language Machine v53 — CONSTRAINED DECODING"
     )
 
     # Core parameters
@@ -221,9 +226,18 @@ def main():
     # Skip bigram (v52: increased weight)
     parser.add_argument("--skip-weight", type=int, default=5,
                         help="Skip bigram weight for J2[words[-2],c] (default: 5, 0=disabled)")
-    # POS skeleton (v52: disabled — positional VSA replaces it)
+    # POS skeleton (v53: always built for generation, disabled for PPL)
     parser.add_argument("--pos-weight", type=int, default=0,
-                        help="POS trigram skeleton weight (default: 0=disabled, positional VSA replaces it)")
+                        help="POS trigram skeleton PPL weight (default: 0=disabled for PPL, always built for generation)")
+    # Frequency penalty (v53: generation-only)
+    parser.add_argument("--freq-penalty", type=int, default=5,
+                        help="Frequency penalty weight for generation (default: 5, 0=disabled)")
+    # POS generation bonus (v53)
+    parser.add_argument("--pos-gen-weight", type=int, default=10,
+                        help="POS skeleton energy bonus weight during generation (default: 10)")
+    # POS type pre-selection (v53)
+    parser.add_argument("--pos-type-top-k", type=int, default=3,
+                        help="Number of top POS types to consider during generation (default: 3)")
 
     # Memory budget
     parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
@@ -241,7 +255,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v52 — POSITIONAL VSA", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v53 — CONSTRAINED DECODING", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -258,7 +272,7 @@ def main():
     uv_regularize = args.uv_regularize and not args.no_uv_regularize
 
     print(f"\n{'=' * 70}")
-    print(f"CONFIG: Attractor Language Machine v52 (POSITIONAL VSA)")
+    print(f"CONFIG: Attractor Language Machine v53 (CONSTRAINED DECODING)")
     print(f"  ARCHITECTURE:")
     print(f"    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)")
     print(f"    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)")
@@ -281,12 +295,17 @@ def main():
     print(f"    Energy: E_bigram(c) = -J2[prev_word, c] * weight")
     print(f"    Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}")
     print(f"    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB")
-    print(f"  POS SKELETON (v52: DISABLED — positional VSA replaces it):")
+    print(f"  POS SKELETON (v53: always built, PPL weight=0, gen bonus weight={args.pos_gen_weight}):")
     print(f"    J_pos_bi: 13×13 POS bigram transitions, log2(count+1)")
     print(f"    J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)")
-    print(f"    Weight: {args.pos_weight}{' (DISABLED)' if args.pos_weight == 0 else ''}")
+    print(f"    PPL weight: {args.pos_weight}{' (DISABLED for PPL)' if args.pos_weight == 0 else ''}")
+    print(f"    Gen bonus weight: {args.pos_gen_weight} (generation-only energy bonus)")
+    print(f"    Type pre-selection: top-{args.pos_type_top_k} most likely types (hard filter during generation)")
     print(f"    Backoff: trigram → bigram (75% weight) when trigram count=0")
     print(f"    Memory: ~10 KB (trivial)")
+    print(f"  CONSTRAINED DECODING (v53: generation-only, PPL unchanged):")
+    print(f"    Frequency penalty: weight={args.freq_penalty}{' (DISABLED)' if args.freq_penalty == 0 else ''} (log2(freq+1) penalty on common words)")
+    print(f"    Sentence boundary reset: YES (reset hierarchy after periods)")
     print(f"  F FUNCTION:")
     print(f"    Type: {args.f_type}")
     if f_type == 2:
@@ -295,7 +314,7 @@ def main():
     print(f"    DAM scale={args.dam_scale}")
     print(f"    Episodic scale={args.episodic_scale}")
     print(f"    Same-word penalty={args.same_word_penalty} (generation only, not PPL)")
-    print(f"    Generation: top-k=10 + Boltzmann (v52)")
+    print(f"    Generation: top-k=10 + Boltzmann + constrained decoding (v53)")
     print(f"    Repetition window=15, distance-decay (v40 fix)")
     print(f"    Grammar penalty scaled to ~33% median_dE (v40 fix)")
     print(f"    Special tokens (idx<4) filtered from candidates (v40 fix)")
@@ -343,6 +362,9 @@ def main():
         bigram_weight=args.bigram_weight,
         skip_weight=args.skip_weight,
         pos_weight=args.pos_weight,
+        freq_penalty_weight=args.freq_penalty,
+        pos_gen_weight=args.pos_gen_weight,
+        pos_type_top_k=args.pos_type_top_k,
         seed=42,
     )
 
@@ -420,8 +442,8 @@ def main():
 
     # --- Save Results ---
     results = {
-        "version": "52.0.0",
-        "architecture": "Attractor Language Machine v52 — POSITIONAL VSA (v52: positional VSA context encoding — rotate(word_sdr, pos_hash(rel_pos)) before superposition, preserving word ORDER in context SDR; bigram J2 weight={bw}, skip weight={sw}, POS weight={pw} (disabled), bind weight={bind_w}, top-k=10)".format(bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
+        "version": "53.0.0",
+        "architecture": "Attractor Language Machine v53 — CONSTRAINED DECODING (v53: POS type pre-selection top-3, POS gen bonus weight={pgw}, frequency penalty weight={fpw}, sentence boundary reset; v52: positional VSA context encoding; bigram J2 weight={bw}, skip weight={sw}, POS PPL weight={pw}, bind weight={bind_w}, top-k=10)".format(pgw=args.pos_gen_weight, fpw=args.freq_penalty, bw=args.bigram_weight, sw=args.skip_weight, pw=args.pos_weight, bind_w=args.bind_weight),
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -443,6 +465,9 @@ def main():
             "bigram_weight": args.bigram_weight,
             "skip_weight": args.skip_weight,
             "pos_weight": args.pos_weight,
+            "freq_penalty_weight": args.freq_penalty,
+            "pos_gen_weight": args.pos_gen_weight,
+            "pos_type_top_k": args.pos_type_top_k,
             "f_type": args.f_type,
             "exp_temperature": args.exp_temperature,
         },
@@ -467,7 +492,7 @@ def main():
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v52")
+    print(f"DONE — Attractor Language Machine v53")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")
