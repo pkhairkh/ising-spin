@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v66 — Training Script
+Attractor Language Machine v67 — Training Script
 
-v66: LEARNED ENERGY WEIGHTS + SPIN PRECISION FIX
-  - CRITICAL FIX: v65 spin energy was ALWAYS ZERO due to cascading
-    integer division truncation. //τ then //512 then //3 = 0 for
-    typical field values. v66 defers division to the end, preserving
-    precision. Spin energy should now be non-zero!
-  - LEARNED WEIGHTS: Energy combination weights (bigram, skip,
-    trigram, DAM, spin, etc.) are now learned via gradient descent
-    on cross-entropy loss, replacing hand-tuned "magic numbers."
-    The Hebbian J matrices stay frozen — only the weight scalars
-    are learned. Gradient has closed form:
-      ∂L/∂w_k = raw_e_k(w_target) - Σ_w P(w) * raw_e_k(w)
-    No PyTorch needed — pure numpy SGD.
-  - Also learns β (temperature) alongside weights.
-  - Expected improvement: better PPL from optimal weight combination,
-    and spin energy now actually contributing to word selection.
+v67: SPIN FIX + LEARNED WEIGHTS
+  - CRITICAL FIX: Y band (AND) was dead — expected overlap with k=10/D=512
+    SDRs is only 0.2 bits/step, so m_y was essentially always zero.
+    Changed from AND to min(s, m_z)*4 which captures "active topic" signal.
+  - Spin weights increased: Z=5x (was 2x), Y=3x (was 1x), spin weight_den=1 (was 5).
+    Spin energy now ~10-20% of DAM range instead of ~1-3%.
+  - Fixed WEIGHT_DEN bug in deferred division: cross-band denominators now
+    correctly included in the common denominator.
+  - __pycache__ auto-cleanup on startup to prevent stale import errors.
+  - v66's learned weights and Adam optimizer preserved.
 
 Architecture: D=512, 50K samples, Hebbian L0
 
@@ -34,6 +29,15 @@ from pathlib import Path
 _src = str(Path(__file__).parent / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
+
+# v67: Clear stale __pycache__ to prevent "unexpected keyword argument" errors
+# after git pull. Python caches bytecode in __pycache__/ and doesn't check
+# if the source file is newer when the .pyc timestamp is close enough.
+import shutil
+for root, dirs, files in os.walk(Path(__file__).parent / "src"):
+    if "__pycache__" in dirs:
+        shutil.rmtree(os.path.join(root, "__pycache__"), ignore_errors=True)
+        dirs.remove("__pycache__")
 
 import argparse
 import json
@@ -139,7 +143,7 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v66 — LEARNED WEIGHTS + SPIN FIX"
+        description="Attractor Language Machine v67 — SPIN FIX + LEARNED WEIGHTS"
     )
 
     # Core parameters
@@ -264,7 +268,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v66 — LEARNED WEIGHTS + SPIN FIX", flush=True)
+    print("ATTRACTOR LANGUAGE MACHINE v67 — SPIN FIX + LEARNED WEIGHTS", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -283,7 +287,7 @@ def main():
     dynamic_gen = args.dynamic_gen  # v65: kept for API compat but generation always uses v65
 
     print(f"""{'=' * 70}
-CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
+CONFIG: Attractor Language Machine v67 (SPIN FIX + LEARNED WEIGHTS)
   ARCHITECTURE:
     SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)
     Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)
@@ -316,7 +320,7 @@ CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
   {'DAM-FIRST GENERATION (v58: DAM primary, POS scaled to DAM std):' if dynamic_gen else 'V66 LEARNED WEIGHTS + SPIN PRECISION FIX:'}
     {'ALL words compete — no hard POS type gate, no bigram pre-filter' if dynamic_gen else 'POS trigram picks top-3 types → hard filter → n-gram + spin energy within'}
     {'POS type bonus is soft: favored type gets energy bonus, others get nothing' if dynamic_gen else 'N-gram + DAM + spin: weights LEARNED via gradient descent'}
-    {'DAM-first: DAM for ALL words, then bigram/skip/POS as bonuses' if dynamic_gen else 'SPIN ENERGY: overlap(J@m, sdr(w)) / (τ*LOG2_NORM) — v66 deferred division'}
+    {'DAM-first: DAM for ALL words, then bigram/skip/POS as bonuses' if dynamic_gen else 'SPIN ENERGY: overlap(J@m, sdr(w)) / (τ*LOG2_NORM) — v67 Y-band fix + stronger weights'}
     Bigram gen weight: {args.bigram_gen_weight}{' (=bigram_weight)' if args.bigram_gen_weight == 0 else ''}
     Skip gen weight: {args.skip_gen_weight}{' (=skip_weight)' if args.skip_gen_weight == 0 else ''}
     Freq penalty: {args.freq_penalty}{' (DISABLED)' if args.freq_penalty == 0 else ''}
@@ -409,9 +413,9 @@ CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
     if rss > 0:
         print(f"  Peak memory (RSS): {rss:,} MB")
 
-    # --- v66: Learn energy weights via gradient descent ---
+    # --- v67: Learn energy weights via gradient descent ---
     print(f"\n{'=' * 70}")
-    print("WEIGHT CALIBRATION (v66: learned magic numbers)")
+    print("WEIGHT CALIBRATION (v67: learned magic numbers)")
     print(f"{'=' * 70}")
     try:
         model._calibrate_energy_weights(n_seqs=1000, n_epochs=50, lr=0.005)
@@ -478,8 +482,8 @@ CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
 
     # --- Save Results ---
     results = {
-        "version": "66.0.0",
-        "architecture": "Attractor Language Machine v66 — LEARNED WEIGHTS + SPIN FIX (energy weights learned via gradient descent on cross-entropy; spin precision fix: deferred integer division prevents truncation to zero; Hebbian J matrices frozen, only combination weights learned; gradient: dL/dw_k = raw_e_k(target) - sum P(w)*raw_e_k(w))",
+        "version": "67.0.0",
+        "architecture": "Attractor Language Machine v67 — SPIN FIX + LEARNED WEIGHTS (Y band fix: AND→min(s,m_z)*4; spin weights Z=5x,Y=3x; WEIGHT_DEN bug fix; __pycache__ auto-cleanup; energy weights learned via gradient descent on cross-entropy; Hebbian J matrices frozen; gradient: dL/dw_k = raw_e_k(target) - sum P(w)*raw_e_k(w))",
         "dataset": args.dataset,
         "timestamp": timestamp,
         "config": {
@@ -534,7 +538,7 @@ CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
 
     t_total = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v66")
+    print(f"DONE — Attractor Language Machine v67")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"PPL: {full_ppl:.2f}")
     print(f"Results: {output_dir}")

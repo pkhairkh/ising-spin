@@ -597,38 +597,35 @@ class HierarchicalDAM:
     H_SCALE_NUM = 0
     H_SCALE_DEN = 1  # Unused when H_SCALE_NUM=0
 
-    # v64: Three-band spin state weights — TAU-NORMALIZED.
+    # v67: Three-band spin state weights — TAU-NORMALIZED with correct scale.
     #
-    # CRITICAL FIX: The magnetization vectors m_z/m_x/m_y accumulate over
-    # many steps (up to tau=50 for Z band). When projected through J,
-    # un-normalized fields are 5-50x larger than the context field
-    # (J @ sdr, where sdr has values 0 or 1). This completely scrambles
-    # the DAM energy landscape through the exponential F function,
-    # causing PPL to blow from 14.65 to 1066.
+    # DESIGN GOAL: Spin energy should be ~10-20% of DAM energy range.
+    # DAM energy range: ~40 distinct levels ([-80, -40] typically).
+    # Target spin energy range: ~8-16 distinct levels → meaningful
+    # discrimination without overwhelming the n-gram/DAM signals.
     #
-    # The fix: divide each field by its tau. This converts "accumulated
-    # activity" (0 to tau) into "average activity" (0 to 1), putting
-    # the fields on the same scale as the context field — exactly like
-    # a transformer's KV cache contribution is on the same scale as the
-    # residual stream.
+    # The magnetization vectors m_z/m_x/m_y accumulate over many steps
+    # (up to tau=50 for Z band). After τ-normalization (dividing by τ),
+    # fields represent "average activity" (0 to 1) projected through J.
+    # This puts them on the same scale as the context field — exactly like
+    # a transformer's KV cache contribution.
     #
-    # After tau-normalization, fields represent "fraction of recent window
-    # that each spin was active" projected through J. This is the correct
-    # semantic meaning for a hidden state: not "how much total activity"
-    # but "what is the typical pattern."
+    # v67 CHANGES from v66:
+    #   - Z weight increased from 2 to 5 (topic is the primary coherence
+    #     signal — should be dominant)
+    #   - X weight reduced from 1 to 1 (narrative is fast, already strong
+    #     due to low τ=5; doesn't need boost)
+    #   - Y weight increased from 1 to 3 (v67 Y band uses min(s, m_z)*4
+    #     instead of AND, so it now has meaningful signal)
+    #   - All denominators are 1 (simplifies the deferred division)
     #
-    # Weight multipliers are applied AFTER tau-normalization:
-    #   Z (topic): 2x — topic is the primary coherence signal
-    #   X (narrative): 1x — narrative direction is supplementary
-    #   Y (syntax): 1x — syntactic coherence is supplementary
-    #
-    # Total three-band contribution: ~20-30% of context_field magnitude,
-    # enough to influence word selection without overwhelming context.
-    Z_WEIGHT_NUM = 2   # 2/1 = 2.0x for topic field (AFTER tau-normalization)
+    # These weights produce spin energy ~[-20, +20] range after the
+    # deferred division, giving ~40 distinct levels — comparable to DAM.
+    Z_WEIGHT_NUM = 5   # 5x for topic field (AFTER tau-normalization)
     Z_WEIGHT_DEN = 1
-    X_WEIGHT_NUM = 1   # 1/1 = 1.0x for narrative field (AFTER tau-normalization)
+    X_WEIGHT_NUM = 1   # 1x for narrative field (AFTER tau-normalization)
     X_WEIGHT_DEN = 1
-    Y_WEIGHT_NUM = 1   # 1/1 = 1.0x for syntactic field (AFTER tau-normalization)
+    Y_WEIGHT_NUM = 3   # 3x for syntactic field (AFTER tau-normalization)
     Y_WEIGHT_DEN = 1
 
     def compute_word_energies(
@@ -769,7 +766,7 @@ class HierarchicalDAM:
         weight_den: int = 1,
     ) -> np.ndarray:
         """
-        v66: Compute LINEAR spin-field energy corrections for each candidate word.
+        v67: Compute LINEAR spin-field energy corrections for each candidate word.
 
         v66 CRITICAL FIX: The v65 code divided by τ and LOG2_NORM and weight_den
         in separate integer division steps, causing cascading truncation to zero.
@@ -781,17 +778,25 @@ class HierarchicalDAM:
         ONE division at the very end by (τ * LOG2_NORM * weight_den). This
         preserves precision by deferring truncation as long as possible.
 
+        v67 FIX: Include cross-band WEIGHT_DEN factors in the deferred division.
+        Also updated Z/X/Y weight multipliers for stronger spin signal.
+
         E_spin(w) = -(weight_num/weight_den) * overlap(spin_field, sdr(w)) / LOG2_NORM
 
         where:
-          spin_field = Z_weight * (J @ m_z) / τ_z + X_weight * (J @ m_x) / τ_x + Y_weight * (J @ m_y) / τ_y
+          spin_field = (Z_num/Z_den) * (J @ m_z) / τ_z
+                     + (X_num/X_den) * (J @ m_x) / τ_x
+                     + (Y_num/Y_den) * (J @ m_y) / τ_y
           overlap(field, sdr) = Σ_{d in active(w)} field[d]
 
         Computation order (avoids truncation):
-          1. Compute raw fields: J @ m_z, J @ m_x, J @ m_y (values ~[-2000,2000] * τ ≈ [-100000,100000])
-          2. Accumulate weighted numerator: Z_num * (J@m_z) + X_num * (J@m_x) + Y_num * (J@m_y)
-          3. Compute overlap with SDR (sum over k=10 active bits, values ~[-1M, 1M])
-          4. ONE division: -overlap * weight_num / (τ_lcm * LOG2_NORM * weight_den)
+          1. Compute raw fields: J @ m_z, J @ m_x, J @ m_y
+          2. Accumulate weighted numerator with cross-band DEN factors:
+             num = Z_num * z_raw * τ_x * τ_y * X_den * Y_den
+                 + X_num * x_raw * τ_z * τ_y * Z_den * Y_den
+                 + Y_num * y_raw * τ_z * τ_x * Z_den * X_den
+          3. Compute overlap with SDR (sum over k=10 active bits)
+          4. ONE division: -overlap * weight_num / (τ_z*τ_x*τ_y * Z_den*X_den*Y_den * LOG2_NORM * weight_den)
 
         Args:
             candidate_words: Array of candidate word IDs.
@@ -812,30 +817,30 @@ class HierarchicalDAM:
         D0 = self.layers_config[0][0]
         tb = self.three_band
 
-        # v66: Compute raw fields WITHOUT dividing by τ yet.
-        # J @ m gives values proportional to accumulated magnetization,
-        # which can be large (m up to τ, J up to 2000 → field ~ O(100000))
-        z_field_raw = tb.compute_z_field(J)   # (D,) int32, ~O(100000)
-        x_field_raw = tb.compute_x_field(J)   # (D,) int32, ~O(10000)
-        y_field_raw = tb.compute_y_field(J)   # (D,) int32, ~O(30000)
+        # Compute raw fields WITHOUT dividing by τ yet.
+        z_field_raw = tb.compute_z_field(J)   # (D,) int32
+        x_field_raw = tb.compute_x_field(J)   # (D,) int32
+        y_field_raw = tb.compute_y_field(J)   # (D,) int32
 
-        # v66: Accumulate weighted numerator BEFORE division.
-        # spin_field_num[i] = Z_NUM * z_field[i] * TAU_X * TAU_Y
-        #                   + X_NUM * x_field[i] * TAU_Z * TAU_Y
-        #                   + Y_NUM * y_field[i] * TAU_Z * TAU_X
-        # This puts all three bands on the same denominator (τ_z * τ_x * τ_y)
-        # while preserving the Z/X/Y weight multipliers.
-        #
-        # Total division at the end: / (τ_z * τ_x * τ_y * LOG2_NORM * weight_den)
+        # Accumulate weighted numerator BEFORE division.
+        # Each band contributes: NUM/DEL * J@m / τ
+        # To put all on common denominator (τ_z * τ_x * τ_y * Z_den * X_den * Y_den):
+        #   Z band term: Z_NUM * z_field * τ_x * τ_y * X_den * Y_den
+        #   X band term: X_NUM * x_field * τ_z * τ_y * Z_den * Y_den
+        #   Y band term: Y_NUM * y_field * τ_z * τ_x * Z_den * X_den
         tz, tx, ty = tb.TAU_Z, tb.TAU_X, tb.TAU_Y
-        common_tau = tz * tx * ty  # = 50*5*15 = 3750
+        z_den, x_den, y_den = self.Z_WEIGHT_DEN, self.X_WEIGHT_DEN, self.Y_WEIGHT_DEN
+
+        # Cross-denominator products (for common denominator)
+        x_den_y_den = x_den * y_den
+        z_den_y_den = z_den * y_den
+        z_den_x_den = z_den * x_den
 
         spin_field_num = (
-            z_field_raw.astype(np.int64) * self.Z_WEIGHT_NUM * (tx * ty) +
-            x_field_raw.astype(np.int64) * self.X_WEIGHT_NUM * (tz * ty) +
-            y_field_raw.astype(np.int64) * self.Y_WEIGHT_NUM * (tz * tx)
+            z_field_raw.astype(np.int64) * self.Z_WEIGHT_NUM * (tx * ty) * x_den_y_den +
+            x_field_raw.astype(np.int64) * self.X_WEIGHT_NUM * (tz * ty) * z_den_y_den +
+            y_field_raw.astype(np.int64) * self.Y_WEIGHT_NUM * (tz * tx) * z_den_x_den
         )
-        # spin_field_num values: ~O(100000 * 3750) = ~O(375M) — fits in int64
 
         # For each candidate word, compute overlap(spin_field_num, sdr(w))
         energies = np.zeros(n_cand, dtype=np.int64)
@@ -865,16 +870,15 @@ class HierarchicalDAM:
         all_spin = spin_field_num[stacked_idx]
         all_spin[~valid_mask] = 0
         total_spin_num = np.sum(all_spin, axis=1).astype(np.int64)
-        # total_spin_num values: ~O(375M * 10) = ~O(3.75B) — fits in int64
 
-        # v66: ONE division at the end, preserving maximum precision.
-        # denominator = common_tau * LOG2_NORM * weight_den * weight_den_per_band
+        # ONE division at the end, preserving maximum precision.
+        # Full denominator = common_tau * Z_den * X_den * Y_den * LOG2_NORM * weight_den
         # Negative because high overlap → more likely → lower energy
-        full_denom = common_tau * self.LOG2_NORM * weight_den
+        full_denom = tz * tx * ty * z_den * x_den * y_den * self.LOG2_NORM * weight_den
         if full_denom > 0 and weight_num > 0:
             energies = -(total_spin_num * weight_num) // full_denom
         else:
-            energies = -(total_spin_num) // (common_tau * self.LOG2_NORM)
+            energies = -(total_spin_num) // (tz * tx * ty * self.LOG2_NORM)
 
         # OOV / empty candidates get zero spin energy (no bonus, no penalty)
         empty = ~np.any(valid_mask, axis=1)

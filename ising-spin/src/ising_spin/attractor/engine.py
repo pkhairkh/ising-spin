@@ -18,7 +18,7 @@ DEEP FIXES (v28 — from knowledge base analysis):
   3. Ward identity UV checks (not just spectral gap / cutoff sensitivity)
   4. Pure Hebbian ONLY (PCD removed — unnecessary at right sparsity)
   5. Anomalous dimensions from operator spectrum of J (not running correlations)
-  6. DAM energy + bigram J2 + skip J2 + trigram J3 + three-band spin energy drives word selection (v66: LEARNED weights + spin precision fix)
+  6. DAM energy + bigram J2 + skip J2 + trigram J3 + three-band spin energy drives word selection (v67: SPIN FIX + learned weights)
   7. D decreasing: 512->256->128->64 (RG reduces DOF at coarser scales)
 
 WHAT'S KEPT:
@@ -228,7 +228,7 @@ class AttractorLanguageModel:
         )
 
         print("=" * 70, flush=True)
-        print("ATTRACTOR LANGUAGE MACHINE v66 — LEARNED WEIGHTS + SPIN FIX", flush=True)
+        print("ATTRACTOR LANGUAGE MACHINE v67 — SPIN FIX + LEARNED WEIGHTS", flush=True)
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}", flush=True)
         print("  RG flow: J_eff[l] decimated (not layers[l].J), Kadanoff rescaling", flush=True)
         print("  Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k division, NO h)", flush=True)
@@ -242,7 +242,7 @@ class AttractorLanguageModel:
         print(f"  Bigram gen weight: {self._bigram_gen_weight}{' (=bigram_weight)' if self._bigram_gen_weight == 0 else ''} (v54: generation-only bigram boost)", flush=True)
         print(f"  Skip gen weight: {self._skip_gen_weight}{' (=skip_weight)' if self._skip_gen_weight == 0 else ''} (v54: generation-only skip boost)", flush=True)
         print(f"  Dynamic gen: {'YES — DAM-first, POS scaled to DAM std' if self._dynamic_gen else 'NO — v54 hard cascade'}", flush=True)
-        print("  Training: Positional VSA DAM + bigram J2 + skip J2 + trigram J3 + three-band spin (v66: LEARNED weights, spin precision fix)", flush=True)
+        print("  Training: Positional VSA DAM + bigram J2 + skip J2 + trigram J3 + three-band spin (v67: SPIN FIX + learned weights)", flush=True)
         print("  UV checks: Ward identities + cutoff independence", flush=True)
         print("  Learning: Hebbian L0 only, PCD REMOVED", flush=True)
         print("=" * 70, flush=True)
@@ -423,7 +423,7 @@ class AttractorLanguageModel:
         if rss > 0:
             print(f"  Memory (RSS): {rss:,} MB")
         print(f"  Integer-only: YES — ZERO float operations in hot path")
-        print(f"  Architecture: Dense Associative Memory (DAM) Engine v66")
+        print(f"  Architecture: Dense Associative Memory (DAM) Engine v67")
         print(f"  F function: {f_type_name}, T={self._exp_temperature/100:.2f}")
         print(f"  Learning: Hebbian (L0 only, RG flow to higher levels)")
         print(f"  Energy: NORMALIZED log2-F ({f_type_name}, LOG2_NORM=512, NO k div, NO h)")
@@ -437,7 +437,7 @@ class AttractorLanguageModel:
         print(f"  Bigram gen weight: {self._bigram_gen_weight}{' (=bigram_weight)' if self._bigram_gen_weight == 0 else ''} (v54)")
         print(f"  Skip gen weight: {self._skip_gen_weight}{' (=skip_weight)' if self._skip_gen_weight == 0 else ''} (v54)")
         print(f"  Dynamic gen: {'YES — DAM-first, POS scaled' if self._dynamic_gen else 'NO (v54 cascade)'}")
-        print(f"  Spin hidden state: σ_z(topic,τ=50,2x) σ_x(narrative,τ=5,1x) σ_y(syntax,τ=15,1x) — v66 deferred division fix")
+        print(f"  Spin hidden state: σ_z(topic,τ=50,5x) σ_x(narrative,τ=5,1x) σ_y(syntax,τ=15,3x) — v67 Y-band fix + stronger weights")
 
         self._print_diagnostics()
 
@@ -1087,7 +1087,7 @@ class AttractorLanguageModel:
 
     def _calibrate_energy_weights(self, n_seqs: int = 1000, n_epochs: int = 50,
                                       lr: float = 0.005) -> None:
-        """v66: Learn energy combination weights via gradient descent on cross-entropy.
+        """v67: Learn energy combination weights via gradient descent on cross-entropy.
 
         The energy function is: E(w) = Σ_k w_k * raw_e_k(w)
         where raw_e_k are the unweighted energy components and w_k are
@@ -1110,7 +1110,7 @@ class AttractorLanguageModel:
         from ..utils import primary_pos_tag
 
         V = len(self.vocab)
-        print(f"\n    v66: Learning energy weights via gradient descent (Adam)...")
+        print(f"\n    v67: Learning energy weights via gradient descent (Adam)...")
         print(f"    ({n_seqs} sequences, {n_epochs} epochs, lr={lr})")
 
         # --- Define learnable weight names and initial values ---
@@ -1131,7 +1131,7 @@ class AttractorLanguageModel:
             'episodic': 1.0,                               # 1.0 (episodic already has field_scale)
             'binding': 1.0,                                # 1.0 (binding already has bind_weight)
             'freq_penalty': 0.0,                           # 0 for PPL (freq penalty is gen-only)
-            'spin': 0.2,                                   # 1/5 for PPL
+            'spin': 1.0,                                   # v67: was 0.2, now spin is meaningful
         }
 
         # Also learn beta alongside weights
@@ -1426,12 +1426,12 @@ class AttractorLanguageModel:
         # Update beta to learned value
         self.beta = learnable_beta
 
-        print(f"\n    v66: Learned weights (integer, DAM-normalized):")
+        print(f"\n    v67: Learned weights (integer, DAM-normalized):")
         for k, v in self._learned_weights.items():
             print(f"      {k}: {v}")
         print(f"    Learned beta: {learnable_beta:.4f}")
         print(f"    Best loss: {best_loss:.4f}")
-        print(f"    vs hand-tuned: tri=8, bi=16, skip=5, dam=1, ep=1, bind=1, freq=0, spin=1/5")
+        print(f"    vs hand-tuned: tri=8, bi=16, skip=5, dam=1, ep=1, bind=1, freq=0, spin=1")
 
     # ===================================================================
     # GENERATION
@@ -1548,14 +1548,14 @@ class AttractorLanguageModel:
             BIND_WEIGHT = lw['binding']          # Learned binding weight
             FREQ_WEIGHT = lw['freq_penalty']     # Learned freq penalty weight
         else:
-            # v60 hand-tuned defaults (fallback)
+            # v67 hand-tuned defaults (fallback)
             TRI_WEIGHT = 20    # Trigram J3: PRIMARY sequential signal
             BI_WEIGHT = 16     # Bigram J2: secondary sequential signal
             SKIP_WEIGHT = 8    # Skip bigram: tertiary gap coherence
             DAM_WEIGHT_NUM = 3  # DAM: secondary discriminator (3/1 = 3x)
             DAM_WEIGHT_DEN = 1
-            SPIN_WEIGHT_NUM = 1  # Spin: gentle perturbation (1/3)
-            SPIN_WEIGHT_DEN = 3
+            SPIN_WEIGHT_NUM = 1  # Spin: now meaningful with v67 fixes (1/1)
+            SPIN_WEIGHT_DEN = 1  # v67: was 3, but Y band fix + Z weight increase makes spin stronger
             EP_WEIGHT = 1       # Episodic weight
             BIND_WEIGHT = 1     # Binding weight
             FREQ_WEIGHT = self._freq_penalty_weight  # Freq penalty
@@ -2011,10 +2011,10 @@ class AttractorLanguageModel:
                     pos_energy = self._compute_pos_energy(type_hist, candidate_types)
                     total_energies += pos_energy
 
-                # v66: Add three-band spin energy (LINEAR, with precision fix)
+                # v67: Add three-band spin energy (LINEAR, with precision fix)
                 # Spin fields are computed as overlap(spin_field, sdr(w)),
-                # NOT fed through log2_F. v66 fix: deferred integer division
-                # prevents cascading truncation to zero.
+                # NOT fed through log2_F. v67 fix: Y band uses m_z-weighted
+                # current state instead of dead AND; Z weight increased to 5x.
                 if hasattr(self, '_learned_weights') and self._learned_weights is not None:
                     spin_energies = self.hierarchy.compute_spin_word_energies(
                         candidate_arr, self.sdr_encoder,
@@ -2024,7 +2024,7 @@ class AttractorLanguageModel:
                 else:
                     spin_energies = self.hierarchy.compute_spin_word_energies(
                         candidate_arr, self.sdr_encoder,
-                        weight_num=1, weight_den=5
+                        weight_num=1, weight_den=1
                     )
                 total_energies += spin_energies
 
@@ -2220,7 +2220,7 @@ class AttractorLanguageModel:
         )
 
         print("\n" + "=" * 70)
-        print("ATTRACTOR LANGUAGE MACHINE v66 — DIAGNOSTICS")
+        print("ATTRACTOR LANGUAGE MACHINE v67 — DIAGNOSTICS")
         print("=" * 70)
 
         if self.sdr_encoder:
