@@ -1085,8 +1085,8 @@ class AttractorLanguageModel:
             self._p10_de = 5
             print(f"    No energy diffs — using default beta: {self.beta:.4f}")
 
-    def _calibrate_energy_weights(self, n_seqs: int = 500, n_epochs: int = 30,
-                                      lr: float = 0.01) -> None:
+    def _calibrate_energy_weights(self, n_seqs: int = 1000, n_epochs: int = 50,
+                                      lr: float = 0.005) -> None:
         """v66: Learn energy combination weights via gradient descent on cross-entropy.
 
         The energy function is: E(w) = Σ_k w_k * raw_e_k(w)
@@ -1102,14 +1102,15 @@ class AttractorLanguageModel:
         This is just the difference between the target word's energy
         component and the probability-weighted average over candidates.
 
-        Learning these weights replaces hand-tuning of "magic numbers"
-        like bigram_weight=16, skip_weight=5, trigram_weight=8, etc.
+        v67: Adam optimizer for stable convergence across different
+        energy scales (bigram ~256, spin ~4-230, DAM ~30-80).
+        Also: more sequences (1000), more epochs (50), spin diagnostics.
         """
         from ..vocabulary.pos import POS2IDX, N_POS
         from ..utils import primary_pos_tag
 
         V = len(self.vocab)
-        print(f"\n    v66: Learning energy weights via gradient descent...")
+        print(f"\n    v66: Learning energy weights via gradient descent (Adam)...")
         print(f"    ({n_seqs} sequences, {n_epochs} epochs, lr={lr})")
 
         # --- Define learnable weight names and initial values ---
@@ -1278,24 +1279,46 @@ class AttractorLanguageModel:
                     self.binding.add_word(self.sdr_encoder.word_active_bits[target_word])
 
                 collected += 1
-                if collected >= 2000:
+                if collected >= 5000:
                     break
 
-            if collected >= 2000:
+            if collected >= 5000:
                 break
 
         print(f"    Collected {collected} positions from {min(seq_idx+1, n_seqs)} sequences")
+
+        # --- Spin energy diagnostic ---
+        spin_nonzero = sum(1 for r in all_raw_components if np.any(r['spin'] != 0))
+        spin_min = min(np.min(r['spin']) for r in all_raw_components)
+        spin_max = max(np.max(r['spin']) for r in all_raw_components)
+        spin_abs_mean = np.mean([np.mean(np.abs(r['spin'])) for r in all_raw_components])
+        print(f"    Spin energy diagnostic: {spin_nonzero}/{collected} positions have non-zero spin")
+        print(f"      spin_raw range: [{spin_min:.1f}, {spin_max:.1f}], mean_abs={spin_abs_mean:.2f}")
+        if spin_nonzero == 0:
+            print(f"    WARNING: Spin energy is ALL ZERO — three-band state not accumulating!")
+            print(f"      This likely means step_all() is not being called, or m_z/m_x/m_y stay zero.")
 
         if collected < 50:
             print(f"    Too few positions for weight learning — keeping defaults")
             self._learned_weights = None
             return
 
-        # --- SGD over collected data ---
-        # Gradient: ∂L/∂w_k = raw_e_k[target] - Σ_w P(w) * raw_e_k(w)
+        # --- Adam optimizer over collected data ---
+        # Adam is much more stable than vanilla SGD when different energy
+        # components have very different scales (bigram ~256, spin ~4-230, DAM ~30-80).
+        # It automatically adapts learning rates per-parameter.
         best_loss = float('inf')
         best_w = dict(w)
         best_beta = learnable_beta
+
+        # Adam state
+        adam_m = {k: 0.0 for k in weight_names}  # first moment (momentum)
+        adam_v = {k: 0.0 for k in weight_names}  # second moment (adaptive lr)
+        adam_m_beta = 0.0
+        adam_v_beta = 0.0
+        beta1 = 0.9   # momentum decay
+        beta2 = 0.999  # adaptive lr decay
+        eps = 1e-8     # numerical stability
 
         for epoch in range(n_epochs):
             total_loss = 0.0
@@ -1303,7 +1326,7 @@ class AttractorLanguageModel:
             beta_grad = 0.0
             n_positions = 0
 
-            # Shuffle positions
+            # Shuffle positions for stochastic gradient estimation
             perm = np.random.permutation(collected)
 
             for idx in perm:
@@ -1330,9 +1353,6 @@ class AttractorLanguageModel:
 
                 # Gradient for each weight:
                 # ∂L/∂w_k = raw_e_k[target] - Σ_w P(w) * raw_e_k(w)
-                # But we need to account for β in the energy:
-                # E(w) = Σ_k w_k * raw_e_k(w), so ∂E/∂w_k = raw_e_k(w)
-                # ∂L/∂w_k = ∂(-log P(target))/∂w_k = raw_e_k[target] - Σ P(w)*raw_e_k(w)
                 for k in weight_names:
                     expected_e = np.sum(probs * raw[k])
                     grad_accum[k] += raw[k][target_idx] - expected_e
@@ -1356,10 +1376,21 @@ class AttractorLanguageModel:
                 best_w = dict(w)
                 best_beta = learnable_beta
 
-            # Update weights (projected gradient descent — keep positive)
+            # Adam update
+            t = epoch + 1  # 1-indexed for bias correction
             for k in weight_names:
-                w[k] = max(0.01, w[k] - lr * grad_accum[k])
-            learnable_beta = max(0.001, learnable_beta - lr * 0.1 * beta_grad)
+                adam_m[k] = beta1 * adam_m[k] + (1 - beta1) * grad_accum[k]
+                adam_v[k] = beta2 * adam_v[k] + (1 - beta2) * grad_accum[k] ** 2
+                m_hat = adam_m[k] / (1 - beta1 ** t)
+                v_hat = adam_v[k] / (1 - beta2 ** t)
+                w[k] = max(0.01, w[k] - lr * m_hat / (np.sqrt(v_hat) + eps))
+
+            # Adam update for beta
+            adam_m_beta = beta1 * adam_m_beta + (1 - beta1) * beta_grad
+            adam_v_beta = beta2 * adam_v_beta + (1 - beta2) * beta_grad ** 2
+            m_hat_b = adam_m_beta / (1 - beta1 ** t)
+            v_hat_b = adam_v_beta / (1 - beta2 ** t)
+            learnable_beta = max(0.001, learnable_beta - lr * 0.1 * m_hat_b / (np.sqrt(v_hat_b) + eps))
 
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 w_str = ", ".join(f"{k}={v:.2f}" for k, v in w.items())

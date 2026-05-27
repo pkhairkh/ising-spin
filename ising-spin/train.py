@@ -414,7 +414,7 @@ CONFIG: Attractor Language Machine v66 (LEARNED WEIGHTS + SPIN FIX)
     print("WEIGHT CALIBRATION (v66: learned magic numbers)")
     print(f"{'=' * 70}")
     try:
-        model._calibrate_energy_weights(n_seqs=500, n_epochs=30, lr=0.01)
+        model._calibrate_energy_weights(n_seqs=1000, n_epochs=50, lr=0.005)
     except Exception as e:
         print(f"  Weight calibration failed: {e}")
         traceback.print_exc()
