@@ -1,17 +1,23 @@
 """
-Base Language Model Interface for v76 EBM Re-ranker.
+Base Language Model Interface for v76h EBM Re-ranker.
 
-Provides a thin wrapper around a frozen pretrained LM (GPT-2 124M)
-that produces top-K candidates with log-probabilities.
+v76h KEY FIX: Proper BPE-to-word alignment for GPT-2.
 
-The base model is NEVER trained — only used for inference.
-The DAM discriminator re-ranks its outputs.
+The original BaseLMInterface passed word-level IDs directly to GPT-2,
+which interprets them as BPE tokens — producing semantic garbage.
+v76h adds `get_top_k_words()` which:
+  1. Converts word-level context to text → BPE tokens
+  2. Runs GPT-2 on proper BPE tokens
+  3. Scores every word in our vocabulary by its first BPE token's log-prob
+  4. Returns word-level candidates with correct log-probabilities
+
+This eliminates the <unk> problem and gives GPT-2 proper semantic context.
 
 Also provides DummyBaseLM for testing without torch/transformers.
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 
 class BaseLMInterface:
@@ -22,6 +28,7 @@ class BaseLMInterface:
       - Tokenization (uses the model's own tokenizer)
       - Top-K candidate generation with log-probabilities
       - Full sequence log-probability computation (for PPL)
+      - v76h: Word-level candidate generation via BPE alignment
 
     The base model is FROZEN — no gradient updates.
     Only used for inference (candidate generation).
@@ -51,6 +58,35 @@ class BaseLMInterface:
 
         self._torch = torch
 
+        # v76h: BPE-to-word alignment cache
+        # Maps word_id -> first BPE token ID for " word" encoding
+        self._word_bpe_cache: Dict[int, int] = {}
+        self._idx2word: Optional[dict] = None
+        self._word2idx: Optional[dict] = None
+
+    def build_word_alignment(self, idx2word: dict, word2idx: dict):
+        """
+        v76h: Build the BPE-to-word alignment cache.
+
+        For each word in our vocabulary, precompute the first BPE token
+        of " word" (with leading space). This is used in get_top_k_words()
+        to score vocabulary words against GPT-2's output distribution.
+
+        Must be called once before using get_top_k_words().
+        """
+        self._idx2word = idx2word
+        self._word2idx = word2idx
+        self._word_bpe_cache = {}
+
+        for word_id in range(4, len(idx2word)):
+            word = idx2word[word_id]
+            # Encode with leading space for proper word-initial BPE
+            bpe_ids = self.tokenizer.encode(" " + word)
+            if bpe_ids:
+                self._word_bpe_cache[word_id] = bpe_ids[0]
+
+        print(f"  BPE-word alignment: {len(self._word_bpe_cache)} words cached", flush=True)
+
     def _resolve_device(self, device: str) -> str:
         import torch
         if device == "auto":
@@ -73,6 +109,9 @@ class BaseLMInterface:
         """
         Get top-K candidate next tokens with log-probabilities.
 
+        NOTE: This returns BPE token IDs, not word-level IDs.
+        For word-level candidates, use get_top_k_words() instead.
+
         Args:
             input_ids: Token IDs for context.
             k: Number of top candidates.
@@ -91,6 +130,75 @@ class BaseLMInterface:
             candidates = top_k.indices.cpu().numpy()
             log_probs_k = top_k.values.cpu().numpy().astype(np.float64)
         return candidates, log_probs_k
+
+    def get_top_k_words(
+        self,
+        word_ids: List[int],
+        k: int = 50,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        v76h: Get top-K WORD-LEVEL candidates with log-probabilities.
+
+        This properly converts word-level context to BPE tokens, runs
+        GPT-2, and scores each vocabulary word by its first BPE token's
+        probability. Returns word-level IDs (4 to V-1).
+
+        This fixes the <unk> problem: all returned candidates are valid
+        word-level IDs that map to real vocabulary words.
+
+        Args:
+            word_ids: Context as word-level IDs.
+            k: Number of top candidates.
+
+        Returns:
+            (candidates, log_probs) — word-level IDs and their log-probs.
+        """
+        torch = self._torch
+
+        # Convert word IDs to text, then to BPE tokens
+        if self._idx2word is None:
+            # Fallback: pass raw IDs (broken but won't crash)
+            return self.get_top_k(word_ids, k=k)
+
+        words = [self._idx2word.get(wid, "") for wid in word_ids]
+        text = " ".join(w for w in words if w)
+        if not text.strip():
+            # Empty context — return most frequent words
+            V = len(self._idx2word)
+            top_ids = np.arange(4, min(4 + k, V))
+            return top_ids, np.full(len(top_ids), -7.0)
+
+        bpe_ids = self.tokenizer.encode(text)
+
+        # Run GPT-2 on proper BPE context
+        with torch.no_grad():
+            ids_tensor = torch.tensor([bpe_ids], device=self.device)
+            outputs = self.model(ids_tensor)
+            logits = outputs.logits[0, -1, :]
+            log_probs_all = torch.log_softmax(logits, dim=-1)
+            log_probs_np = log_probs_all.cpu().numpy().astype(np.float64)
+
+        # Score each vocabulary word using cached BPE mapping
+        V = len(self._idx2word)
+        word_scores = np.full(V, -100.0)
+
+        for word_id, bpe_id in self._word_bpe_cache.items():
+            if bpe_id < len(log_probs_np):
+                word_scores[word_id] = log_probs_np[bpe_id]
+
+        # Get top-K word-level candidates
+        valid_mask = word_scores > -100
+        if not np.any(valid_mask):
+            # Fallback: return first k words
+            top_ids = np.arange(4, min(4 + k, V))
+            return top_ids, np.full(len(top_ids), -7.0)
+
+        valid_scores = word_scores[4:V]
+        top_k_offset = np.argsort(valid_scores)[-k:][::-1]
+        top_k_ids = top_k_offset + 4
+        top_k_scores = word_scores[top_k_ids]
+
+        return top_k_ids, top_k_scores
 
     def compute_sequence_log_prob(self, input_ids: List[int]) -> float:
         """
@@ -117,6 +225,27 @@ class BaseLMInterface:
                 2, shift_labels.unsqueeze(-1)
             ).squeeze(-1)
             return token_log_probs.sum().item()
+
+    def compute_word_sequence_log_prob(
+        self,
+        word_ids: List[int],
+    ) -> float:
+        """
+        v76h: Compute log-probability of a word-level sequence.
+
+        Converts word IDs to text → BPE tokens, then computes
+        the full sequence log-probability under GPT-2.
+        """
+        if self._idx2word is None:
+            return self.compute_sequence_log_prob(word_ids)
+
+        words = [self._idx2word.get(wid, "") for wid in word_ids]
+        text = " ".join(w for w in words if w)
+        if not text.strip():
+            return -100.0
+
+        bpe_ids = self.tokenizer.encode(text)
+        return self.compute_sequence_log_prob(bpe_ids)
 
     def align_token_to_vocab(
         self,
@@ -152,7 +281,7 @@ class DummyBaseLM:
     """
     Dummy base model for testing without torch/transformers.
 
-    Uses simple unigram frequency to generate candidates.
+    Uses simple unigram + bigram frequency to generate candidates.
     Not a real language model — just for pipeline testing.
     """
 
@@ -190,6 +319,10 @@ class DummyBaseLM:
             for i in range(1, len(seq)):
                 self._bigram_counts[seq[i-1], seq[i]] += 1
 
+    def build_word_alignment(self, idx2word: dict, word2idx: dict):
+        """v76h: Dummy — no BPE alignment needed."""
+        pass
+
     def get_top_k(
         self,
         input_ids: List[int],
@@ -224,6 +357,14 @@ class DummyBaseLM:
 
         return top_k_indices, log_probs
 
+    def get_top_k_words(
+        self,
+        word_ids: List[int],
+        k: int = 50,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """v76h: Dummy — delegates to get_top_k (already word-level)."""
+        return self.get_top_k(word_ids, k=k)
+
     def compute_sequence_log_prob(self, input_ids: List[int]) -> float:
         """Compute approximate sequence log-probability."""
         total = 0.0
@@ -235,6 +376,10 @@ class DummyBaseLM:
             else:
                 total += np.log(1e-10)
         return total
+
+    def compute_word_sequence_log_prob(self, word_ids: List[int]) -> float:
+        """v76h: Dummy — same as compute_sequence_log_prob."""
+        return self.compute_sequence_log_prob(word_ids)
 
     def align_token_to_vocab(
         self,

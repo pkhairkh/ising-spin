@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Integer EBM Re-ranker v76g — Training Script
+Integer EBM Re-ranker v76h — Training Script
 
-v76g ARCHITECTURAL FIXES:
-  1. Z-score energy normalization: DAM energies are normalized to match
-     base model log-prob scale, eliminating the bit-shift hack.
-  2. Bigram energy table: Explicit word-order model replaces the DAM's
-     failed attempt to learn word swaps via NCE.
-  3. No word_swap in NCE: Removed the impossible corruption type that
-     was wasting J-matrix capacity.
+v76h ARCHITECTURAL FIXES:
+  1. Proper BPE-to-word alignment: GPT-2 candidates are now word-level
+     (eliminates <unk> tokens, gives GPT-2 proper context)
+  2. Bigram energy scale fix: Bigram is z-score normalized independently
+     (was dominating DAM energy 7700 vs 84 std)
+  3. Repetition penalty: Prevents loops ("they in they in...")
+  4. J_max increased: 32000 → 64000 (was saturating)
+  5. SDR sparsity increased: 0.02 → 0.04 (k=10 → k=20, better position encoding)
 
 Pipeline:
   1. Load base model (GPT-2 or DummyBaseLM)
   2. Load corpus, build vocabulary, tokenize
-  3. Build SDR encoder
-  4. Build DAM discriminator (NCE-trained, 3 corruption types only)
-  5. Build bigram log-prob table
-  6. NCE training: Hebbian with contrastive signal
-  7. Calibrate re-ranking (z-score normalization + alpha/beta search)
-  8. Evaluate: discriminative accuracy, PPL, generation
+  3. Build SDR encoder (k=20 for v76h)
+  4. Build BPE-to-word alignment cache (v76h new step)
+  5. Build DAM discriminator (NCE-trained, 3 corruption types only)
+  6. Build bigram log-prob table
+  7. NCE training: Hebbian with contrastive signal
+  8. Calibrate re-ranking (z-score normalization + alpha/gamma/beta search)
+  9. Evaluate: discriminative accuracy, PPL, generation
 
 Usage:
   python -u train.py --samples 5000 --vocab 1000 --no-base-model --nce-epochs 1
@@ -55,7 +57,7 @@ DEFAULT_SAMPLES = 50000
 DEFAULT_VOCAB = 2000
 DEFAULT_DATASET = "tinystories"
 DEFAULT_SDR_DIM = 512
-DEFAULT_SDR_SPARSITY = 0.02
+DEFAULT_SDR_SPARSITY = 0.04  # v76h: increased from 0.02 (k=10→20)
 
 # Cache directory
 CACHE_DIR = Path(__file__).parent
@@ -203,7 +205,7 @@ def build_pos_types(vocab_words, word_freq):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Integer EBM Re-ranker v76g — Z-score Normalization + Bigram Energy"
+        description="Integer EBM Re-ranker v76h — BPE Alignment + Bigram Fix + Rep Penalty"
     )
 
     # Core parameters
@@ -219,15 +221,18 @@ def main():
     # Re-ranking
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--sdr-dim", type=int, default=DEFAULT_SDR_DIM)
-    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY)
+    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY,
+                        help="v76h: 0.04 default (k=20), was 0.02 (k=10)")
     parser.add_argument("--dam-scale", type=int, default=1600)
-    parser.add_argument("--j-clip", type=int, default=32000)
+    parser.add_argument("--j-clip", type=int, default=64000,
+                        help="v76h: increased from 32000 (was saturating)")
     parser.add_argument("--log-prob-scale", type=int, default=100)
     parser.add_argument("--dam-alpha", type=float, default=1.0,
                         help="v76g: Mixing weight for z-score normalized DAM energy. "
                              "0=pure base model, 1=equal DAM+base, >1=DAM dominates")
-    parser.add_argument("--bigram-weight", type=int, default=10,
-                        help="v76g: Weight for bigram log-prob energy (replaces word_swap NCE)")
+    parser.add_argument("--gamma", type=float, default=0.5,
+                        help="v76h: Mixing weight for z-score normalized bigram energy. "
+                             "0=no bigram, 1=equal bigram+base, >1=bigram dominates")
 
     # NCE
     parser.add_argument("--nce-eta", type=int, default=10,
@@ -242,6 +247,12 @@ def main():
     parser.add_argument("--episodic-weight", type=int, default=2)
     parser.add_argument("--bind-weight", type=int, default=5)
     parser.add_argument("--max-episodes", type=int, default=10000)
+
+    # v76h: Repetition penalty
+    parser.add_argument("--rep-penalty", type=float, default=50.0,
+                        help="v76h: Energy penalty for repeated words (0=disabled)")
+    parser.add_argument("--rep-window", type=int, default=5,
+                        help="v76h: How many recent words to check for repetition")
 
     # Generation
     parser.add_argument("--rerank-beta", type=float, default=0.01)
@@ -263,26 +274,28 @@ def main():
     use_dummy = args.no_base_model or args.base_model == "dummy"
 
     print("=" * 70, flush=True)
-    print("INTEGER EBM RE-RANKER v76g — Z-score Normalization + Bigram Energy", flush=True)
+    print("INTEGER EBM RE-RANKER v76h — BPE Alignment + Bigram Fix + Rep Penalty", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
-    print(f"Key changes from v76e/f:", flush=True)
-    print(f"  1. Z-score energy normalization (replaces bit-shift hack)", flush=True)
-    print(f"  2. Bigram energy table (replaces word_swap NCE)", flush=True)
-    print(f"  3. Only 3 NCE corruption types (no word_swap)", flush=True)
+    print(f"Key changes from v76g:", flush=True)
+    print(f"  1. Proper BPE-to-word alignment (eliminates <unk>, fixes GPT-2 context)", flush=True)
+    print(f"  2. Bigram energy z-score normalized independently (fixes scale mismatch)", flush=True)
+    print(f"  3. Repetition penalty (prevents 'they in they in...' loops)", flush=True)
+    print(f"  4. J-clip increased: 32000 → {args.j_clip}", flush=True)
+    print(f"  5. SDR sparsity: 0.02 → {args.sdr_sparsity} (k={int(args.sdr_dim * args.sdr_sparsity)})", flush=True)
     rss = get_rss_mb()
     if rss > 0:
         print(f"Memory (RSS): {rss:,} MB", flush=True)
     print("=" * 70, flush=True)
 
     # --- [1] Load Data ---
-    print("\n[1/7] Loading data...", flush=True)
+    print("\n[1/8] Loading data...", flush=True)
     texts = load_data(args.samples, dataset_name=args.dataset)
     n_texts = len(texts)
     print(f"  Using {n_texts:,} texts for training", flush=True)
 
     # --- [2] Build Vocabulary ---
-    print("\n[2/7] Building vocabulary...", flush=True)
+    print("\n[2/8] Building vocabulary...", flush=True)
     vocab_words, word2idx, idx2word, word_freq = build_vocabulary(
         texts, max_vocab=args.vocab, min_freq=args.vocab_min_freq
     )
@@ -290,7 +303,7 @@ def main():
     print(f"  Vocabulary: {V} words", flush=True)
 
     # --- [3] Tokenize ---
-    print("\n[3/7] Tokenizing...", flush=True)
+    print("\n[3/8] Tokenizing...", flush=True)
     sequences = tokenize_texts(texts, word2idx, max_seq_len=args.max_seq_len)
     # Split train/test
     n_train = int(0.9 * len(sequences))
@@ -299,12 +312,12 @@ def main():
     print(f"  Train: {len(train_seqs):,}, Test: {len(test_seqs):,}", flush=True)
 
     # --- [4] Build POS types ---
-    print("\n[4/7] Building POS type system...", flush=True)
+    print("\n[4/8] Building POS type system...", flush=True)
     pos_types = build_pos_types(vocab_words, word_freq)
     print(f"  POS system: {len(set(pos_types))} types, {V} words typed", flush=True)
 
     # --- [5] Build SDR Encoder ---
-    print("\n[5/7] Building SDR encoder...", flush=True)
+    print("\n[5/8] Building SDR encoder...", flush=True)
     from ising_spin.attractor.sdr import SDREncoder
     sdr_encoder = SDREncoder(
         vocab_size=V,
@@ -316,7 +329,7 @@ def main():
     print(f"  SDR: D={args.sdr_dim}, k={k} ({args.sdr_sparsity*100:.1f}% sparse)", flush=True)
 
     # --- [6] Build Base Model ---
-    print("\n[6/7] Building base model...", flush=True)
+    print("\n[6/8] Building base model...", flush=True)
     base_model = None
     if use_dummy:
         from ising_spin.attractor.base_model import DummyBaseLM
@@ -326,12 +339,15 @@ def main():
             seed=42,
         )
         base_model.build_bigrams(train_seqs)
+        base_model.build_word_alignment(idx2word, word2idx)
         print(f"  DummyBaseLM: {V} words, bigrams built", flush=True)
     else:
         try:
             from ising_spin.attractor.base_model import BaseLMInterface
             base_model = BaseLMInterface(model_name=args.base_model)
-            print(f"  Base model: {args.base_model} loaded", flush=True)
+            # v76h: Build BPE-to-word alignment cache
+            base_model.build_word_alignment(idx2word, word2idx)
+            print(f"  Base model: {args.base_model} loaded (word-level candidates enabled)", flush=True)
         except (ImportError, Exception) as e:
             print(f"  Cannot load GPT-2: {e}", flush=True)
             print(f"  Falling back to DummyBaseLM", flush=True)
@@ -342,10 +358,11 @@ def main():
                 seed=42,
             )
             base_model.build_bigrams(train_seqs)
+            base_model.build_word_alignment(idx2word, word2idx)
             use_dummy = True
 
     # --- [7] Build ReRankerEngine and Train ---
-    print("\n[7/7] Building ReRankerEngine and training...", flush=True)
+    print("\n[7/8] Building ReRankerEngine and training...", flush=True)
     from ising_spin.attractor.reranker_engine import ReRankerEngine
 
     engine = ReRankerEngine(
@@ -365,12 +382,14 @@ def main():
         nce_epochs=args.nce_epochs,
         context_window=args.context_window,
         dam_alpha=args.dam_alpha,
+        gamma=args.gamma,
         top_k=args.top_k,
         log_prob_scale=args.log_prob_scale,
         spin_weight=args.spin_weight,
         episodic_weight=args.episodic_weight,
         bind_weight=args.bind_weight,
-        bigram_weight=args.bigram_weight,
+        rep_penalty=args.rep_penalty,
+        rep_window=args.rep_window,
         max_episodes=args.max_episodes,
         seed=42,
     )
@@ -451,11 +470,30 @@ def main():
             # Also generate WITHOUT re-ranking for comparison
             base_ids = list(prompt_ids)
             for step in range(args.gen_length):
-                candidates, log_probs = base_model.get_top_k(
-                    base_ids, k=min(args.top_k, V)
-                )
+                # Use word-level candidates for fair comparison
+                if hasattr(base_model, 'get_top_k_words') and not isinstance(base_model, type(base_model)):
+                    try:
+                        candidates, log_probs = base_model.get_top_k_words(
+                            base_ids, k=min(args.top_k, V)
+                        )
+                    except Exception:
+                        candidates, log_probs = base_model.get_top_k(
+                            base_ids, k=min(args.top_k, V)
+                        )
+                else:
+                    candidates, log_probs = base_model.get_top_k(
+                        base_ids, k=min(args.top_k, V)
+                    )
+
+                # Filter to valid word IDs
+                valid = (candidates >= 4) & (candidates < V)
+                if not np.any(valid):
+                    break
+                candidates = candidates[valid]
+                log_probs = log_probs[valid]
                 best = int(np.argmax(log_probs))
                 base_ids.append(int(candidates[best]))
+
             base_text = " ".join(idx2word.get(wid, "<unk>") for wid in base_ids)
             print(f"\n  --- Base model only (no re-ranking) ---", flush=True)
             print(f"  {base_text[:300]}", flush=True)
@@ -476,19 +514,24 @@ def main():
           f"DAM_std={engine._dam_energy_std:.1f}", flush=True)
     print(f"  Base: base_mean={engine._base_energy_mean:.1f}, "
           f"base_std={engine._base_energy_std:.1f}", flush=True)
-    print(f"  Alpha={engine.dam_alpha:.1f}, Beta={engine.rerank_beta}", flush=True)
+    print(f"  Bigram: bigram_mean={engine._bigram_energy_mean:.3f}, "
+          f"bigram_std={engine._bigram_energy_std:.3f}", flush=True)
+    print(f"  Alpha={engine.dam_alpha:.1f}, Gamma={engine.gamma:.1f}, "
+          f"Beta={engine.rerank_beta}", flush=True)
     print(f"  Bigram: {'built' if engine._bigram_logprob is not None else 'none'}", flush=True)
+    print(f"  Rep penalty: {engine.rep_penalty}, window={engine.rep_window}", flush=True)
     print(f"  Spin: z_active={int(np.sum(engine.three_band.m_z > 0))}, "
           f"x_active={int(np.sum(engine.three_band.m_x > 0))}, "
           f"y_active={int(np.sum(engine.three_band.m_y > 0))}", flush=True)
     print(f"  Episodic: {len(engine.episodic.episodes)} episodes", flush=True)
     print(f"  Binding: {len(engine.binding._recent_words)} recent words", flush=True)
+    print(f"  Word-level candidates: {engine._use_word_candidates}", flush=True)
 
     # --- Save Results ---
     t_total = time.time() - t_start
     results = {
-        "version": "76g.0.0",
-        "architecture": "Integer EBM Re-ranker v76g (z-score normalization + bigram energy)",
+        "version": "76h.0.0",
+        "architecture": "Integer EBM Re-ranker v76h (BPE alignment + bigram fix + rep penalty)",
         "timestamp": timestamp,
         "config": vars(args),
         "results": {
@@ -502,11 +545,14 @@ def main():
             "J_max": int(np.max(np.abs(engine.dam.J))),
             "base_model": "dummy" if use_dummy else args.base_model,
             "dam_alpha": engine.dam_alpha,
+            "gamma": engine.gamma,
             "rerank_beta": engine.rerank_beta,
             "dam_energy_mean": engine._dam_energy_mean,
             "dam_energy_std": engine._dam_energy_std,
             "base_energy_mean": engine._base_energy_mean,
             "base_energy_std": engine._base_energy_std,
+            "bigram_energy_mean": engine._bigram_energy_mean,
+            "bigram_energy_std": engine._bigram_energy_std,
         },
     }
 
@@ -521,12 +567,12 @@ def main():
     print(f"  Saved: {root_results}")
 
     print(f"\n{'=' * 70}", flush=True)
-    print(f"DONE — Integer EBM Re-ranker v76g")
+    print(f"DONE — Integer EBM Re-ranker v76h")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"Discriminative accuracy: {disc_acc.get('overall_accuracy', 0.0):.3f}")
     print(f"Base PPL: {ppl_stats.get('base_ppl', float('inf')):.2f}")
     print(f"Re-ranked PPL: {ppl_stats.get('reranked_ppl', float('inf')):.2f}")
-    print(f"Alpha: {engine.dam_alpha:.1f}, Beta: {engine.rerank_beta}")
+    print(f"Alpha: {engine.dam_alpha:.1f}, Gamma: {engine.gamma:.1f}, Beta: {engine.rerank_beta}")
     print(f"Results: {output_dir}")
     print(f"{'=' * 70}", flush=True)
 

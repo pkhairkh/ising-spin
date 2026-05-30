@@ -1,36 +1,41 @@
 """
-Integer EBM Re-ranker Engine v76g.
+Integer EBM Re-ranker Engine v76h.
 
-ARCHITECTURAL FIXES from v76e/f:
+ARCHITECTURAL FIXES from v76g:
 
-  FLAW 1 FIXED: Energy-logprob scale mismatch.
-  v76e used dam_energies >> dam_weight_shift (a fixed bit-shift) to scale
-  DAM energies to match base model log-probs. But the DAM energy range
-  drifts during training, making any fixed shift wrong by the time
-  calibration runs. v76g uses Z-SCORE NORMALIZATION: (E - mean) / std,
-  then rescale to match base energy std. This makes the mixing weight
-  alpha meaningful and stable across training runs.
+  FLAW 1 FIXED: GPT-2 BPE-to-word misalignment.
+  v76g passed word-level IDs directly to GPT-2, which interprets them
+  as BPE tokens — producing semantic garbage. v76h uses the new
+  get_top_k_words() method that converts context to text → BPE tokens,
+  runs GPT-2 properly, and returns word-level candidates. This:
+    - Eliminates <unk> tokens in generation
+    - Gives GPT-2 proper semantic context for candidate generation
+    - Makes base model log-probs actually meaningful
 
-  FLAW 2 FIXED: Word swap undetectability.
-  The Ising DAM with SDR encoding CANNOT detect word swaps (accuracy
-  stuck at 0.411 < chance). v76g removes word_swap from NCE training
-  entirely (it was wasting capacity on an impossible task) and adds
-  an explicit BIGRAM ENERGY TABLE that directly encodes word-pair
-  ordering statistics. This handles word order the way the DAM can't.
+  FLAW 2 FIXED: Bigram energy scale mismatch.
+  v76g scaled bigram energy by log_prob_scale * bigram_weight = 100*10 = 1000x,
+  giving bigram values ~7700 that DOMINATED the z-score normalized DAM energy
+  (~84 std). v76h:
+    - Separates bigram from DAM-side energy (it's log-prob based, same scale
+      as base_energies, not DAM energy)
+    - Z-score normalizes bigram energy independently
+    - Uses gamma parameter to mix bigram with base model
+    - combined = base_energies + alpha * dam_side + gamma * bigram_scaled
 
-  FLAW 3 FIXED: Re-ranking calibration instability.
-  v76e calibrated by grid-searching dam_weight_shift AND beta, but
-  with broken energy scales the grid search was optimizing noise.
-  v76g calibration only searches alpha (mixing weight) and beta, with
-  energies already properly normalized. Fewer parameters, more stable.
+  FLAW 3 FIXED: No repetition penalty.
+  v76g had no mechanism to prevent repetition loops ("they in they in...").
+  v76h adds a repetition penalty that increases the energy of candidates
+  that appear in the recent N generated words.
 
 Pipeline:
-  1. Base model generates top-K candidates + log-probabilities
+  1. Base model generates top-K WORD-LEVEL candidates + log-probabilities
   2. Spin state tracker updates from context (Z/X/Y bands)
-  3. DAM discriminator scores each candidate: E = E_DAM + E_spin + E_episodic + E_bind + E_bigram
+  3. DAM discriminator scores each candidate: E = E_DAM + E_spin + E_episodic + E_bind
   4. Z-score normalize DAM-side energy, rescale to base model range
-  5. Combined energy = base_log_prob * LOG_PROB_SCALE + alpha * DAM_side_normalized
-  6. Integer Boltzmann sampling from combined distribution
+  5. Z-score normalize bigram energy independently
+  6. Add repetition penalty for recent words
+  7. Combined = base_energies + alpha * dam_side + gamma * bigram_scaled + rep_penalty
+  8. Integer Boltzmann sampling from combined distribution
 
 Training:
   NCE (Noise Contrastive Estimation) with 3 corruption types:
@@ -61,11 +66,12 @@ LOG_PROB_SCALE_DEFAULT = 100
 
 class ReRankerEngine:
     """
-    Integer EBM Re-ranker v76g.
+    Integer EBM Re-ranker v76h.
 
     The DAM discriminates between correct and incorrect next-word
     candidates produced by a pretrained base model. DAM energies
     are z-score normalized before combining with base model log-probs.
+    Bigram energies are z-score normalized independently.
     """
 
     def __init__(
@@ -79,7 +85,7 @@ class ReRankerEngine:
         word_freq: Optional[np.ndarray] = None,
         # DAM parameters
         dam_scale: int = 1600,
-        j_clip: int = 32000,
+        j_clip: int = 64000,  # v76h: increased from 32000
         f_type: int = DAMLayer.F_EXP_APPROX,
         exp_temperature: int = 100,
         # NCE parameters
@@ -91,10 +97,13 @@ class ReRankerEngine:
         top_k: int = 50,
         log_prob_scale: int = LOG_PROB_SCALE_DEFAULT,
         dam_alpha: float = 1.0,  # v76g: mixing weight for normalized DAM energy
+        gamma: float = 0.5,  # v76h: mixing weight for bigram energy
         spin_weight: int = 5,
         episodic_weight: int = 2,
         bind_weight: int = 5,
-        bigram_weight: int = 10,  # v76g: weight for bigram energy
+        # Repetition penalty
+        rep_penalty: float = 50.0,  # v76h: energy penalty for repeated words
+        rep_window: int = 5,  # v76h: how many recent words to penalize
         # UV regularization
         uv_regularize: bool = True,
         uv_lambda: int = 10,
@@ -155,15 +164,19 @@ class ReRankerEngine:
         self.top_k = top_k
         self.log_prob_scale = log_prob_scale
         self.dam_alpha = dam_alpha
+        self.gamma = gamma  # v76h: bigram mixing weight
         self.spin_weight = spin_weight
         self.episodic_weight = episodic_weight
         self.bind_weight = bind_weight
-        self.bigram_weight = bigram_weight
         self.dam_scale = dam_scale
         self.nce_epochs = nce_epochs
         self.nce_negatives = nce_negatives
         self.context_window = context_window
         self.seed = seed
+
+        # v76h: Repetition penalty parameters
+        self.rep_penalty = rep_penalty
+        self.rep_window = rep_window
 
         # v76g: Bigram log-prob table for word order
         self._bigram_logprob: Optional[np.ndarray] = None  # (V, V) float64
@@ -174,9 +187,16 @@ class ReRankerEngine:
         self._base_energy_mean: float = 0.0
         self._base_energy_std: float = 1.0
 
+        # v76h: Bigram energy normalization statistics
+        self._bigram_energy_mean: float = 0.0
+        self._bigram_energy_std: float = 1.0
+
         # Boltzmann sampler (will be calibrated after training)
         self.sampler = IntegerBoltzmannSampler(beta=0.01, max_delta=50000)
         self.rerank_beta = 0.01
+
+        # v76h: Use word-level candidates (fixes <unk> problem)
+        self._use_word_candidates = not isinstance(base_model, DummyBaseLM)
 
         # Diagnostics
         self._training_log = []
@@ -326,22 +346,26 @@ class ReRankerEngine:
 
     def _calibrate_reranking(self, sequences: List[List[int]]):
         """
-        v76g: Calibrate re-ranking with z-score normalized energies.
+        v76h: Calibrate re-ranking with z-score normalized energies.
 
-        Two-step calibration:
+        Three-step calibration:
         1. Compute energy statistics for z-score normalization
-        2. Grid search over alpha (DAM mixing weight) and beta (Boltzmann temp)
+           (DAM energy, base energy, AND bigram energy)
+        2. Grid search over alpha (DAM mixing weight), gamma (bigram weight),
+           and beta (Boltzmann temp)
 
-        With z-score normalization, alpha is on a meaningful scale:
-          alpha=0 → pure base model (no DAM influence)
+        With z-score normalization, alpha and gamma are on meaningful scales:
+          alpha=0 → no DAM influence
           alpha=1 → DAM influence equal to base model std
-          alpha>1 → DAM dominates
+          gamma=0 → no bigram influence
+          gamma=1 → bigram influence equal to base model std
         """
         print("    Calibrating re-ranking (z-score normalization)...")
 
         # Step 1: Collect energy samples for normalization statistics
         dam_energy_samples = []
         base_energy_samples = []
+        bigram_energy_samples = []
 
         for seq in sequences[:300]:
             if len(seq) < 3:
@@ -349,9 +373,16 @@ class ReRankerEngine:
             for pos in range(1, min(len(seq), 5)):
                 ctx = seq[:pos]
                 target = seq[pos]
-                candidates, log_probs = self.base_model.get_top_k(
-                    ctx, k=min(self.top_k, self.V)
-                )
+
+                # Get candidates — use word-level if available
+                if self._use_word_candidates and hasattr(self.base_model, 'get_top_k_words'):
+                    candidates, log_probs = self.base_model.get_top_k_words(
+                        ctx, k=min(self.top_k, self.V)
+                    )
+                else:
+                    candidates, log_probs = self.base_model.get_top_k(
+                        ctx, k=min(self.top_k, self.V)
+                    )
 
                 # Compute DAM energy for target
                 ctx_sdr = self.sdr_encoder.encode_context_positional(
@@ -368,13 +399,26 @@ class ReRankerEngine:
                 base_e = -(log_probs * self.log_prob_scale).astype(np.int64)
                 base_energy_samples.extend(base_e.tolist())
 
+                # Compute bigram energy samples
+                if len(ctx) > 0:
+                    prev_word = ctx[-1]
+                    if 0 <= prev_word < self.V and self._bigram_logprob is not None:
+                        for cand_id in candidates[:10]:  # Sample 10 candidates
+                            if 0 <= cand_id < self.V:
+                                lp = self._bigram_logprob[prev_word, cand_id]
+                                bigram_e = -lp  # v76h: raw negative log-prob (no scale)
+                                bigram_energy_samples.append(bigram_e)
+
         if not dam_energy_samples:
             self._dam_energy_mean = 0.0
             self._dam_energy_std = 1.0
             self._base_energy_mean = 0.0
             self._base_energy_std = 1.0
+            self._bigram_energy_mean = 0.0
+            self._bigram_energy_std = 1.0
             self.rerank_beta = 0.01
-            print(f"    Using defaults: alpha={self.dam_alpha}, beta={self.rerank_beta}")
+            print(f"    Using defaults: alpha={self.dam_alpha}, "
+                  f"gamma={self.gamma}, beta={self.rerank_beta}")
             return
 
         # Compute normalization statistics
@@ -383,12 +427,22 @@ class ReRankerEngine:
         self._base_energy_mean = float(np.mean(base_energy_samples))
         self._base_energy_std = max(1.0, float(np.std(base_energy_samples)))
 
+        # v76h: Bigram normalization stats
+        if bigram_energy_samples:
+            self._bigram_energy_mean = float(np.mean(bigram_energy_samples))
+            self._bigram_energy_std = max(0.1, float(np.std(bigram_energy_samples)))
+        else:
+            self._bigram_energy_mean = 7.7  # Typical -log P for bigrams
+            self._bigram_energy_std = 2.0
+
         print(f"    Energy stats: DAM mean={self._dam_energy_mean:.1f} "
               f"std={self._dam_energy_std:.1f}, "
               f"Base mean={self._base_energy_mean:.1f} "
               f"std={self._base_energy_std:.1f}")
+        print(f"    Bigram stats: mean={self._bigram_energy_mean:.3f} "
+              f"std={self._bigram_energy_std:.3f}")
 
-        # Step 2: Grid search over alpha and beta
+        # Step 2: Grid search over alpha, gamma, and beta
         test_pairs = []
         for seq in sequences[:200]:
             if len(seq) < 3:
@@ -404,9 +458,15 @@ class ReRankerEngine:
         # Precompute re-ranking data
         rerank_data = []
         for ctx, target in test_pairs[:300]:
-            candidates, log_probs = self.base_model.get_top_k(
-                ctx, k=min(self.top_k, self.V)
-            )
+            if self._use_word_candidates and hasattr(self.base_model, 'get_top_k_words'):
+                candidates, log_probs = self.base_model.get_top_k_words(
+                    ctx, k=min(self.top_k, self.V)
+                )
+            else:
+                candidates, log_probs = self.base_model.get_top_k(
+                    ctx, k=min(self.top_k, self.V)
+                )
+
             if target not in candidates:
                 continue
             target_idx = int(np.where(candidates == target)[0][0])
@@ -418,48 +478,55 @@ class ReRankerEngine:
             return
 
         best_alpha = self.dam_alpha
+        best_gamma = self.gamma
         best_beta = 0.01
         best_acc = 0.0
 
         for alpha in [0.0, 0.5, 1.0, 2.0, 3.0, 5.0]:
-            for beta in [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]:
-                correct = 0
-                total = 0
-                for ctx, candidates, log_probs, target_idx in rerank_data:
-                    # Temporarily override alpha
-                    orig_alpha = self.dam_alpha
-                    self.dam_alpha = alpha
-                    combined_energies, _ = self.rerank(ctx, candidates, log_probs)
-                    self.dam_alpha = orig_alpha
+            for gamma in [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]:
+                for beta in [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]:
+                    correct = 0
+                    total = 0
+                    for ctx, candidates, log_probs, target_idx in rerank_data:
+                        # Temporarily override alpha and gamma
+                        orig_alpha = self.dam_alpha
+                        orig_gamma = self.gamma
+                        self.dam_alpha = alpha
+                        self.gamma = gamma
+                        combined_energies, _ = self.rerank(ctx, candidates, log_probs)
+                        self.dam_alpha = orig_alpha
+                        self.gamma = orig_gamma
 
-                    if len(combined_energies) == 0:
-                        continue
+                        if len(combined_energies) == 0:
+                            continue
 
-                    # Boltzmann-weighted selection
-                    E_min = np.min(combined_energies)
-                    deltas = (combined_energies - E_min).astype(np.float64)
-                    deltas = np.clip(deltas, 0, 700)
-                    weights = np.exp(-deltas * beta)
-                    total_weight = np.sum(weights)
-                    if total_weight <= 0:
-                        continue
+                        # Boltzmann-weighted selection
+                        E_min = np.min(combined_energies)
+                        deltas = (combined_energies - E_min).astype(np.float64)
+                        deltas = np.clip(deltas, 0, 700)
+                        weights = np.exp(-deltas * beta)
+                        total_weight = np.sum(weights)
+                        if total_weight <= 0:
+                            continue
 
-                    chosen_idx = int(np.argmax(weights))
-                    if chosen_idx == target_idx:
-                        correct += 1
-                    total += 1
+                        chosen_idx = int(np.argmax(weights))
+                        if chosen_idx == target_idx:
+                            correct += 1
+                        total += 1
 
-                acc = correct / max(1, total)
-                if acc > best_acc:
-                    best_acc = acc
-                    best_alpha = alpha
-                    best_beta = beta
+                    acc = correct / max(1, total)
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_alpha = alpha
+                        best_gamma = gamma
+                        best_beta = beta
 
         self.dam_alpha = best_alpha
+        self.gamma = best_gamma
         self.rerank_beta = best_beta
         self.sampler = IntegerBoltzmannSampler(beta=best_beta, max_delta=50000)
-        print(f"    Calibrated: alpha={best_alpha:.1f}, beta={best_beta}, "
-              f"rerank_acc={best_acc:.3f} ({len(rerank_data)} pairs)")
+        print(f"    Calibrated: alpha={best_alpha:.1f}, gamma={best_gamma:.1f}, "
+              f"beta={best_beta}, rerank_acc={best_acc:.3f} ({len(rerank_data)} pairs)")
 
     def _compute_bigram_energy(
         self,
@@ -467,16 +534,17 @@ class ReRankerEngine:
         candidates: np.ndarray,
     ) -> np.ndarray:
         """
-        v76g: Compute bigram log-probability energy for each candidate.
+        v76h: Compute bigram log-probability energy for each candidate.
 
         The bigram energy is the negative log P(candidate | prev_word).
         Lower energy = more likely bigram = better word order.
 
-        This directly handles word order, which the DAM cannot learn
-        via NCE (word_swap accuracy was stuck below chance).
+        v76h CHANGE: Energy is in natural log units (NOT scaled by
+        log_prob_scale). It gets z-score normalized independently
+        before combining with base_energies.
         """
         K = len(candidates)
-        bigram_energies = np.zeros(K, dtype=np.int64)
+        bigram_energies = np.zeros(K, dtype=np.float64)
 
         if self._bigram_logprob is None or len(context_word_ids) == 0:
             return bigram_energies
@@ -487,35 +555,67 @@ class ReRankerEngine:
 
         for i, cand_id in enumerate(candidates):
             if cand_id < 0 or cand_id >= self.V:
-                bigram_energies[i] = 0
+                bigram_energies[i] = self._bigram_energy_mean
                 continue
-            # Negative log-prob → integer energy (scale by log_prob_scale)
+            # v76h: Raw negative log-prob — NOT scaled by log_prob_scale
             lp = self._bigram_logprob[prev_word, cand_id]
-            bigram_energies[i] = -int(lp * self.log_prob_scale)
+            bigram_energies[i] = -lp
 
         return bigram_energies
+
+    def _compute_rep_penalty(
+        self,
+        candidates: np.ndarray,
+        recent_words: List[int],
+    ) -> np.ndarray:
+        """
+        v76h: Compute repetition penalty for each candidate.
+
+        Candidates that appear in the recent N generated words get
+        an energy penalty proportional to how recently they appeared.
+        This prevents loops like "they in they in they in...".
+        """
+        K = len(candidates)
+        penalties = np.zeros(K, dtype=np.int64)
+
+        if self.rep_penalty <= 0 or len(recent_words) == 0:
+            return penalties
+
+        # Only penalize the last rep_window words
+        recent = recent_words[-self.rep_window:]
+        for i, cand_id in enumerate(candidates):
+            for j, prev_word in enumerate(recent):
+                if cand_id == prev_word:
+                    # More recent repetitions get higher penalty
+                    recency = len(recent) - j  # 1 = most recent
+                    penalties[i] += int(self.rep_penalty * recency / len(recent))
+
+        return penalties
 
     def rerank(
         self,
         context_word_ids: List[int],
         candidates: np.ndarray,
         base_log_probs: np.ndarray,
+        recent_words: Optional[List[int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Re-rank candidates using DAM discriminator + bigram model.
 
-        v76g KEY CHANGE: DAM energies are z-score normalized before
-        combining with base model log-probs. This makes the mixing
-        weight alpha meaningful (scale-independent).
+        v76h KEY CHANGES:
+        1. Bigram energy is z-score normalized INDEPENDENTLY from DAM
+           (it's log-prob based, same units as base_energies, not DAM energy)
+        2. Repetition penalty added for recent words
+        3. Combined = base + alpha*dam_side + gamma*bigram_scaled + rep_penalty
 
         Args:
             context_word_ids: Context word IDs.
             candidates: Candidate word IDs, shape (K,).
             base_log_probs: Base model log-probabilities, shape (K,).
+            recent_words: v76h: Recently generated words for rep penalty.
 
         Returns:
-            (energies, re_ranked_probs) — combined energies and
-            Boltzmann probabilities for each candidate.
+            (energies, dam_energies) — combined energies and DAM-side energies.
         """
         K = len(candidates)
         if K == 0:
@@ -544,16 +644,11 @@ class ReRankerEngine:
             dam_energies[i] = -int(np.sum(context_field[active]))
 
         # 5. Z-score normalize DAM energies, rescale to base energy std
-        # v76g: This is the critical fix for the energy-logprob scale mismatch.
-        # Instead of a fixed bit-shift (>>8), we normalize DAM energies to
-        # have the same scale as base model energies, then mix with alpha.
         dam_float = dam_energies.astype(np.float64)
         if self._dam_energy_std > 0:
             dam_norm = (dam_float - self._dam_energy_mean) / self._dam_energy_std
         else:
             dam_norm = np.zeros_like(dam_float)
-
-        # Rescale to base energy range so alpha=1 means equal contribution
         dam_scaled = (dam_norm * self._base_energy_std).astype(np.int64)
 
         # 6. Compute spin energy for each candidate
@@ -584,26 +679,38 @@ class ReRankerEngine:
                 candidates.astype(np.int64), self.sdr_encoder
             )
 
-        # 9. Compute bigram energy (v76g: replaces word_swap NCE training)
-        bigram_energies = self._compute_bigram_energy(context_word_ids, candidates)
-
-        # 10. Total DAM-side energy
-        # v76g: dam_scaled is already z-score normalized and rescaled.
-        # alpha controls DAM influence directly:
-        #   0 = pure base model, 1 = equal DAM+base, >1 = DAM dominates
-        total_dam = (dam_scaled  # alpha applied below
+        # 9. DAM-side energy: DAM + spin + episodic + binding (NO bigram)
+        dam_side = (dam_scaled
                     + spin_energies * self.spin_weight
                     + ep_energies * self.episodic_weight
-                    + bind_energies * self.bind_weight
-                    + bigram_energies * self.bigram_weight)
+                    + bind_energies * self.bind_weight)
 
-        # 11. Convert base model log-probs to integer energy scale
+        # 10. v76h: Bigram energy — z-score normalized INDEPENDENTLY
+        # Bigram is log-prob based (like base_energies), not DAM energy.
+        # We normalize it to base_energy_std scale so gamma is meaningful.
+        bigram_raw = self._compute_bigram_energy(context_word_ids, candidates)
+        if self._bigram_energy_std > 0:
+            bigram_norm = (bigram_raw - self._bigram_energy_mean) / self._bigram_energy_std
+        else:
+            bigram_norm = np.zeros_like(bigram_raw)
+        bigram_scaled = (bigram_norm * self._base_energy_std).astype(np.int64)
+
+        # 11. v76h: Repetition penalty
+        rep_penalties = np.zeros(K, dtype=np.int64)
+        if recent_words is not None and len(recent_words) > 0:
+            rep_penalties = self._compute_rep_penalty(candidates, recent_words)
+
+        # 12. Convert base model log-probs to integer energy scale
         base_energies = -(base_log_probs * self.log_prob_scale).astype(np.int64)
 
-        # 12. Combined energy: base model + alpha * DAM discriminator
-        combined = base_energies + (total_dam * self.dam_alpha).astype(np.int64)
+        # 13. v76h: Combined energy
+        # base + alpha * DAM-side + gamma * bigram + rep_penalty
+        combined = (base_energies
+                    + (dam_side * self.dam_alpha).astype(np.int64)
+                    + (bigram_scaled * self.gamma).astype(np.int64)
+                    + rep_penalties)
 
-        return combined, total_dam
+        return combined, dam_side.astype(np.float64)
 
     def _rerank_index(
         self,
@@ -611,9 +718,11 @@ class ReRankerEngine:
         candidates: np.ndarray,
         base_log_probs: np.ndarray,
         beta: float,
+        recent_words: Optional[List[int]] = None,
     ) -> int:
         """Get the index of the best candidate after re-ranking."""
-        combined, _ = self.rerank(context_word_ids, candidates, base_log_probs)
+        combined, _ = self.rerank(context_word_ids, candidates, base_log_probs,
+                                  recent_words=recent_words)
         if len(combined) == 0:
             return 0
         return int(np.argmin(combined))
@@ -648,11 +757,19 @@ class ReRankerEngine:
         """
         Generate text using base model + DAM re-ranking.
 
+        v76h KEY CHANGES:
+        1. Uses get_top_k_words() for GPT-2 (word-level candidates)
+        2. All candidates are valid word IDs (no <unk>)
+        3. Repetition penalty prevents loops
+        4. Properly filtered candidates (only word IDs in [4, V))
+
         Pipeline per step:
-          1. Base model generates top-K candidates + log-probs
-          2. DAM discriminator + bigram model scores each candidate
-          3. Combined energy (z-score normalized) determines ranking
-          4. Boltzmann sample from combined distribution
+          1. Base model generates top-K WORD-LEVEL candidates + log-probs
+          2. DAM discriminator scores each candidate
+          3. Bigram model scores word-order likelihood
+          4. Repetition penalty added for recent words
+          5. Combined energy determines ranking
+          6. Boltzmann sample from combined distribution
         """
         generated = list(prompt_ids)
 
@@ -671,17 +788,30 @@ class ReRankerEngine:
             self.binding.add_word(self.sdr_encoder.word_active_bits[word_id])
 
         for step in range(length):
-            # Get top-K candidates from base model
-            candidates, log_probs = self.base_model.get_top_k(
-                generated, k=min(self.top_k, self.V)
-            )
+            # Get top-K candidates — use word-level if available
+            if self._use_word_candidates and hasattr(self.base_model, 'get_top_k_words'):
+                candidates, log_probs = self.base_model.get_top_k_words(
+                    generated, k=min(self.top_k, self.V)
+                )
+            else:
+                candidates, log_probs = self.base_model.get_top_k(
+                    generated, k=min(self.top_k, self.V)
+                )
 
             if len(candidates) == 0:
                 break
 
-            # Re-rank with DAM
+            # Filter to valid word IDs only (no special tokens, no OOV)
+            valid_mask = (candidates >= 4) & (candidates < self.V)
+            if not np.any(valid_mask):
+                break
+            candidates = candidates[valid_mask]
+            log_probs = log_probs[valid_mask]
+
+            # Re-rank with DAM + bigram + repetition penalty
             combined_energies, dam_energies = self.rerank(
-                generated, candidates, log_probs
+                generated, candidates, log_probs,
+                recent_words=generated[-self.rep_window:]
             )
 
             # Boltzmann sample from combined energies
@@ -723,15 +853,26 @@ class ReRankerEngine:
                 ctx = seq[:pos]
                 target = seq[pos]
 
-                candidates, log_probs = self.base_model.get_top_k(
-                    ctx, k=min(self.top_k, self.V)
-                )
+                # Use word-level candidates if available
+                if self._use_word_candidates and hasattr(self.base_model, 'get_top_k_words'):
+                    candidates, log_probs = self.base_model.get_top_k_words(
+                        ctx, k=min(self.top_k, self.V)
+                    )
+                else:
+                    candidates, log_probs = self.base_model.get_top_k(
+                        ctx, k=min(self.top_k, self.V)
+                    )
 
                 target_mask = candidates == target
                 if not np.any(target_mask):
-                    base_lp = self.base_model.compute_sequence_log_prob(
-                        ctx + [target]
-                    ) - self.base_model.compute_sequence_log_prob(ctx)
+                    # Target not in candidates — use base model log-prob
+                    if hasattr(self.base_model, 'compute_word_sequence_log_prob'):
+                        base_lp = (self.base_model.compute_word_sequence_log_prob(ctx + [target])
+                                   - self.base_model.compute_word_sequence_log_prob(ctx))
+                    else:
+                        base_lp = self.base_model.compute_sequence_log_prob(
+                            ctx + [target]
+                        ) - self.base_model.compute_sequence_log_prob(ctx)
                     base_log_probs.append(base_lp)
                     reranked_log_probs.append(base_lp)
                 else:
@@ -739,9 +880,7 @@ class ReRankerEngine:
                     base_lp = log_probs[target_idx]
                     base_log_probs.append(base_lp)
 
-                    combined_energies, _ = self.rerank(
-                        ctx, candidates, log_probs
-                    )
+                    combined_energies, _ = self.rerank(ctx, candidates, log_probs)
 
                     E_min = np.min(combined_energies)
                     deltas = (combined_energies - E_min).astype(np.float64)
