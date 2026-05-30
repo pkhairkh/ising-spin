@@ -50,6 +50,8 @@ from .reranker_engine import ReRankerEngine
 from .base_model import BaseLMInterface, DummyBaseLM
 from .corruptions import Corruptor
 from .nce import NCETrainer
+from .hash_energy import HashEnergyTable
+from .legd_decoder import LEGDDecoder
 
 __all__ = [
     "SDREncoder",
@@ -65,4 +67,6 @@ __all__ = [
     "DummyBaseLM",
     "Corruptor",
     "NCETrainer",
+    "HashEnergyTable",
+    "LEGDDecoder",
 ]
