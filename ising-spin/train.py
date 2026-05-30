@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Attractor Language Machine v67 — Training Script
+Integer EBM Re-ranker v76 — Training Script
 
-v67: SPIN FIX + LEARNED WEIGHTS
-  - CRITICAL FIX: Y band (AND) was dead — expected overlap with k=10/D=512
-    SDRs is only 0.2 bits/step, so m_y was essentially always zero.
-    Changed from AND to min(s, m_z)*4 which captures "active topic" signal.
-  - Spin weights increased: Z=5x (was 2x), Y=3x (was 1x), spin weight_den=1 (was 5).
-    Spin energy now ~10-20% of DAM range instead of ~1-3%.
-  - Fixed WEIGHT_DEN bug in deferred division: cross-band denominators now
-    correctly included in the common denominator.
-  - __pycache__ auto-cleanup on startup to prevent stale import errors.
-  - v66's learned weights and Adam optimizer preserved.
+v76 PIVOT: The DAM is no longer a standalone language model.
+It is a discriminator/re-ranker on top of a frozen LM.
 
-Architecture: D=512, 50K samples, Hebbian L0
+Pipeline:
+  1. Load base model (GPT-2 or DummyBaseLM)
+  2. Load corpus, build vocabulary, tokenize
+  3. Build SDR encoder
+  4. Build DAM discriminator (NCE-trained)
+  5. NCE training: Hebbian with contrastive signal
+  6. Calibrate re-ranking temperature
+  7. Evaluate: discriminative accuracy, PPL, generation
 
 Usage:
-  python -u train.py                                     # Default: 50K samples
+  python -u train.py --samples 5000 --vocab 1000 --no-base-model --nce-epochs 1
+  python -u train.py  # Default: 50K samples, GPT-2 base model
 """
 
 # --- UNBUFFERED OUTPUT ---
@@ -30,9 +30,7 @@ _src = str(Path(__file__).parent / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-# v67: Clear stale __pycache__ to prevent "unexpected keyword argument" errors
-# after git pull. Python caches bytecode in __pycache__/ and doesn't check
-# if the source file is newer when the .pyc timestamp is close enough.
+# Clear stale __pycache__
 import shutil
 for root, dirs, files in os.walk(Path(__file__).parent / "src"):
     if "__pycache__" in dirs:
@@ -43,14 +41,13 @@ import argparse
 import json
 import time
 import traceback
+import numpy as np
 from pathlib import Path
 
 # --- Configuration ---
-
 DEFAULT_SAMPLES = 50000
 DEFAULT_VOCAB = 2000
 DEFAULT_DATASET = "tinystories"
-DEFAULT_MEMORY_BUDGET = 0
 DEFAULT_SDR_DIM = 512
 DEFAULT_SDR_SPARSITY = 0.02
 
@@ -61,8 +58,11 @@ OUTPUT_DIR = CACHE_DIR / "output"
 
 def get_rss_mb() -> int:
     """Get current process RSS in MB."""
-    from ising_spin.utils import get_rss_mb as _get_rss_mb
-    return _get_rss_mb()
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:
+        return 0
 
 
 def find_cache_file(n_samples: int, dataset_name: str = "tinystories") -> str:
@@ -97,13 +97,7 @@ def find_cache_file(n_samples: int, dataset_name: str = "tinystories") -> str:
 
 def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
     """Load or download data with proper cache handling."""
-    from ising_spin.utils import DATASET_LOADERS, DEFAULT_DATASET as _DEF
-
-    dataset_name = dataset_name or _DEF
-    if dataset_name not in DATASET_LOADERS:
-        print(f"  Unknown dataset '{dataset_name}', falling back to {_DEF}")
-        dataset_name = _DEF
-
+    # Try cache first
     cache_dataset = dataset_name.replace("-", "_")
     cache_path = find_cache_file(n_samples, cache_dataset)
 
@@ -114,161 +108,169 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
             texts = json.load(f)
         t_load = time.time() - t0
         print(f"  {len(texts):,} texts loaded in {t_load:.1f}s")
-
         if len(texts) >= n_samples:
             return texts[:n_samples]
-        else:
-            print(f"  Cache has {len(texts):,} texts but need {n_samples:,}")
 
-    print(f"No cached data found. Downloading {dataset_name} from HuggingFace...")
-    loader = DATASET_LOADERS[dataset_name]
-    t0 = time.time()
-    texts = loader(n_samples=n_samples)
-    print(f"  Downloaded {len(texts):,} texts in {time.time()-t0:.1f}s")
-
-    if n_samples >= 1000000 and n_samples % 1000000 == 0:
-        cache_name = f"cached_{cache_dataset}_{n_samples // 1000000}m.json"
-    elif n_samples >= 1000 and n_samples % 1000 == 0:
+    # Download from HuggingFace
+    print(f"Downloading {dataset_name} from HuggingFace...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("roneneldan/TinyStories", split=f"train[:{n_samples}]")
+        texts = [s["text"] for s in ds]
+        # Cache for next time
         cache_name = f"cached_{cache_dataset}_{n_samples // 1000}k.json"
-    else:
-        cache_name = f"cached_{cache_dataset}_{n_samples}.json"
+        with open(CACHE_DIR / cache_name, "w") as f:
+            json.dump(texts, f)
+        print(f"  Downloaded and cached {len(texts):,} texts")
+        return texts
+    except Exception as e:
+        print(f"  Error downloading: {e}")
+        return []
 
-    cache_file = CACHE_DIR / cache_name
-    print(f"  Saving cache to: {cache_file}")
-    with open(cache_file, "w") as f:
-        json.dump(texts, f)
 
-    return texts
+def build_vocabulary(texts: list, max_vocab: int = 2000, min_freq: int = 5):
+    """Build vocabulary from texts."""
+    from collections import Counter
+    word_counts = Counter()
+    for text in texts:
+        words = text.lower().split()
+        word_counts.update(words)
+
+    # Filter by min frequency
+    filtered = {w: c for w, c in word_counts.items() if c >= min_freq}
+    # Sort by frequency, take top max_vocab
+    sorted_words = sorted(filtered.items(), key=lambda x: -x[1])
+    vocab_words = ["<pad>", "<unk>", "<bos>", "<eos>"] + [w for w, _ in sorted_words[:max_vocab-4]]
+
+    word2idx = {w: i for i, w in enumerate(vocab_words)}
+    idx2word = {i: w for i, w in enumerate(vocab_words)}
+    word_freq = np.zeros(len(vocab_words), dtype=np.int32)
+    for w, c in sorted_words[:max_vocab-4]:
+        if w in word2idx:
+            word_freq[word2idx[w]] = c
+
+    return vocab_words, word2idx, idx2word, word_freq
+
+
+def tokenize_texts(texts: list, word2idx: dict, max_seq_len: int = 30):
+    """Tokenize texts into word ID sequences."""
+    sequences = []
+    for text in texts:
+        words = text.lower().split()
+        ids = [word2idx.get(w, 1) for w in words]  # 1 = <unk>
+        ids = [id for id in ids if id >= 4]  # Skip special tokens
+        if len(ids) >= 2:
+            sequences.append(ids[:max_seq_len])
+    return sequences
+
+
+def build_pos_types(vocab_words, word_freq):
+    """Build simple POS type system based on word suffixes."""
+    # Simplified POS types for corruption generation
+    n_types = 13
+    pos_types = np.zeros(len(vocab_words), dtype=np.int32)
+
+    # Very simple heuristic POS tagging
+    for i, word in enumerate(vocab_words):
+        if i < 4:  # Special tokens
+            pos_types[i] = 0
+        elif word.endswith(("ed",)):
+            pos_types[i] = 1  # VERB_PAST
+        elif word.endswith(("ing",)):
+            pos_types[i] = 2  # VERB_ING
+        elif word.endswith(("ly",)):
+            pos_types[i] = 3  # ADV
+        elif word.endswith(("tion", "ment", "ness", "ity")):
+            pos_types[i] = 4  # NOUN_ABSTRACT
+        elif word.endswith(("ous", "ful", "less", "ive", "able")):
+            pos_types[i] = 5  # ADJ
+        elif word in ("the", "a", "an"):
+            pos_types[i] = 6  # DET
+        elif word in ("is", "was", "were", "are", "am", "be", "been", "being"):
+            pos_types[i] = 7  # AUX
+        elif word in ("he", "she", "it", "they", "we", "i", "you"):
+            pos_types[i] = 8  # PRON
+        elif word in ("and", "but", "or", "so", "because", "when", "if"):
+            pos_types[i] = 9  # CONJ
+        elif word in ("to", "from", "in", "on", "at", "with", "by", "for"):
+            pos_types[i] = 10  # PREP
+        elif word in (".", ",", "!", "?", ";", ":"):
+            pos_types[i] = 11  # PUNCT
+        else:
+            pos_types[i] = 12  # OTHER
+
+    return pos_types
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Attractor Language Machine v67 — SPIN FIX + LEARNED WEIGHTS"
+        description="Integer EBM Re-ranker v76f — Context-only DAM energy + LL calibration + repetition penalty"
     )
 
     # Core parameters
-    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
-                        help="Number of training samples (default: 50K)")
-    parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB,
-                        help="Max vocabulary size (default: 2000)")
-    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
-                        choices=["tinystories", "tiny-textbooks", "writingprompts", "fineweb-edu"],
-                        help=f"Dataset (default: {DEFAULT_DATASET})")
+    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
+    parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
 
-    # SDR parameters
-    parser.add_argument("--sdr-dim", type=int, default=DEFAULT_SDR_DIM,
-                        help="SDR dimension (default: 512)")
-    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY,
-                        help="SDR sparsity (default: 0.02 = 2%%)")
+    # Base model
+    parser.add_argument("--base-model", type=str, default="gpt2")
+    parser.add_argument("--no-base-model", action="store_true", default=False,
+                        help="Use DummyBaseLM (no torch required)")
 
-    # Energy scales
-    parser.add_argument("--dam-scale", type=int, default=1600,
-                        help="DAM energy scale (default: 1600)")
-    parser.add_argument("--episodic-scale", type=int, default=100,
-                        help="Episodic memory energy scale (default: 100)")
-    parser.add_argument("--same-word-penalty", type=int, default=800,
-                        help="Same-word repetition penalty (default: 800)")
+    # Re-ranking
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--sdr-dim", type=int, default=DEFAULT_SDR_DIM)
+    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY)
+    parser.add_argument("--dam-scale", type=int, default=1600)
+    parser.add_argument("--j-clip", type=int, default=32000)
+    parser.add_argument("--log-prob-scale", type=int, default=100)
+    parser.add_argument("--dam-weight-shift", type=int, default=8,
+                        help="Bit-shift for DAM energy scaling (>>N = /2^N). Default 8 = /256")
 
-    # F function parameters
-    parser.add_argument("--f-type", type=str, default="exp_approx",
-                        choices=["quadratic", "cubic", "exp_approx"],
-                        help="F function type (default: exp_approx)")
-    parser.add_argument("--exp-temperature", type=int, default=100,
-                        help="Exponential F temperature in Q8 (100=1.0, 50=0.5 sharper, default: 100)")
+    # NCE
+    parser.add_argument("--nce-eta", type=int, default=10,
+                        help="NCE learning rate (default: 10, balanced formula uses n_neg*eta for positive)")
+    parser.add_argument("--nce-epochs", type=int, default=3,
+                        help="NCE training epochs (default: 3, was 1 — more epochs help with balanced updates)")
+    parser.add_argument("--nce-negatives", type=int, default=4)
+    parser.add_argument("--word-swap-negatives", type=int, default=3,
+                        help="Extra word_swap negatives per positive (v76e: default 3)")
+    parser.add_argument("--word-swap-weight", type=int, default=2,
+                        help="Weight multiplier for word_swap in NCE update (v76e: default 2)")
 
-    # UV-complete parameters
-    parser.add_argument("--uv-regularize", action="store_true", default=True,
-                        help="Enable UV-complete regularization (default: True)")
-    parser.add_argument("--no-uv-regularize", action="store_true",
-                        help="Disable UV-complete regularization")
-    parser.add_argument("--uv-lambda", type=int, default=5,
-                        help="UV regularization strength (default: 5)")
-    parser.add_argument("--topdown-scale", type=int, default=200,
-                        help="Top-down feedback scale (default: 200)")
+    # Repetition penalty (v76f)
+    parser.add_argument("--repetition-penalty", type=int, default=500,
+                        help="Energy penalty for recently generated tokens (v76f: default 500)")
+    parser.add_argument("--repetition-window", type=int, default=3,
+                        help="Number of recent positions to check for repetition (v76f: default 3)")
 
-    # Coupling parameters
-    parser.add_argument("--j-clip", type=int, default=2000,
-                        help="Coupling matrix clip value (default: 2000)")
-
-    # Episodic memory
-    parser.add_argument("--max-episodes", type=int, default=10000,
-                        help="Max episodic memory episodes (default: 10000)")
+    # Spin and episodic
+    parser.add_argument("--spin-weight", type=int, default=5)
+    parser.add_argument("--episodic-weight", type=int, default=2)
+    parser.add_argument("--bind-weight", type=int, default=5)
+    parser.add_argument("--max-episodes", type=int, default=10000)
 
     # Generation
-    parser.add_argument("--max-seq-len", type=int, default=30,
-                        help="Max sequence length (default: 30)")
-    parser.add_argument("--vocab-min-freq", type=int, default=5,
-                        help="Min word frequency for vocab (default: 5)")
+    parser.add_argument("--rerank-beta", type=float, default=0.01)
+    parser.add_argument("--gen-length", type=int, default=100)
+    parser.add_argument("--max-seq-len", type=int, default=30)
+    parser.add_argument("--context-window", type=int, default=10)
+    parser.add_argument("--vocab-min-freq", type=int, default=5)
 
-    # VSA Binding parameters (v39)
-    parser.add_argument("--bind-window", type=int, default=8,
-                        help="Binding context window size (default: 8)")
-    parser.add_argument("--bind-weight", type=int, default=15,
-                        help="Binding energy weight (default: 15, v52 reduced — positional VSA handles order in DAM)")
-    parser.add_argument("--n-unbind-words", type=int, default=3,
-                        help="Number of recent words for multi-step unbinding (default: 3)")
-    parser.add_argument("--bind-density", type=int, default=0,
-                        help="M_bind target density in bits (default: 0=auto, i.e. 2*k=20, v44 value)")
-
-    # Bigram DAM (v52: strong bigram + positional VSA context)
-    parser.add_argument("--bigram-weight", type=int, default=16,
-                        help="Bigram coupling weight (default: 16 for log-normalized, 0=disabled)")
-    # Skip bigram (v52: increased weight)
-    parser.add_argument("--skip-weight", type=int, default=5,
-                        help="Skip bigram weight for J2[words[-2],c] (default: 5, 0=disabled)")
-    # POS skeleton (v53: always built for generation, disabled for PPL)
-    parser.add_argument("--pos-weight", type=int, default=0,
-                        help="POS trigram skeleton PPL weight (default: 0=disabled for PPL, always built for generation)")
-    # Frequency penalty (v53: generation-only)
-    parser.add_argument("--freq-penalty", type=int, default=5,
-                        help="Frequency penalty weight for generation (default: 5, 0=disabled)")
-    # POS generation bonus (v53)
-    parser.add_argument("--pos-gen-weight", type=int, default=10,
-                        help="POS skeleton energy bonus weight during generation (default: 10)")
-    # POS type pre-selection (v53)
-    parser.add_argument("--pos-type-top-k", type=int, default=3,
-                        help="Number of top POS types to consider during generation (default: 3)")
-    # Bigram generation weight (v54: generation-only bigram boost)
-    parser.add_argument("--bigram-gen-weight", type=int, default=32,
-                        help="Bigram coupling weight during generation (default: 32 for dynamic gen, 64 for v54 cascade)")
-    # Skip bigram generation weight (v54: generation-only skip boost)
-    parser.add_argument("--skip-gen-weight", type=int, default=16,
-                        help="Skip bigram weight during generation (default: 16 for dynamic gen, 24 for v54 cascade)")
-    # Dynamic generation (v57)
-    parser.add_argument("--dynamic-gen", action="store_true", default=False,
-                        help="Enable experimental dynamic generation (v58: DAM-first, soft POS). Default: v54 hard cascade which produces coherent generation.")
-    parser.add_argument("--gen-coarse-k", type=int, default=200,
-                        help="Number of candidates passing coarse stage in dynamic gen (default: 200)")
-
-    # Word-level trigram (v58)
-    parser.add_argument("--trigram-weight", type=int, default=8,
-                        help="Word-level trigram J3 weight (default: 8, 0=disabled)")
-    parser.add_argument("--trigram-hash-size", type=int, default=50000,
-                        help="Hash buckets for J3 (default: 50000, v60: increased from 10000 for 2005-word vocab)")
-
-    # Noisy Hebbian training (v58)
-    parser.add_argument("--no-noisy-hebbian", action="store_true", default=False,
-                        help="Disable noisy Hebbian training (default: enabled for generation robustness)")
-    parser.add_argument("--noisy-hebbian-flip", type=int, default=2,
-                        help="Number of bits to flip in context SDR during training (default: 2)")
-
-    # Memory budget
-    parser.add_argument("--memory-budget", type=int, default=DEFAULT_MEMORY_BUDGET,
-                        help="Memory budget in MB (0=unlimited; 14000=16GB Pi)")
+    # Advanced
+    parser.add_argument("--exp-temperature", type=int, default=100)
 
     args = parser.parse_args()
 
-    # Parse F type
-    f_type_map = {"quadratic": 0, "cubic": 1, "exp_approx": 2}
-    f_type = f_type_map[args.f_type]
-
     # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = OUTPUT_DIR / f"attractor_{timestamp}"
+    output_dir = OUTPUT_DIR / f"reranker_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    use_dummy = args.no_base_model or args.base_model == "dummy"
+
     print("=" * 70, flush=True)
-    print("ATTRACTOR LANGUAGE MACHINE v67 — SPIN FIX + LEARNED WEIGHTS", flush=True)
+    print("INTEGER EBM RE-RANKER v76f — Context-only DAM + LL calibration + repetition penalty", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     rss = get_rss_mb()
@@ -276,273 +278,256 @@ def main():
         print(f"Memory (RSS): {rss:,} MB", flush=True)
     print("=" * 70, flush=True)
 
-    # --- Load Data ---
+    # --- [1] Load Data ---
+    print("\n[1/7] Loading data...", flush=True)
     texts = load_data(args.samples, dataset_name=args.dataset)
     n_texts = len(texts)
-    print(f"Using {n_texts:,} texts for training")
+    print(f"  Using {n_texts:,} texts for training", flush=True)
 
-    # --- Config ---
-    uv_regularize = args.uv_regularize and not args.no_uv_regularize
+    # --- [2] Build Vocabulary ---
+    print("\n[2/7] Building vocabulary...", flush=True)
+    vocab_words, word2idx, idx2word, word_freq = build_vocabulary(
+        texts, max_vocab=args.vocab, min_freq=args.vocab_min_freq
+    )
+    V = len(vocab_words)
+    print(f"  Vocabulary: {V} words", flush=True)
 
-    dynamic_gen = args.dynamic_gen  # v65: kept for API compat but generation always uses v65
+    # --- [3] Tokenize ---
+    print("\n[3/7] Tokenizing...", flush=True)
+    sequences = tokenize_texts(texts, word2idx, max_seq_len=args.max_seq_len)
+    # Split train/test
+    n_train = int(0.9 * len(sequences))
+    train_seqs = sequences[:n_train]
+    test_seqs = sequences[n_train:]
+    print(f"  Train: {len(train_seqs):,}, Test: {len(test_seqs):,}", flush=True)
 
-    print(f"""{'=' * 70}
-CONFIG: Attractor Language Machine v67 (SPIN FIX + LEARNED WEIGHTS)
-  ARCHITECTURE:
-    SDR: D={args.sdr_dim}, sparsity={args.sdr_sparsity} ({int(args.sdr_dim * args.sdr_sparsity)} active bits)
-    Hierarchy: L0(512)->L1(256)->L2(128)->L3(64)
-    RG flow: J_eff[l] decimated, Kadanoff rescaling (v34 fix preserved)
-    F function: INLINE piecewise exp (NO J_MAX clip)
-    Energy: NORMALIZED log2-F (LOG2_NORM=512, NO k div, NO h, dE ~ O(200-300))
-  BINDING (v52: VSA secondary — positional VSA + J2 are primary):
-    Type: VSA permutation — bind(a,hash(b)), unbind=rot(D-hash(b))
-    Hash: sum(active_bits) mod D (full [0,D-1] spread)
-    Window: {args.bind_window} recent bigram bindings
-    Weight: {args.bind_weight}
-    N_unbind: {args.n_unbind_words} (multi-step unbinding)
-    M_bind density: {args.bind_density if args.bind_density > 0 else 'auto=20'} bits
-    M_bind: attractor dynamics ONLY (not DAM energy — v45 reverted)
-    Recency: NONE (uniform — recency reverted, hurt PPL)
-  BIGRAM DAM (v52: STRONG bigram + positional VSA context):
-    J2: V×V int32 matrix of log2(count+1) values
-    Weight: {args.bigram_weight}{' (DISABLED)' if args.bigram_weight == 0 else ''}
-    Skip bigram: J2[words[-2],c] weight={args.skip_weight}{' (DISABLED)' if args.skip_weight == 0 else ''}
-    Energy: E_bigram(c) = -J2[prev_word, c] * weight
-    Range: [0, ~16] × weight → max ~{16 * args.bigram_weight}
-    Memory: ~{args.vocab * args.vocab * 4 / 1024 / 1024:.0f} MB
-  POS SKELETON:
-    J_pos_bi: 13×13 POS bigram transitions, log2(count+1)
-    J_pos_tri: 13×13×13 POS trigram transitions, log2(count+1)
-    PPL weight: {args.pos_weight}{' (DISABLED for PPL)' if args.pos_weight == 0 else ''}
-    Gen bonus weight: {args.pos_gen_weight} ({'soft bias in dynamic gen' if dynamic_gen else 'hard type gate in v54 cascade'})
-    Backoff: trigram → bigram (75% weight) when trigram count=0
-    Memory: ~10 KB (trivial)
-  {'DAM-FIRST GENERATION (v58: DAM primary, POS scaled to DAM std):' if dynamic_gen else 'V66 LEARNED WEIGHTS + SPIN PRECISION FIX:'}
-    {'ALL words compete — no hard POS type gate, no bigram pre-filter' if dynamic_gen else 'POS trigram picks top-3 types → hard filter → n-gram + spin energy within'}
-    {'POS type bonus is soft: favored type gets energy bonus, others get nothing' if dynamic_gen else 'N-gram + DAM + spin: weights LEARNED via gradient descent'}
-    {'DAM-first: DAM for ALL words, then bigram/skip/POS as bonuses' if dynamic_gen else 'SPIN ENERGY: overlap(J@m, sdr(w)) / (τ*LOG2_NORM) — v67 Y-band fix + stronger weights'}
-    Bigram gen weight: {args.bigram_gen_weight}{' (=bigram_weight)' if args.bigram_gen_weight == 0 else ''}
-    Skip gen weight: {args.skip_gen_weight}{' (=skip_weight)' if args.skip_gen_weight == 0 else ''}
-    Freq penalty: {args.freq_penalty}{' (DISABLED)' if args.freq_penalty == 0 else ''}
-    Sentence boundary: Z(3/4 decay) X(hard reset) Y(1/2 decay) — LINEAR spin energy (v65)
-  F FUNCTION:
-    Type: {args.f_type}
-  ENERGY SCALES:
-    DAM scale={args.dam_scale}
-    Episodic scale={args.episodic_scale}
-    Same-word penalty={args.same_word_penalty} (generation only, not PPL)
-    Generation: top-k=10 + Boltzmann + {'dynamic (soft POS, no hard gates)' if dynamic_gen else 'POS-driven + bigram-dominant (v54)'}
-    Repetition window=15, distance-decay (v40 fix)
-    Grammar penalty scaled to ~33% median_dE (v40 fix)
-    Special tokens (idx<4) filtered from candidates (v40 fix)
-  UV-COMPLETE:
-    Regularize={uv_regularize}, lambda={args.uv_lambda}
-    Top-down scale={args.topdown_scale}
-    Ward identity checks: ENABLED
-  COUPLING:
-    J_clip={args.j_clip}
-    Learning: Hebbian (L0 only, RG flow to higher levels)
-  EPISODIC:
-    Max episodes={args.max_episodes}
-  DATA:
-    Dataset={args.dataset}, samples={n_texts:,}
-    Vocab max={args.vocab}, min_freq={args.vocab_min_freq}
-    Max seq len={args.max_seq_len}
-  {'Memory budget=' + str(args.memory_budget) + ' MB' if args.memory_budget > 0 else ''}
-{'=' * 70}""")
+    # --- [4] Build POS types ---
+    print("\n[4/7] Building POS type system...", flush=True)
+    pos_types = build_pos_types(vocab_words, word_freq)
+    print(f"  POS system: {len(set(pos_types))} types, {V} words typed", flush=True)
 
-    # --- Train ---
-    from ising_spin.attractor import AttractorLanguageModel
+    # --- [5] Build SDR Encoder ---
+    print("\n[5/7] Building SDR encoder...", flush=True)
+    from ising_spin.attractor.sdr import SDREncoder
+    sdr_encoder = SDREncoder(
+        vocab_size=V,
+        D=args.sdr_dim,
+        sparsity=args.sdr_sparsity,
+    )
+    sdr_encoder.build(word_freq=word_freq)
+    k = sdr_encoder.k
+    print(f"  SDR: D={args.sdr_dim}, k={k} ({args.sdr_sparsity*100:.1f}% sparse)", flush=True)
 
-    model = AttractorLanguageModel(
-        vocab_min_freq=args.vocab_min_freq,
-        vocab_max_size=args.vocab,
-        sdr_dim=args.sdr_dim,
-        sdr_sparsity=args.sdr_sparsity,
+    # --- [6] Build Base Model ---
+    print("\n[6/7] Building base model...", flush=True)
+    base_model = None
+    if use_dummy:
+        from ising_spin.attractor.base_model import DummyBaseLM
+        base_model = DummyBaseLM(
+            vocab_words=vocab_words,
+            word_freq=word_freq,
+            seed=42,
+        )
+        base_model.build_bigrams(train_seqs)
+        print(f"  DummyBaseLM: {V} words, bigrams built", flush=True)
+    else:
+        try:
+            from ising_spin.attractor.base_model import BaseLMInterface
+            base_model = BaseLMInterface(model_name=args.base_model)
+            print(f"  Base model: {args.base_model} loaded", flush=True)
+        except (ImportError, Exception) as e:
+            print(f"  Cannot load GPT-2: {e}", flush=True)
+            print(f"  Falling back to DummyBaseLM", flush=True)
+            from ising_spin.attractor.base_model import DummyBaseLM
+            base_model = DummyBaseLM(
+                vocab_words=vocab_words,
+                word_freq=word_freq,
+                seed=42,
+            )
+            base_model.build_bigrams(train_seqs)
+            use_dummy = True
+
+    # --- [7] Build ReRankerEngine and Train ---
+    print("\n[7/7] Building ReRankerEngine and training...", flush=True)
+    from ising_spin.attractor.reranker_engine import ReRankerEngine
+
+    engine = ReRankerEngine(
+        base_model=base_model,
+        sdr_encoder=sdr_encoder,
+        vocab_words=vocab_words,
+        word2idx=word2idx,
+        idx2word=idx2word,
+        pos_types=pos_types,
+        word_freq=word_freq,
         dam_scale=args.dam_scale,
-        episodic_scale=args.episodic_scale,
-        same_word_penalty=args.same_word_penalty,
-        uv_regularize=uv_regularize,
-        uv_lambda=args.uv_lambda,
-        topdown_scale=args.topdown_scale,
         j_clip=args.j_clip,
-        max_episodes=args.max_episodes,
-        max_seq_len=args.max_seq_len,
-        memory_budget_mb=args.memory_budget,
-        f_type=f_type,
+        f_type=2,  # F_EXP_APPROX
         exp_temperature=args.exp_temperature,
-        bind_window=args.bind_window,
+        nce_eta=args.nce_eta,
+        nce_negatives=args.nce_negatives,
+        nce_epochs=args.nce_epochs,
+        context_window=args.context_window,
+        n_word_swap=args.word_swap_negatives,
+        word_swap_weight=args.word_swap_weight,
+        repetition_penalty=args.repetition_penalty,
+        repetition_window=args.repetition_window,
+        top_k=args.top_k,
+        log_prob_scale=args.log_prob_scale,
+        dam_weight_shift=args.dam_weight_shift,
+        spin_weight=args.spin_weight,
+        episodic_weight=args.episodic_weight,
         bind_weight=args.bind_weight,
-        n_unbind_words=args.n_unbind_words,
-        bind_density=args.bind_density,
-        bigram_weight=args.bigram_weight,
-        skip_weight=args.skip_weight,
-        pos_weight=args.pos_weight,
-        freq_penalty_weight=args.freq_penalty,
-        pos_gen_weight=args.pos_gen_weight,
-        pos_type_top_k=args.pos_type_top_k,
-        bigram_gen_weight=args.bigram_gen_weight,
-        skip_gen_weight=args.skip_gen_weight,
-        dynamic_gen=dynamic_gen,
-        gen_coarse_k=args.gen_coarse_k,
-        trigram_weight=args.trigram_weight,
-        trigram_hash_size=args.trigram_hash_size,
-        noisy_hebbian=not args.no_noisy_hebbian,
-        noisy_hebbian_flip=args.noisy_hebbian_flip,
+        max_episodes=args.max_episodes,
         seed=42,
     )
 
+    # Train
     t_start = time.time()
-
-    try:
-        model.train(n_samples=n_texts, texts=texts)
-    except MemoryError:
-        rss = get_rss_mb()
-        print(f"\n!!! OUT OF MEMORY during training !!! (RSS: {rss:,} MB)")
-        sys.exit(1)
-    except Exception as e:
-        rss = get_rss_mb()
-        print(f"\n!!! TRAINING ERROR: {e} !!! (RSS: {rss:,} MB)")
-        traceback.print_exc()
-        sys.exit(1)
-
+    train_stats = engine.train(train_seqs)
     t_train = time.time() - t_start
-    rss = get_rss_mb()
-    print(f"\nTraining complete: {t_train:.1f}s ({t_train/60:.1f}min)")
-    print(f"  Vocab size: {len(model.vocab)}")
-    if rss > 0:
-        print(f"  Peak memory (RSS): {rss:,} MB")
+    print(f"\n  Training complete: {t_train:.1f}s", flush=True)
 
-    # --- v67: Learn energy weights via gradient descent ---
-    print(f"\n{'=' * 70}")
-    print("WEIGHT CALIBRATION (v67: learned magic numbers)")
-    print(f"{'=' * 70}")
+    # --- Discriminative Accuracy ---
+    print(f"\n{'=' * 70}", flush=True)
+    print("DISCRIMINATIVE ACCURACY (KEY METRIC)", flush=True)
+    print(f"{'=' * 70}", flush=True)
+
     try:
-        model._calibrate_energy_weights(n_seqs=1000, n_epochs=50, lr=0.005)
+        disc_acc = engine.compute_discriminative_accuracy(
+            test_seqs, n_samples=500
+        )
+        print(f"  Overall: {disc_acc['overall_accuracy']:.3f}", flush=True)
+        for key in sorted(disc_acc.keys()):
+            if key.endswith("_accuracy"):
+                print(f"    {key}: {disc_acc[key]:.3f}", flush=True)
     except Exception as e:
-        print(f"  Weight calibration failed: {e}")
+        print(f"  Error: {e}", flush=True)
         traceback.print_exc()
-        print("  Using hand-tuned defaults instead")
+        disc_acc = {"overall_accuracy": 0.0}
 
-    # Re-create sampler with possibly-updated beta
-    from ising_spin.sampling import IntegerBoltzmannSampler
-    model._sampler = IntegerBoltzmannSampler(beta=model.beta, max_delta=50000)
-    model._gen_sampler = None  # Force re-creation with new beta
+    # --- Perplexity ---
+    print(f"\n{'=' * 70}", flush=True)
+    print("PERPLEXITY", flush=True)
+    print(f"{'=' * 70}", flush=True)
 
-    # --- Evaluation ---
-    print(f"\n{'=' * 70}")
-    print("EVALUATION")
-    print(f"{'=' * 70}")
-
-    # Quick PPL
-    print("\nQuick PPL (10 seqs):", end=" ")
     try:
-        quick_ppl = model.compute_perplexity(n_samples=10)
-        print(f"{quick_ppl:.1f}")
+        ppl_stats = engine.compute_perplexity(test_seqs, n_samples=min(100, len(test_seqs)))
+        print(f"  Base PPL:      {ppl_stats['base_ppl']:.2f}", flush=True)
+        print(f"  Re-ranked PPL: {ppl_stats['reranked_ppl']:.2f}", flush=True)
+        print(f"  Evaluated on:  {ppl_stats['n_tokens']} tokens", flush=True)
+        improvement = ppl_stats['base_ppl'] - ppl_stats['reranked_ppl']
+        if improvement > 0:
+            print(f"  ✓ DAM IMPROVES the base model by {improvement:.2f} PPL", flush=True)
+        else:
+            print(f"  ✗ DAM HURTS the base model by {-improvement:.2f} PPL", flush=True)
     except Exception as e:
-        print(f"Error: {e}")
-        quick_ppl = 999
-
-    # Full PPL
-    print(f"\nFull PPL evaluation (100 seqs)...")
-    try:
-        full_ppl = model.compute_perplexity(n_samples=100)
-        print(f"  Perplexity: {full_ppl:.2f}")
-    except Exception as e:
-        print(f"  Error: {e}")
-        full_ppl = quick_ppl
+        print(f"  Error: {e}", flush=True)
+        traceback.print_exc()
+        ppl_stats = {"base_ppl": float("inf"), "reranked_ppl": float("inf"), "n_tokens": 0}
 
     # --- Generation ---
-    print(f"\n{'=' * 70}")
-    print(f"GENERATION (PPL={full_ppl:.2f})")
-    print(f"{'=' * 70}")
+    print(f"\n{'=' * 70}", flush=True)
+    print("GENERATION", flush=True)
+    print(f"{'=' * 70}", flush=True)
 
     prompts = ["once upon a time", "there was a little", "the little girl"]
-    if args.dataset != "tinystories":
-        prompts = ["the history of", "science and technology", "research shows that"]
 
-    generated_texts = []
     for i, prompt in enumerate(prompts):
-        print(f"\n  --- '{prompt}' (200 words) ---")
+        print(f"\n  --- '{prompt}' ({args.gen_length} words) ---", flush=True)
         try:
-            result = model.generate(prompt=prompt, length=200)
-            text = result.get("text", str(result))
-            if isinstance(text, list):
-                text = " ".join(text)
-            print(f"  {text[:300]}...")
-            generated_texts.append(text)
+            # Tokenize prompt
+            prompt_words = prompt.lower().split()
+            prompt_ids = [word2idx.get(w, 1) for w in prompt_words]
+            prompt_ids = [pid for pid in prompt_ids if pid >= 4]
 
+            if len(prompt_ids) == 0:
+                print("  (prompt words not in vocab)", flush=True)
+                continue
+
+            # Generate with re-ranking
+            generated_ids = engine.generate(
+                prompt_ids, length=args.gen_length
+            )
+
+            # Decode
+            text = " ".join(idx2word.get(wid, "<unk>") for wid in generated_ids)
+            print(f"  {text[:300]}", flush=True)
+
+            # Save
             gen_file = output_dir / f"generated_{i}.txt"
             with open(gen_file, "w") as f:
                 f.write(text)
+
+            # Also generate WITHOUT re-ranking (base model only) for comparison
+            if not use_dummy or True:  # Always compare for DummyBaseLM
+                base_ids = list(prompt_ids)
+                for step in range(args.gen_length):
+                    candidates, log_probs = base_model.get_top_k(
+                        base_ids, k=min(args.top_k, V)
+                    )
+                    # Pick top-1 from base model (no re-ranking)
+                    best = int(np.argmax(log_probs))
+                    base_ids.append(int(candidates[best]))
+                base_text = " ".join(idx2word.get(wid, "<unk>") for wid in base_ids)
+                print(f"\n  --- Base model only (no re-ranking) ---", flush=True)
+                print(f"  {base_text[:300]}", flush=True)
+
         except Exception as e:
-            print(f"  Generation error: {e}")
+            print(f"  Generation error: {e}", flush=True)
             traceback.print_exc()
-            generated_texts.append("")
+
+    # --- Diagnostics ---
+    print(f"\n{'=' * 70}", flush=True)
+    print("DIAGNOSTICS", flush=True)
+    print(f"{'=' * 70}", flush=True)
+
+    print(f"  DAM: J_nnz={int(np.count_nonzero(engine.dam.J))}, "
+          f"J_max={int(np.max(np.abs(engine.dam.J)))}, "
+          f"h_nnz={int(np.count_nonzero(engine.dam.h))}", flush=True)
+    print(f"  Spin: z_active={int(np.sum(engine.three_band.m_z > 0))}, "
+          f"x_active={int(np.sum(engine.three_band.m_x > 0))}, "
+          f"y_active={int(np.sum(engine.three_band.m_y > 0))}", flush=True)
+    print(f"  Episodic: {len(engine.episodic.episodes)} episodes", flush=True)
+    print(f"  Binding: {len(engine.binding._recent_words)} recent words", flush=True)
 
     # --- Save Results ---
+    t_total = time.time() - t_start
     results = {
-        "version": "67.0.0",
-        "architecture": "Attractor Language Machine v67 — SPIN FIX + LEARNED WEIGHTS (Y band fix: AND→min(s,m_z)*4; spin weights Z=5x,Y=3x; WEIGHT_DEN bug fix; __pycache__ auto-cleanup; energy weights learned via gradient descent on cross-entropy; Hebbian J matrices frozen; gradient: dL/dw_k = raw_e_k(target) - sum P(w)*raw_e_k(w))",
-        "dataset": args.dataset,
+        "version": "76f.0.0",
+        "architecture": "Integer EBM Re-ranker v76f (context-only DAM + LL calibration + repetition penalty)",
         "timestamp": timestamp,
-        "config": {
-            "sdr_dim": args.sdr_dim,
-            "sdr_sparsity": args.sdr_sparsity,
-            "dam_scale": args.dam_scale,
-            "episodic_scale": args.episodic_scale,
-            "uv_regularize": uv_regularize,
-            "uv_lambda": args.uv_lambda,
-            "topdown_scale": args.topdown_scale,
-            "j_clip": args.j_clip,
-            "max_episodes": args.max_episodes,
-            "vocab_max_size": args.vocab,
-            "same_word_penalty": args.same_word_penalty,
-            "bind_window": args.bind_window,
-            "bind_weight": args.bind_weight,
-            "n_unbind_words": args.n_unbind_words,
-            "bind_density": args.bind_density,
-            "bigram_weight": args.bigram_weight,
-            "skip_weight": args.skip_weight,
-            "pos_weight": args.pos_weight,
-            "freq_penalty_weight": args.freq_penalty,
-            "pos_gen_weight": args.pos_gen_weight,
-            "pos_type_top_k": args.pos_type_top_k,
-            "bigram_gen_weight": args.bigram_gen_weight,
-            "skip_gen_weight": args.skip_gen_weight,
-            "dynamic_gen": dynamic_gen,
-            "gen_coarse_k": args.gen_coarse_k,
-            "f_type": args.f_type,
-            "exp_temperature": args.exp_temperature,
-        },
+        "config": vars(args),
         "results": {
-            "training_time_sec": t_train,
-            "quick_ppl": quick_ppl,
-            "full_ppl": full_ppl,
-            "vocab_size": len(model.vocab),
-            "peak_rss_mb": get_rss_mb(),
-            "learned_weights": getattr(model, '_learned_weights', None),
-            "learned_beta": getattr(model, '_learned_beta', None),
+            "training_time_s": t_train,
+            "total_time_s": t_total,
+            "discriminative_accuracy": disc_acc.get("overall_accuracy", 0.0),
+            "base_ppl": ppl_stats.get("base_ppl", float("inf")),
+            "reranked_ppl": ppl_stats.get("reranked_ppl", float("inf")),
+            "vocab_size": V,
+            "J_nnz": int(np.count_nonzero(engine.dam.J)),
+            "J_max": int(np.max(np.abs(engine.dam.J))),
+            "base_model": "dummy" if use_dummy else args.base_model,
         },
     }
 
     results_file = output_dir / "results.json"
     with open(results_file, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"  Saved: {results_file}")
+        json.dump(results, f, indent=2, default=str)
+    print(f"\n  Saved: {results_file}")
 
     root_results = CACHE_DIR / "training_results.json"
     with open(root_results, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=str)
     print(f"  Saved: {root_results}")
 
-    t_total = time.time() - t_start
-    print(f"\n{'=' * 70}")
-    print(f"DONE — Attractor Language Machine v67")
+    print(f"\n{'=' * 70}", flush=True)
+    print(f"DONE — Integer EBM Re-ranker v76f")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
-    print(f"PPL: {full_ppl:.2f}")
+    print(f"Discriminative accuracy: {disc_acc.get('overall_accuracy', 0.0):.3f}")
+    print(f"Base PPL: {ppl_stats.get('base_ppl', float('inf')):.2f}")
+    print(f"Re-ranked PPL: {ppl_stats.get('reranked_ppl', float('inf')):.2f}")
     print(f"Results: {output_dir}")
-    print(f"{'=' * 70}")
+    print(f"{'=' * 70}", flush=True)
 
 
 if __name__ == "__main__":
