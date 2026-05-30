@@ -51,7 +51,9 @@ from .base_model import BaseLMInterface, DummyBaseLM
 from .corruptions import Corruptor
 from .nce import NCETrainer
 from .hash_energy import HashEnergyTable
+from .feature_hash_energy import FeatureHashEnergyTable
 from .legd_decoder import LEGDDecoder
+from .legd_decoder_v2 import LEGDDecoderV2
 
 __all__ = [
     "SDREncoder",
@@ -68,5 +70,7 @@ __all__ = [
     "Corruptor",
     "NCETrainer",
     "HashEnergyTable",
+    "FeatureHashEnergyTable",
     "LEGDDecoder",
+    "LEGDDecoderV2",
 ]
