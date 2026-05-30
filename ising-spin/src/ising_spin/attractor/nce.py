@@ -1,20 +1,24 @@
 """
 Noise Contrastive Estimation (NCE) for DAM Discriminator Training.
 
-v76e: Fix word_swap + re-ranking calibration.
+v76g: Remove word_swap from training.
 
-Bug 12: word_swap accuracy = 0.371 (below chance).
-  Only 1 word_swap negative per positive, drowned out by 3 other types.
-  Word_swap is the HARDEST corruption (smallest context change), so it
-  needs MORE training signal, not less.
-  FIX: Generate n_word_swap extras (default 3) per positive, and apply
-  per-type weighting (word_swap gets 2x weight in the NCE update).
+  WHY: The DAM with SDR encoding CANNOT detect word swaps. The positional
+  VSA encoding (np.roll by position) creates such small changes in the
+  context SDR after a swap that the DAM energy barely moves. After 3
+  versions (v76d/e/f) trying to fix this (balanced updates, extra
+  negatives, per-type weighting), word_swap accuracy remains stuck at
+  0.411 — below random chance (0.5).
 
-Bug 13: Re-ranking calibration gives rerank_acc = 0.364.
-  Calibration searched beta in [0.005..0.1] but used greedy argmin
-  (which IGNORES beta entirely). Also didn't search dam_weight_shift.
-  FIX: Calibration now searches dam_weight_shift AND uses proper
-  Boltzmann-weighted selection. Also searches wider beta range.
+  Continuing to train on word_swap WASTES J-matrix capacity on an
+  impossible task, which degrades performance on the tasks the DAM
+  CAN learn (random_sub, pos_violate, topic_violate). Word order is
+  now handled by an explicit bigram energy table in the reranker.
+
+  CHANGES from v76e:
+  - Only 3 corruption types: RANDOM_SUB, POS_VIOLATE, TOPIC_VIOLATE
+  - Removed n_word_swap and word_swap_weight parameters
+  - Simpler code, faster training, no wasted capacity
 
 v76d: Balanced NCE ratio + asymmetric J (fixed energy inversion).
 """
@@ -25,16 +29,15 @@ from typing import List, Tuple, Optional, Dict
 
 from .dam import DAMLayer
 from .sdr import SDREncoder
-from .corruptions import Corruptor, CORRUPTION_NAMES
+from .corruptions import Corruptor, CORRUPTION_NAMES, RANDOM_SUB, POS_VIOLATE, TOPIC_VIOLATE
 
 
 class NCETrainer:
     """
     NCE Hebbian trainer for the DAM discriminator.
 
-    v76e: Extra word_swap negatives + per-type weighting.
-    v76d: Balanced NCE ratio for both J and h, asymmetric J,
-    multi-type disc_acc check.
+    v76g: 3 corruption types only (no word_swap).
+    v76d: Balanced NCE ratio for both J and h, asymmetric J.
     """
 
     def __init__(
@@ -48,8 +51,6 @@ class NCETrainer:
         j_clip: int = 32000,
         uv_regularize: bool = True,
         uv_lambda: int = 10,
-        n_word_swap: int = 3,
-        word_swap_weight: int = 2,
     ):
         self.dam = dam
         self.sdr_encoder = sdr_encoder
@@ -60,20 +61,19 @@ class NCETrainer:
         self.j_clip = j_clip
         self.uv_regularize = uv_regularize
         self.uv_lambda = uv_lambda
-        self.n_word_swap = n_word_swap      # Extra word_swap negatives per positive
-        self.word_swap_weight = word_swap_weight  # Weight multiplier for word_swap in NCE update
 
     def train_epoch(
         self,
         sequences: List[List[int]],
         epoch: int = 0,
-        n_negatives: int = 4,
+        n_negatives: int = 3,
         callback=None,
     ) -> Dict:
-        """One epoch of NCE training, streaming pairs from sequences.
+        """
+        One epoch of NCE training, streaming pairs from sequences.
 
-        v76e: Total negatives per positive = n_negatives (base types)
-        + n_word_swap (extra word_swap). Default: 4 + 3 = 7 total.
+        v76g: n_negatives defaults to 3 (one per corruption type).
+        No word_swap negatives.
         """
         # Count total pairs
         n_pairs = sum(max(0, len(s) - 1) for s in sequences if len(s) >= 2)
@@ -132,14 +132,14 @@ class NCETrainer:
         avg_pos_e = total_pos_energy / max(1, disc_total)
         avg_neg_e = total_neg_energy / max(1, disc_total)
 
-        # Apply UV regularization ONCE at end of epoch (not per-batch!)
+        # Apply UV regularization ONCE at end of epoch
         if self.uv_regularize:
             nnz_before = int(np.count_nonzero(self.dam.J))
             self.dam._uv_regularize()
             nnz_after = int(np.count_nonzero(self.dam.J))
             print(f"    UV regularization: J_nnz {nnz_before} → {nnz_after}")
 
-        # v76d diagnostic: h statistics
+        # h statistics
         h_nnz = int(np.count_nonzero(self.dam.h))
         h_max = int(np.max(np.abs(self.dam.h))) if h_nnz > 0 else 0
         h_mean = float(np.mean(self.dam.h.astype(np.float32)))
@@ -171,13 +171,11 @@ class NCETrainer:
         batch_pairs: List[Tuple[List[int], int]],
         n_negatives: int,
     ) -> Dict:
-        """Process one batch of (context, target) pairs.
+        """
+        Process one batch of (context, target) pairs.
 
-        v76d: Balanced NCE update for both J and h.
-        The key insight: with n_neg negatives, the positive signal must
-        be weighted n_neg× to balance. Otherwise common features (present
-        in both pos and neg) get driven negative, inverting the energy
-        landscape so the DAM assigns LOWER energy to corrupted text.
+        v76g: Balanced NCE with 3 corruption types only.
+        No word_swap — it was below chance and wasted capacity.
         """
         B = len(batch_pairs)
         D = self.dam.D
@@ -196,101 +194,54 @@ class NCETrainer:
                 )
             pos_ctx_sdrs[i] = ctx_cache[ctx_key]
 
-        # v76e: Generate and encode negative pairs with extra word_swap
-        total_neg = n_negatives + self.n_word_swap
-        neg_ctx_sdrs = [np.zeros((B, D), dtype=np.uint8) for _ in range(total_neg)]
-        neg_tgt_sdrs = [np.zeros((B, D), dtype=np.uint8) for _ in range(total_neg)]
-        neg_type_weights = np.ones(total_neg, dtype=np.float32)  # per-negative weight
+        # Generate and encode negative pairs
+        # v76g: Only 3 types — RANDOM_SUB, POS_VIOLATE, TOPIC_VIOLATE
+        neg_ctx_sdrs = [np.zeros((B, D), dtype=np.uint8) for _ in range(n_negatives)]
+        neg_tgt_sdrs = [np.zeros((B, D), dtype=np.uint8) for _ in range(n_negatives)]
 
         for i, (ctx, nxt) in enumerate(batch_pairs):
-            # Standard 4 negatives (one per type)
-            negatives = self.corruptor.generate_negatives(ctx, nxt, n_negatives)
+            # Generate negatives with only 3 types (no WORD_SWAP)
+            negatives = self.corruptor.generate_negatives(
+                ctx, nxt, n_negatives=n_negatives
+            )
             for k, (neg_ctx, neg_cand, ctype) in enumerate(negatives[:n_negatives]):
-                if ctype != 3:  # Not WORD_SWAP: reuse positive context
-                    neg_ctx_sdrs[k][i] = pos_ctx_sdrs[i]
-                else:
-                    neg_ctx_key = tuple(neg_ctx[-self.context_window:])
-                    if neg_ctx_key not in ctx_cache:
-                        ctx_cache[neg_ctx_key] = self.sdr_encoder.encode_context_positional(
-                            list(neg_ctx_key), context_window=self.context_window
-                        )
-                    neg_ctx_sdrs[k][i] = ctx_cache[neg_ctx_key]
                 neg_tgt_sdrs[k][i] = self.sdr_encoder.encode(neg_cand)
-
-            # v76e: Extra word_swap negatives (the hardest type needs more signal)
-            for extra_k in range(self.n_word_swap):
-                idx = n_negatives + extra_k
-                neg_type_weights[idx] = float(self.word_swap_weight)
-                swap_neg = self.corruptor._corrupt(ctx, nxt, 3)  # WORD_SWAP=3
-                if swap_neg is not None:
-                    neg_ctx_list, neg_cand, _ = swap_neg
-                    neg_ctx_key = tuple(neg_ctx_list[-self.context_window:])
-                    if neg_ctx_key not in ctx_cache:
-                        ctx_cache[neg_ctx_key] = self.sdr_encoder.encode_context_positional(
-                            list(neg_ctx_key), context_window=self.context_window
-                        )
-                    neg_ctx_sdrs[idx][i] = ctx_cache[neg_ctx_key]
-                    neg_tgt_sdrs[idx][i] = self.sdr_encoder.encode(neg_cand)
-                else:
-                    # Fallback: reuse positive (zero gradient contribution)
-                    neg_ctx_sdrs[idx][i] = pos_ctx_sdrs[i]
-                    neg_tgt_sdrs[idx][i] = self.sdr_encoder.encode(nxt)
+                # All 3 corruption types keep the same context
+                neg_ctx_sdrs[k][i] = pos_ctx_sdrs[i]
 
         # === BALANCED NCE UPDATE for J ===
-        # v76e: Per-type weighted NCE update.
-        # word_swap negatives get word_swap_weight (default 2x) because they
-        # provide the weakest signal (smallest context change) and need more
-        # gradient to compete with the stronger corruption types.
-        #
-        # The balanced ratio still applies: total_neg_weight * pos - weighted_neg_sum
         pos_ctx_f = pos_ctx_sdrs.astype(np.float32)
         pos_tgt_f = pos_tgt_sdrs.astype(np.float32)
-        J_pos_mean = (pos_tgt_f.T @ pos_ctx_f) / B  # entries in [0, 1]
+        J_pos_mean = (pos_tgt_f.T @ pos_ctx_f) / B
 
-        J_neg_weighted = np.zeros_like(J_pos_mean)
-        total_neg_weight = 0.0
-        for k in range(total_neg):
-            w = float(neg_type_weights[k])
-            J_neg_weighted += w * (neg_tgt_sdrs[k].astype(np.float32).T
+        J_neg_mean = np.zeros_like(J_pos_mean)
+        for k in range(n_negatives):
+            J_neg_mean += (neg_tgt_sdrs[k].astype(np.float32).T
                           @ neg_ctx_sdrs[k].astype(np.float32)) / B
-            total_neg_weight += w
 
-        # Balanced NCE update: total_weight * pos - weighted_neg
-        J_update_f = float(self.eta) * (total_neg_weight * J_pos_mean - J_neg_weighted)
+        # Balanced NCE: n_neg * pos - neg_sum
+        J_update_f = float(self.eta) * (float(n_negatives) * J_pos_mean - J_neg_mean)
         J_update = np.round(J_update_f).astype(np.int32)
-        del pos_ctx_f, pos_tgt_f, J_pos_mean, J_neg_weighted, J_update_f
+        del pos_ctx_f, pos_tgt_f, J_pos_mean, J_neg_mean, J_update_f
 
-        # BUG 10 FIX: Do NOT symmetrize J for the discriminative model.
-        # The energy is E = -s_tgt^T (J @ s_ctx + h) — a BIPARTITE bilinear form.
-        # J[i,j] = coupling FROM context bit j TO target bit i.
-        # Symmetrizing mixes this with the reverse signal (ctx bit i → tgt bit j),
-        # which is a different signal that dilutes discriminative power.
-        # Also: no need to zero diagonal — self-coupling is valid in bipartite energy.
-        # (Removed: np.fill_diagonal(J_update, 0) and J_update symmetrization)
-
+        # Asymmetric J (bipartite: no symmetrization)
         J_new = self.dam.J.astype(np.int32) + J_update
         np.clip(J_new, -self.j_clip, self.j_clip, out=J_new)
         self.dam.J = J_new.astype(np.int16)
 
         # === BALANCED NCE UPDATE for h ===
-        # v76e: Same per-type weighting as J.
-        h_pos_mean = np.mean(pos_tgt_sdrs.astype(np.float32), axis=0)  # [0, 1]
-        h_neg_weighted = np.zeros(D, dtype=np.float32)
-        for k in range(total_neg):
-            w = float(neg_type_weights[k])
-            h_neg_weighted += w * np.mean(neg_tgt_sdrs[k].astype(np.float32), axis=0)
+        h_pos_mean = np.mean(pos_tgt_sdrs.astype(np.float32), axis=0)
+        h_neg_mean = np.zeros(D, dtype=np.float32)
+        for k in range(n_negatives):
+            h_neg_mean += np.mean(neg_tgt_sdrs[k].astype(np.float32), axis=0)
         h_update = np.round(
-            self.eta * (total_neg_weight * h_pos_mean - h_neg_weighted)
+            self.eta * (float(n_negatives) * h_pos_mean - h_neg_mean)
         ).astype(np.int32)
         h_new = self.dam.h.astype(np.int32) + h_update
         np.clip(h_new, -self.j_clip, self.j_clip, out=h_new)
         self.dam.h = h_new.astype(np.int16)
 
-        # NOTE: UV regularization is NOT applied per-batch.
-        # Applied once at end of epoch in train_epoch().
-
-        # === Discriminative accuracy check — ALL neg types ===
-        # v76e: Check all negatives including extra word_swap.
+        # === Discriminative accuracy check ===
         disc_correct = 0
         disc_total = 0
         total_pos_energy = 0
@@ -304,13 +255,12 @@ class NCETrainer:
             active = np.where(tgt_sdr > 0)[0]
             pos_e = -int(np.sum(field[active]))
 
-            # Check ALL negative types (including extra word_swap)
-            for k in range(total_neg):
+            for k in range(n_negatives):
                 neg_field = self.dam.compute_field(neg_ctx_sdrs[k][idx])
                 neg_active = np.where(neg_tgt_sdrs[k][idx] > 0)[0]
                 neg_e = -int(np.sum(neg_field[neg_active]))
 
-                if pos_e < neg_e:  # Lower energy = more likely
+                if pos_e < neg_e:
                     disc_correct += 1
                 disc_total += 1
                 total_pos_energy += pos_e

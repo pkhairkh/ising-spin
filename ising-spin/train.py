@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-Integer EBM Re-ranker v76 — Training Script
+Integer EBM Re-ranker v76g — Training Script
 
-v76 PIVOT: The DAM is no longer a standalone language model.
-It is a discriminator/re-ranker on top of a frozen LM.
+v76g ARCHITECTURAL FIXES:
+  1. Z-score energy normalization: DAM energies are normalized to match
+     base model log-prob scale, eliminating the bit-shift hack.
+  2. Bigram energy table: Explicit word-order model replaces the DAM's
+     failed attempt to learn word swaps via NCE.
+  3. No word_swap in NCE: Removed the impossible corruption type that
+     was wasting J-matrix capacity.
 
 Pipeline:
   1. Load base model (GPT-2 or DummyBaseLM)
   2. Load corpus, build vocabulary, tokenize
   3. Build SDR encoder
-  4. Build DAM discriminator (NCE-trained)
-  5. NCE training: Hebbian with contrastive signal
-  6. Calibrate re-ranking temperature
-  7. Evaluate: discriminative accuracy, PPL, generation
+  4. Build DAM discriminator (NCE-trained, 3 corruption types only)
+  5. Build bigram log-prob table
+  6. NCE training: Hebbian with contrastive signal
+  7. Calibrate re-ranking (z-score normalization + alpha/beta search)
+  8. Evaluate: discriminative accuracy, PPL, generation
 
 Usage:
   python -u train.py --samples 5000 --vocab 1000 --no-base-model --nce-epochs 1
@@ -97,7 +103,6 @@ def find_cache_file(n_samples: int, dataset_name: str = "tinystories") -> str:
 
 def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
     """Load or download data with proper cache handling."""
-    # Try cache first
     cache_dataset = dataset_name.replace("-", "_")
     cache_path = find_cache_file(n_samples, cache_dataset)
 
@@ -111,13 +116,11 @@ def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
         if len(texts) >= n_samples:
             return texts[:n_samples]
 
-    # Download from HuggingFace
     print(f"Downloading {dataset_name} from HuggingFace...")
     try:
         from datasets import load_dataset
         ds = load_dataset("roneneldan/TinyStories", split=f"train[:{n_samples}]")
         texts = [s["text"] for s in ds]
-        # Cache for next time
         cache_name = f"cached_{cache_dataset}_{n_samples // 1000}k.json"
         with open(CACHE_DIR / cache_name, "w") as f:
             json.dump(texts, f)
@@ -136,9 +139,7 @@ def build_vocabulary(texts: list, max_vocab: int = 2000, min_freq: int = 5):
         words = text.lower().split()
         word_counts.update(words)
 
-    # Filter by min frequency
     filtered = {w: c for w, c in word_counts.items() if c >= min_freq}
-    # Sort by frequency, take top max_vocab
     sorted_words = sorted(filtered.items(), key=lambda x: -x[1])
     vocab_words = ["<pad>", "<unk>", "<bos>", "<eos>"] + [w for w, _ in sorted_words[:max_vocab-4]]
 
@@ -157,8 +158,8 @@ def tokenize_texts(texts: list, word2idx: dict, max_seq_len: int = 30):
     sequences = []
     for text in texts:
         words = text.lower().split()
-        ids = [word2idx.get(w, 1) for w in words]  # 1 = <unk>
-        ids = [id for id in ids if id >= 4]  # Skip special tokens
+        ids = [word2idx.get(w, 1) for w in words]
+        ids = [id for id in ids if id >= 4]
         if len(ids) >= 2:
             sequences.append(ids[:max_seq_len])
     return sequences
@@ -166,45 +167,43 @@ def tokenize_texts(texts: list, word2idx: dict, max_seq_len: int = 30):
 
 def build_pos_types(vocab_words, word_freq):
     """Build simple POS type system based on word suffixes."""
-    # Simplified POS types for corruption generation
     n_types = 13
     pos_types = np.zeros(len(vocab_words), dtype=np.int32)
 
-    # Very simple heuristic POS tagging
     for i, word in enumerate(vocab_words):
-        if i < 4:  # Special tokens
+        if i < 4:
             pos_types[i] = 0
         elif word.endswith(("ed",)):
-            pos_types[i] = 1  # VERB_PAST
+            pos_types[i] = 1
         elif word.endswith(("ing",)):
-            pos_types[i] = 2  # VERB_ING
+            pos_types[i] = 2
         elif word.endswith(("ly",)):
-            pos_types[i] = 3  # ADV
+            pos_types[i] = 3
         elif word.endswith(("tion", "ment", "ness", "ity")):
-            pos_types[i] = 4  # NOUN_ABSTRACT
+            pos_types[i] = 4
         elif word.endswith(("ous", "ful", "less", "ive", "able")):
-            pos_types[i] = 5  # ADJ
+            pos_types[i] = 5
         elif word in ("the", "a", "an"):
-            pos_types[i] = 6  # DET
+            pos_types[i] = 6
         elif word in ("is", "was", "were", "are", "am", "be", "been", "being"):
-            pos_types[i] = 7  # AUX
+            pos_types[i] = 7
         elif word in ("he", "she", "it", "they", "we", "i", "you"):
-            pos_types[i] = 8  # PRON
+            pos_types[i] = 8
         elif word in ("and", "but", "or", "so", "because", "when", "if"):
-            pos_types[i] = 9  # CONJ
+            pos_types[i] = 9
         elif word in ("to", "from", "in", "on", "at", "with", "by", "for"):
-            pos_types[i] = 10  # PREP
+            pos_types[i] = 10
         elif word in (".", ",", "!", "?", ";", ":"):
-            pos_types[i] = 11  # PUNCT
+            pos_types[i] = 11
         else:
-            pos_types[i] = 12  # OTHER
+            pos_types[i] = 12
 
     return pos_types
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Integer EBM Re-ranker v76f — Context-only DAM energy + LL calibration + repetition penalty"
+        description="Integer EBM Re-ranker v76g — Z-score Normalization + Bigram Energy"
     )
 
     # Core parameters
@@ -224,25 +223,19 @@ def main():
     parser.add_argument("--dam-scale", type=int, default=1600)
     parser.add_argument("--j-clip", type=int, default=32000)
     parser.add_argument("--log-prob-scale", type=int, default=100)
-    parser.add_argument("--dam-weight-shift", type=int, default=8,
-                        help="Bit-shift for DAM energy scaling (>>N = /2^N). Default 8 = /256")
+    parser.add_argument("--dam-alpha", type=float, default=1.0,
+                        help="v76g: Mixing weight for z-score normalized DAM energy. "
+                             "0=pure base model, 1=equal DAM+base, >1=DAM dominates")
+    parser.add_argument("--bigram-weight", type=int, default=10,
+                        help="v76g: Weight for bigram log-prob energy (replaces word_swap NCE)")
 
     # NCE
     parser.add_argument("--nce-eta", type=int, default=10,
-                        help="NCE learning rate (default: 10, balanced formula uses n_neg*eta for positive)")
+                        help="NCE learning rate")
     parser.add_argument("--nce-epochs", type=int, default=3,
-                        help="NCE training epochs (default: 3, was 1 — more epochs help with balanced updates)")
-    parser.add_argument("--nce-negatives", type=int, default=4)
-    parser.add_argument("--word-swap-negatives", type=int, default=3,
-                        help="Extra word_swap negatives per positive (v76e: default 3)")
-    parser.add_argument("--word-swap-weight", type=int, default=2,
-                        help="Weight multiplier for word_swap in NCE update (v76e: default 2)")
-
-    # Repetition penalty (v76f)
-    parser.add_argument("--repetition-penalty", type=int, default=500,
-                        help="Energy penalty for recently generated tokens (v76f: default 500)")
-    parser.add_argument("--repetition-window", type=int, default=3,
-                        help="Number of recent positions to check for repetition (v76f: default 3)")
+                        help="NCE training epochs")
+    parser.add_argument("--nce-negatives", type=int, default=3,
+                        help="v76g: Number of NCE negatives (3 types: random_sub, pos_violate, topic_violate)")
 
     # Spin and episodic
     parser.add_argument("--spin-weight", type=int, default=5)
@@ -270,9 +263,13 @@ def main():
     use_dummy = args.no_base_model or args.base_model == "dummy"
 
     print("=" * 70, flush=True)
-    print("INTEGER EBM RE-RANKER v76f — Context-only DAM + LL calibration + repetition penalty", flush=True)
+    print("INTEGER EBM RE-RANKER v76g — Z-score Normalization + Bigram Energy", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
+    print(f"Key changes from v76e/f:", flush=True)
+    print(f"  1. Z-score energy normalization (replaces bit-shift hack)", flush=True)
+    print(f"  2. Bigram energy table (replaces word_swap NCE)", flush=True)
+    print(f"  3. Only 3 NCE corruption types (no word_swap)", flush=True)
     rss = get_rss_mb()
     if rss > 0:
         print(f"Memory (RSS): {rss:,} MB", flush=True)
@@ -367,16 +364,13 @@ def main():
         nce_negatives=args.nce_negatives,
         nce_epochs=args.nce_epochs,
         context_window=args.context_window,
-        n_word_swap=args.word_swap_negatives,
-        word_swap_weight=args.word_swap_weight,
-        repetition_penalty=args.repetition_penalty,
-        repetition_window=args.repetition_window,
+        dam_alpha=args.dam_alpha,
         top_k=args.top_k,
         log_prob_scale=args.log_prob_scale,
-        dam_weight_shift=args.dam_weight_shift,
         spin_weight=args.spin_weight,
         episodic_weight=args.episodic_weight,
         bind_weight=args.bind_weight,
+        bigram_weight=args.bigram_weight,
         max_episodes=args.max_episodes,
         seed=42,
     )
@@ -417,9 +411,9 @@ def main():
         print(f"  Evaluated on:  {ppl_stats['n_tokens']} tokens", flush=True)
         improvement = ppl_stats['base_ppl'] - ppl_stats['reranked_ppl']
         if improvement > 0:
-            print(f"  ✓ DAM IMPROVES the base model by {improvement:.2f} PPL", flush=True)
+            print(f"  DAM IMPROVES the base model by {improvement:.2f} PPL", flush=True)
         else:
-            print(f"  ✗ DAM HURTS the base model by {-improvement:.2f} PPL", flush=True)
+            print(f"  DAM HURTS the base model by {-improvement:.2f} PPL", flush=True)
     except Exception as e:
         print(f"  Error: {e}", flush=True)
         traceback.print_exc()
@@ -435,7 +429,6 @@ def main():
     for i, prompt in enumerate(prompts):
         print(f"\n  --- '{prompt}' ({args.gen_length} words) ---", flush=True)
         try:
-            # Tokenize prompt
             prompt_words = prompt.lower().split()
             prompt_ids = [word2idx.get(w, 1) for w in prompt_words]
             prompt_ids = [pid for pid in prompt_ids if pid >= 4]
@@ -444,33 +437,28 @@ def main():
                 print("  (prompt words not in vocab)", flush=True)
                 continue
 
-            # Generate with re-ranking
             generated_ids = engine.generate(
                 prompt_ids, length=args.gen_length
             )
 
-            # Decode
             text = " ".join(idx2word.get(wid, "<unk>") for wid in generated_ids)
             print(f"  {text[:300]}", flush=True)
 
-            # Save
             gen_file = output_dir / f"generated_{i}.txt"
             with open(gen_file, "w") as f:
                 f.write(text)
 
-            # Also generate WITHOUT re-ranking (base model only) for comparison
-            if not use_dummy or True:  # Always compare for DummyBaseLM
-                base_ids = list(prompt_ids)
-                for step in range(args.gen_length):
-                    candidates, log_probs = base_model.get_top_k(
-                        base_ids, k=min(args.top_k, V)
-                    )
-                    # Pick top-1 from base model (no re-ranking)
-                    best = int(np.argmax(log_probs))
-                    base_ids.append(int(candidates[best]))
-                base_text = " ".join(idx2word.get(wid, "<unk>") for wid in base_ids)
-                print(f"\n  --- Base model only (no re-ranking) ---", flush=True)
-                print(f"  {base_text[:300]}", flush=True)
+            # Also generate WITHOUT re-ranking for comparison
+            base_ids = list(prompt_ids)
+            for step in range(args.gen_length):
+                candidates, log_probs = base_model.get_top_k(
+                    base_ids, k=min(args.top_k, V)
+                )
+                best = int(np.argmax(log_probs))
+                base_ids.append(int(candidates[best]))
+            base_text = " ".join(idx2word.get(wid, "<unk>") for wid in base_ids)
+            print(f"\n  --- Base model only (no re-ranking) ---", flush=True)
+            print(f"  {base_text[:300]}", flush=True)
 
         except Exception as e:
             print(f"  Generation error: {e}", flush=True)
@@ -484,6 +472,12 @@ def main():
     print(f"  DAM: J_nnz={int(np.count_nonzero(engine.dam.J))}, "
           f"J_max={int(np.max(np.abs(engine.dam.J)))}, "
           f"h_nnz={int(np.count_nonzero(engine.dam.h))}", flush=True)
+    print(f"  Normalization: DAM_mean={engine._dam_energy_mean:.1f}, "
+          f"DAM_std={engine._dam_energy_std:.1f}", flush=True)
+    print(f"  Base: base_mean={engine._base_energy_mean:.1f}, "
+          f"base_std={engine._base_energy_std:.1f}", flush=True)
+    print(f"  Alpha={engine.dam_alpha:.1f}, Beta={engine.rerank_beta}", flush=True)
+    print(f"  Bigram: {'built' if engine._bigram_logprob is not None else 'none'}", flush=True)
     print(f"  Spin: z_active={int(np.sum(engine.three_band.m_z > 0))}, "
           f"x_active={int(np.sum(engine.three_band.m_x > 0))}, "
           f"y_active={int(np.sum(engine.three_band.m_y > 0))}", flush=True)
@@ -493,8 +487,8 @@ def main():
     # --- Save Results ---
     t_total = time.time() - t_start
     results = {
-        "version": "76f.0.0",
-        "architecture": "Integer EBM Re-ranker v76f (context-only DAM + LL calibration + repetition penalty)",
+        "version": "76g.0.0",
+        "architecture": "Integer EBM Re-ranker v76g (z-score normalization + bigram energy)",
         "timestamp": timestamp,
         "config": vars(args),
         "results": {
@@ -507,6 +501,12 @@ def main():
             "J_nnz": int(np.count_nonzero(engine.dam.J)),
             "J_max": int(np.max(np.abs(engine.dam.J))),
             "base_model": "dummy" if use_dummy else args.base_model,
+            "dam_alpha": engine.dam_alpha,
+            "rerank_beta": engine.rerank_beta,
+            "dam_energy_mean": engine._dam_energy_mean,
+            "dam_energy_std": engine._dam_energy_std,
+            "base_energy_mean": engine._base_energy_mean,
+            "base_energy_std": engine._base_energy_std,
         },
     }
 
@@ -521,11 +521,12 @@ def main():
     print(f"  Saved: {root_results}")
 
     print(f"\n{'=' * 70}", flush=True)
-    print(f"DONE — Integer EBM Re-ranker v76f")
+    print(f"DONE — Integer EBM Re-ranker v76g")
     print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
     print(f"Discriminative accuracy: {disc_acc.get('overall_accuracy', 0.0):.3f}")
     print(f"Base PPL: {ppl_stats.get('base_ppl', float('inf')):.2f}")
     print(f"Re-ranked PPL: {ppl_stats.get('reranked_ppl', float('inf')):.2f}")
+    print(f"Alpha: {engine.dam_alpha:.1f}, Beta: {engine.rerank_beta}")
     print(f"Results: {output_dir}")
     print(f"{'=' * 70}", flush=True)
 
