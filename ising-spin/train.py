@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v87 — Raw Energy + Higher NCE Rate)
+Integer Language Model — Training Script (v88 — Coordinated Energy)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v87 FIXES over v86 (PPL 14.16 — still worse than v83's 13.77):
-  v86 added per-feature z-score normalization to balance feature scales.
-  Result: PPL 14.16, slightly better than v85 (14.27) but still behind v83 (13.77).
+v88 FIXES over v87 (PPL 14.46 — worse than v83's 13.77):
+  Since v84, we kept two changes that v83 didn't have:
+  1. Per-feature class-balanced negatives — fragments the energy landscape
+  2. nce_rate subsampling (0.02-0.50) — weakens class features
 
-  ROOT CAUSE: Per-feature normalization was HARMFUL:
-  1. Destroyed mean signal (centering at 0 loses discriminative direction)
-  2. Double normalization (per-feature + global) over-compressed energy
-  3. Calibration weight search already handles relative feature scaling
+  v83 worked because ALL features shared the same negatives and all had
+  nce_rate=1.0. Class features saturated at ±100 but that was fine.
 
-  FIX: Remove per-feature normalization. Use RAW energies like v83.
-  Also: increase class nce_rate from 0.10 → 0.50 (5x more updates).
-  This gives class features much more signal, pushing values near ±50
-  saturation but providing useful discriminative energy.
+  FIX: Return to v83's COORDINATED training dynamics:
+  - All features at nce_rate=1.0 (no subsampling)
+  - All features share the same negatives (balanced by primary class only)
+  - Expanded alpha grid up to 2.0 (was capped at 0.5)
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
@@ -201,7 +200,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v87 — Raw Energy + Higher NCE Rate)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v88 — Coordinated Energy)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -227,9 +226,9 @@ def main():
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
     parser.add_argument("--cls-clip", type=int, default=50,
-                        help="Clip for class features (v87: clip=50, nce_rate=0.50)")
-    parser.add_argument("--cls-nce-rate", type=float, default=0.50,
-                        help="NCE subsampling rate for class features (v87: 0.50 = update on 50%% of pairs)")
+                        help="Clip for class features (v88: clip=50, nce_rate=1.0)")
+    parser.add_argument("--cls-nce-rate", type=float, default=1.0,
+                        help="NCE subsampling rate for class features (v88: 1.0 = update on all pairs, coordinated training)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -266,7 +265,7 @@ def main():
             "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
             "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-            "cls_tri_freq",  # v84+, kept through v87
+            "cls_tri_freq",  # v84+, kept through v88
             "lex_tri",
         ]
         if not use_dist:
@@ -284,7 +283,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v87 — Raw Energy + Higher NCE Rate", flush=True)
+    print("INTEGER LANGUAGE MODEL v88 — Coordinated Energy", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -445,7 +444,7 @@ def main():
     t_total = time.time() - t0
     results = {
         "version": "2.5.0",
-        "architecture": "Integer Language Model v87 — Raw Energy + Higher NCE Rate",
+        "architecture": "Integer Language Model v88 — Coordinated Energy",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -481,7 +480,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v87")
+    print(f"DONE — Integer Language Model v88")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

@@ -4,7 +4,7 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v87 — Raw Energy + Higher NCE Rate):
+Architecture (v88 — Coordinated Energy):
   1. BigramModel: P(word | prev) from integer counts (the base)
   2. Dynamic FeatureHashEnergy: MULTI-CLASS features
      - Multiple word class systems running simultaneously
@@ -15,10 +15,13 @@ Architecture (v87 — Raw Energy + Higher NCE Rate):
   4. Metropolis gate: hard-reject high-energy candidates
   5. Repetition penalty: unigram + bigram SOFT exponential decay
 
-v87 FIXES over v86 (PPL 14.16 — still worse than v83's 13.77):
-  - Removed per-feature z-score normalization (was harmful: destroyed mean
-    signal and over-compressed energy with double normalization)
-  - Increased class nce_rate from 0.10 → 0.50 (stronger signal in class features)
+v88 FIXES over v87 (PPL 14.46 — worse than v83's 13.77):
+  - Returned to v83's COORDINATED training dynamics:
+    - All features at nce_rate=1.0 (no subsampling)
+    - Shared negatives for all features (balanced by primary class only)
+  - Expanded alpha grid: added 1.0 and 2.0 (was capped at 0.5)
+  - Class features will saturate at ±100 — this is expected and FINE (v83 worked)
+  - Root cause since v84: per-feature negatives fragmented the energy landscape
 
 v83 FIXES (preserved):
   - Disc-aware weight pruning: features with disc < 0.60 get weight=0
@@ -174,9 +177,8 @@ class IntegerLM:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
 
-        v87: Per-feature z-score normalization REMOVED.
-        Was harmful: destroyed mean signal and over-compressed energy.
-        Now uses raw energies + global z-score only (like v83).
+        v88: Expanded alpha grid (up to 2.0) to allow stronger energy correction.
+        Raw energies + global z-score normalization (like v83).
 
         v83 IMPROVEMENTS (preserved):
         - Disc-aware weight pruning: features with disc < 0.60 get weight=0
@@ -186,7 +188,7 @@ class IntegerLM:
         """
         print("  Calibrating...", flush=True)
 
-        # v87: Compute per-feature stats for diagnostics only (NOT for normalization)
+        # v88: Compute per-feature stats for diagnostics only (NOT for normalization)
         self._compute_feature_stats(sequences)
 
         # Collect energy samples for GLOBAL normalization
@@ -206,7 +208,7 @@ class IntegerLM:
 
         print(f"    Energy: mean={self._e_mean:.1f}, std={self._e_std:.1f}", flush=True)
 
-        # v87: Print raw per-feature energy stats for diagnostics
+        # v88: Print per-feature energy stats for diagnostics
         if self.energy.feature_stats:
             print(f"    Per-feature stats (diagnostics only, NOT used for normalization):", flush=True)
             for fname, stats in self.energy.feature_stats.items():
@@ -255,9 +257,9 @@ class IntegerLM:
             if n_pruned > 0:
                 print(f"    Pruned {n_pruned} weak features (disc < 0.60)", flush=True)
 
-        # Phase 1: Search alpha
+        # Phase 1: Search alpha — v88: expanded grid up to 2.0
         best_alpha, best_acc = self.alpha, 0.0
-        for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:
+        for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]:
             acc = self._eval_rerank(rerank_data, alpha)
             if acc > best_acc:
                 best_acc, best_alpha = acc, alpha
@@ -338,12 +340,12 @@ class IntegerLM:
 
     def _compute_feature_stats(self, sequences: List[List[int]]):
         """
-        v87: Compute per-feature mean and std for DIAGNOSTICS ONLY.
+        v88: Compute per-feature mean and std for DIAGNOSTICS ONLY.
 
         These stats are printed during calibration for debugging but are
-        NOT used for normalization (v86's per-feature z-score was harmful).
-        The raw energies are combined directly, and the global z-score
-        normalization in _compute_legd_probs handles the overall scale.
+        NOT used for normalization. The raw energies are combined directly,
+        and the global z-score normalization in _compute_legd_probs handles
+        the overall scale.
         """
         feature_energies = {feat.name: [] for feat in self.energy.features.values()}
 
@@ -363,7 +365,7 @@ class IntegerLM:
                     feature_energies[feat.name].append(float(e[0]))
                 n_samples += 1
 
-        # v87: Store for diagnostics only — NOT used for normalization
+        # v88: Store for diagnostics only — NOT used for normalization
         self.energy.feature_stats = {}
         for feat in self.energy.features.values():
             vals = feature_energies[feat.name]
@@ -403,7 +405,7 @@ class IntegerLM:
         lps_scaled = log_probs / temperature
         base_probs = np.exp(lps_scaled - np.max(lps_scaled))
 
-        # Hash energy (v87: raw, no per-feature normalization)
+        # Hash energy (v88: raw weighted sum, no per-feature normalization)
         hash_e = self.energy.compute_local_energy_batch(context, candidates)
         h_norm = (hash_e - self._e_mean) / max(1.0, self._e_std)
 

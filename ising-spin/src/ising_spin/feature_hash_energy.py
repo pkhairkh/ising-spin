@@ -1,51 +1,28 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v87 RAW ENERGY + HIGHER NCE RATE.
+Dynamic Feature-Hashed Integer Energy Table — v88 COORDINATED ENERGY.
 
-v86 FIXES over v85 (PPL 14.27 — still worse than v83's 13.77):
-  v85's NCE subsampling (nce_rate=0.02) fixed saturation but made class features
-  too weak: std=10 vs lexical std=78. After global z-score normalization, class
-  features contributed only ~1.7% of energy variance — effectively noise.
+v88 DIAGNOSIS over v84–v87 (PPL 14.16–15.07, all worse than v83's 13.77):
+  Since v84, we kept two changes that v83 didn't have:
+  1. Per-feature class-balanced negatives — each feature gets negatives
+     balanced by its own class system. This fragments the energy landscape:
+     features trained on different negatives learn different baselines,
+     making them less coordinated at inference.
+  2. nce_rate subsampling (0.02–0.50) — weakens or distorts class features
+     relative to lexical features.
 
-  ROOT CAUSE: Feature scale mismatch. Lexical features (4M unique patterns,
-  sparse updates) and class features (441 patterns, dense updates) operate on
-  completely different scales. Summing them directly lets lexical features
-  dominate, making class features irrelevant regardless of their weight.
+  v83 worked because ALL features shared the same negatives (balanced by
+  the primary class system) and all had nce_rate=1.0. Class features
+  saturated at ±100, but the saturated binary signal was still useful,
+  and the alpha/weight calibration worked with it.
 
-  FIX: Per-feature z-score normalization BEFORE combining energies.
-  E = Σ weight_f × (E_f − mean_f) / std_f
+  FIX: Return to v83's COORDINATED training dynamics:
+  - All features at nce_rate=1.0 (no subsampling)
+  - All features share the same negatives (balanced by primary class only)
+  - Class features will saturate at ±100 — this is EXPECTED and FINE
+  - The global z-score normalization + alpha/weight grid search handles it
 
-  This normalizes each feature to unit variance, so the weight grid search
-  can find the optimal balance. A weight of 1.0 now means "contribute 1 std"
-  regardless of whether the feature has raw values in [-200,200] or [-20,20].
-
-  Also: increased nce_rate from 0.02 → 0.10 for class features (stronger signal
-  while still preventing saturation).
-
-v85 FIXES (preserved):
-  unique patterns (21×21 freq bigrams) but receive ~1.3M NCE updates per
-  epoch. That's ~2950 updates per pattern, vs ~0.3 for lexical features
-  (2000×2000=4M patterns). Any clip level will saturate under this pressure.
-
-  FIX: Per-feature NCE SUBSAMPLING. Class features only participate in a
-  fraction of NCE updates (controlled by nce_rate parameter). With
-  nce_rate=0.02, class features update on 2% of training pairs, giving
-  ~59 updates per pattern per epoch (vs 2950). This keeps values well
-  within clip=50 bounds and allows the transition matrix to show
-  meaningful variation between classes.
-
-  MATH: With nce_rate=0.02, 3 epochs, ~441 patterns:
-    - Total updates per pattern: 59 × 3 = 177
-    - Expected std of values: √177 ≈ 13.3
-    - Values stay in [-40, 40] range → well within clip=50
-
-  Other v84 changes preserved (good ideas, just didn't fix saturation):
-  - cls_tri_freq feature (freq-class trigram) — KEPT
-  - Per-feature class-balanced negatives — KEPT
-  - Softer bigram repetition penalty — KEPT
-
-  Reverted from v84:
-  - Class feature clips: 200 → 50 (back to v83 values)
-  - Adaptive clip: removed sqrt(n_classes) scaling (back to v83 formula)
+  Also: expanded alpha grid in integer_lm.py (0.5 → 2.0 cap) to allow
+  stronger energy correction when the energy is well-scaled.
 
 v83 FIXES (preserved):
   - Adaptive clip with hard upper bound (was no-op in v82)
@@ -73,18 +50,18 @@ AVAILABLE FEATURES:
     ClassWordSkipFeature   — hash(prev2_class, cand_word) [class_key selectable]
     WordClassSkipFeature   — hash(prev2_word, cand_class) [class_key selectable]
 
-DEFAULT FEATURE SET (v87):
+DEFAULT FEATURE SET (v88):
   LexBigramFeature(class_key=None, nce_rate=1.0),              # pure lexical
-  WordClassBigramFeature(class_key="freq", nce_rate=0.50),     # freq word→class
-  ClassWordBigramFeature(class_key="freq", nce_rate=0.50),     # freq class→word
+  WordClassBigramFeature(class_key="freq", nce_rate=1.0),      # freq word→class
+  ClassWordBigramFeature(class_key="freq", nce_rate=1.0),      # freq class→word
   LexSkipFeature(class_key=None, nce_rate=1.0),               # pure lexical skip
-  WordClassBigramFeature(class_key="dist", nce_rate=0.50),     # dist word→class
-  ClassWordBigramFeature(class_key="dist", nce_rate=0.50),     # dist class→word
-  ClassTrigramFeature(class_key="dist", nce_rate=0.50),        # dist class 3-gram
-  ClassTrigramFeature(class_key="freq", nce_rate=0.50),        # freq class 3-gram
+  WordClassBigramFeature(class_key="dist", nce_rate=1.0),      # dist word→class
+  ClassWordBigramFeature(class_key="dist", nce_rate=1.0),      # dist class→word
+  ClassTrigramFeature(class_key="dist", nce_rate=1.0),         # dist class 3-gram
+  ClassTrigramFeature(class_key="freq", nce_rate=1.0),         # freq class 3-gram
   LexTrigramFeature(class_key=None, nce_rate=1.0),             # pure lexical 3-gram
 
-  9 features total: 3 lexical (nce_rate=1.0) + 6 class (nce_rate=0.50)
+  9 features total: ALL at nce_rate=1.0 (coordinated training)
 
 ADD YOUR OWN FEATURE:
   1. Subclass FeatureSpec, set class_key
@@ -505,7 +482,7 @@ class ClassWordBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.50):
+                 weight=0.5, class_key="freq", nce_rate=1.0):
         name = f"cls_word_bi_{class_key}" if class_key else "cls_word_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -533,7 +510,7 @@ class WordClassBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.50):
+                 weight=0.5, class_key="freq", nce_rate=1.0):
         name = f"word_cls_bi_{class_key}" if class_key else "word_cls_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -560,7 +537,7 @@ class ClassTrigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.50):
+                 weight=0.5, class_key="freq", nce_rate=1.0):
         name = f"cls_tri_{class_key}" if class_key else "cls_tri"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -590,7 +567,7 @@ class ClassWordSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.50):
+                 weight=0.3, class_key="freq", nce_rate=1.0):
         name = f"cls_word_skip_{class_key}" if class_key else "cls_word_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -618,7 +595,7 @@ class WordClassSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.50):
+                 weight=0.3, class_key="freq", nce_rate=1.0):
         name = f"word_cls_skip_{class_key}" if class_key else "word_cls_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -656,16 +633,16 @@ def default_features(
     include_dist: bool = True,
 ) -> List[FeatureSpec]:
     """
-    Create the recommended default feature set for v87.
+    Create the recommended default feature set for v88.
 
     MULTI-CLASS: Features use BOTH frequency buckets AND distributional
     clusters simultaneously. This gives the model access to:
     - Frequency-based patterns (importance, gradient)
     - Syntax-based patterns (part-of-speech-like, from data)
 
-    v86 CHANGES over v85:
-    - Increased class feature nce_rate from 0.02 → 0.10 (stronger signal)
-    - Per-feature z-score normalization now balances feature contributions
+    v88 CHANGES over v87:
+    - ALL features at nce_rate=1.0 (coordinated training, like v83)
+    - No per-feature negative sampling (shared negatives for coordination)
 
     Default 9 features:
       Lexical (3) — nce_rate=1.0:
@@ -673,12 +650,12 @@ def default_features(
         - LexSkipFeature: skip-gram
         - LexTrigramFeature: 3-gram collocations
 
-      Frequency bucket class (3) — nce_rate=0.02:
+      Frequency bucket class (3) — nce_rate=1.0:
         - WordClassBigramFeature(class_key="freq"): word→freq-class
         - ClassWordBigramFeature(class_key="freq"): freq-class→word
         - ClassTrigramFeature(class_key="freq"): freq-class 3-gram
 
-      Distributional cluster class (3) — nce_rate=0.02:
+      Distributional cluster class (3) — nce_rate=1.0:
         - WordClassBigramFeature(class_key="dist"): word→dist-cluster
         - ClassWordBigramFeature(class_key="dist"): dist-cluster→word
         - ClassTrigramFeature(class_key="dist"): dist-cluster 3-gram
@@ -691,15 +668,15 @@ def default_features(
             n_hashes=3, table_size=lex_table_size,
             eta=1, clip=100, weight=1.0, nce_rate=1.0,
         ),
-        # Frequency bucket class features — v87: clip=50, nce_rate=0.50
-        # (nce_rate=0.50 = 50% of pairs, values approach ±50 but not all rows identical)
+        # Frequency bucket class features — v88: clip=50, nce_rate=1.0
+        # (coordinated training — same rate as lexical features, like v83)
         WordClassBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=1.0,
         ),
         ClassWordBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=1.0,
         ),
         # Lexical skip
         LexSkipFeature(
@@ -709,19 +686,19 @@ def default_features(
     ]
 
     if include_dist:
-        # Distributional cluster class features — v87: clip=50, nce_rate=0.50
+        # Distributional cluster class features — v88: clip=50, nce_rate=1.0
         features.extend([
             WordClassBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=1.0,
             ),
             ClassWordBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=1.0,
             ),
             ClassTrigramFeature(
                 n_hashes=2, table_size=class_tri_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=1.0,
             ),
         ])
 
@@ -729,7 +706,7 @@ def default_features(
     features.append(
         ClassTrigramFeature(
             n_hashes=2, table_size=class_tri_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=1.0,
         )
     )
 
@@ -787,9 +764,8 @@ class FeatureHashEnergyTable:
         self.seed = seed
         self.features: OrderedDict[str, FeatureSpec] = OrderedDict()
 
-        # v87: Per-feature normalization REMOVED — was harmful (destroyed mean signal)
-        # Global z-score normalization in _compute_legd_probs is sufficient
-        self.feature_stats: Dict[str, Dict[str, float]] = {}  # kept for API compat, unused
+        # v88: Per-feature stats kept for diagnostics only
+        self.feature_stats: Dict[str, Dict[str, float]] = {}  # diagnostics only
 
         # Primary class system for balanced negative sampling
         # Use the first available class system (usually "freq")
@@ -850,15 +826,10 @@ class FeatureHashEnergyTable:
         """
         Compute total local energy for all candidates given context.
 
-        v86: Per-feature z-score normalization BEFORE combining.
-        E = sum_features(weight_f * (E_f - mean_f) / std_f)
-
-        This ensures each feature contributes proportionally regardless of
-        its absolute scale. Without normalization, lexical features (std~78)
-        dominate class features (std~10), making class features irrelevant.
-
-        Stats are computed during calibration. If not yet calibrated,
-        falls back to raw (unnormalized) combination.
+        v88: Raw weighted energy sum — no per-feature normalization.
+        The global z-score normalization in _compute_legd_probs handles scaling.
+        All features are trained with coordinated dynamics (shared negatives,
+        same nce_rate=1.0), so raw energy values are naturally balanced.
 
         Each feature uses its own class array (determined by class_key).
         Returns float64 energy array. Lower = more likely = better.
@@ -880,7 +851,7 @@ class FeatureHashEnergyTable:
         context_word_ids: List[int],
         candidate: int,
     ) -> float:
-        """Scalar version for single candidate. v87: raw energy, no per-feature norm."""
+        """Scalar version for single candidate. v88: raw weighted energy."""
         if not context_word_ids:
             return 0.0
 
@@ -1026,86 +997,44 @@ class FeatureHashEnergyTable:
                 for key, (pc, tc, p2c) in perm_class.items():
                     chunk_class[key] = (pc[c0:c1], tc[c0:c1], p2c[c0:c1])
 
-                # Positive updates — with v85 NCE SUBSAMPLING
-                # For each feature, only update on a random fraction of pairs
-                # (controlled by feat.nce_rate). This prevents class features
-                # from saturating due to update density mismatch.
+                # Positive updates — v88: ALL features update on ALL pairs (nce_rate=1.0)
+                # No subsampling — coordinated training like v83.
                 for feat in self.features.values():
                     ckey = feat.class_key or self.primary_class_key
                     cpc, ctc, cp2c = chunk_class.get(ckey, (None, None, None))
                     if cpc is None:
                         continue
 
-                    # v85: NCE subsampling — skip pairs probabilistically
-                    if feat.nce_rate < 1.0:
-                        sub_mask = rng.random(C) < feat.nce_rate
-                        if not np.any(sub_mask):
-                            continue
-                        sub_cp = cp[sub_mask]
-                        sub_cpc = cpc[sub_mask]
-                        sub_ct = ct[sub_mask]
-                        sub_ctc = ctc[sub_mask]
-                        sub_cp2 = cp2[sub_mask]
-                        sub_cp2c = cp2c[sub_mask] if cp2c is not None else None
-                        sub_chp2 = chp2[sub_mask]
-                    else:
-                        sub_cp = cp; sub_cpc = cpc; sub_ct = ct; sub_ctc = ctc
-                        sub_cp2 = cp2; sub_cp2c = cp2c; sub_chp2 = chp2
-
                     feat.nce_positive(
-                        sub_cp, sub_cpc, sub_ct, sub_ctc,
-                        prev2_words=sub_cp2, prev2_class=sub_cp2c, mask=sub_chp2,
+                        cp, cpc, ct, ctc,
+                        prev2_words=cp2, prev2_class=cp2c, mask=chp2,
                     )
 
-                # Negative updates — v85: PER-FEATURE class-balanced negatives + subsampling
-                # Each feature gets negatives balanced by its OWN class system
-                # AND subsampled at its own nce_rate.
+                # Negative updates — v88: SHARED negatives for all features
+                # All features use the SAME negatives (balanced by primary class system).
+                # This creates a coordinated energy landscape (like v83).
                 for _ in range(n_negatives):
-                    # Sample one set of negatives per primary class system
+                    # Sample negatives balanced by primary class system
                     neg, neg_class_dict = self._sample_balanced_negatives(rng, C)
 
                     for feat in self.features.values():
                         ckey = feat.class_key or self.primary_class_key
-
-                        # v84: Also sample feature-specific negatives if class_key differs
-                        if feat.class_key and feat.class_key != self.primary_class_key:
-                            feat_neg, feat_neg_cls_dict = self._sample_balanced_negatives(
-                                rng, C, class_key=feat.class_key,
-                            )
-                        else:
-                            feat_neg, feat_neg_cls_dict = neg, neg_class_dict
-
                         _, ctc, cp2c = chunk_class.get(ckey, (None, None, None))
-                        feat_neg_cls = feat_neg_cls_dict.get(ckey)
+                        feat_neg_cls = neg_class_dict.get(ckey)
                         if ctc is None or feat_neg_cls is None:
                             continue
                         cpc_pos, _, cp2c_pos = chunk_class.get(ckey, (None, None, None))
 
-                        # v85: NCE subsampling for negative updates too
-                        if feat.nce_rate < 1.0:
-                            sub_mask = rng.random(C) < feat.nce_rate
-                            if not np.any(sub_mask):
-                                continue
-                            sub_cp = cp[sub_mask]
-                            sub_cpc_pos = cpc_pos[sub_mask]
-                            sub_feat_neg = feat_neg[sub_mask]
-                            sub_feat_neg_cls = feat_neg_cls[sub_mask]
-                            sub_cp2 = cp2[sub_mask]
-                            sub_cp2c_pos = cp2c_pos[sub_mask] if cp2c_pos is not None else None
-                            sub_chp2 = chp2[sub_mask]
-                        else:
-                            sub_cp = cp; sub_cpc_pos = cpc_pos
-                            sub_feat_neg = feat_neg; sub_feat_neg_cls = feat_neg_cls
-                            sub_cp2 = cp2; sub_cp2c_pos = cp2c_pos; sub_chp2 = chp2
-
+                        # v88: No subsampling — all features update on all pairs (nce_rate=1.0)
                         feat.nce_negative(
-                            sub_cp, sub_cpc_pos, sub_feat_neg, sub_feat_neg_cls,
-                            prev2_words=sub_cp2, prev2_class=sub_cp2c_pos, mask=sub_chp2,
+                            cp, cpc_pos, neg, feat_neg_cls,
+                            prev2_words=cp2, prev2_class=cp2c_pos, mask=chp2,
                         )
 
             t_elapsed = _time.time() - t0
 
-            # Clip all features (adaptive) — v85: simple formula, nce_rate handles saturation
+            # Clip all features (adaptive) — v88: with nce_rate=1.0, class features
+            # will saturate at ±100 but this is expected and fine (like v83)
             for feat in self.features.values():
                 feat.adaptive_clip(percentile=99)
 
