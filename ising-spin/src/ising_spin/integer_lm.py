@@ -4,29 +4,29 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v81 — Data-Driven Classes):
+Architecture (v82 — Multi-Class):
   1. BigramModel: P(word | prev) from integer counts (the base)
-  2. Dynamic FeatureHashEnergy: variable features with DATA-DRIVEN classes
-     - Each feature is a self-contained FeatureSpec (own tables, eta, clip, weight)
+  2. Dynamic FeatureHashEnergy: MULTI-CLASS features
+     - Multiple word class systems running simultaneously
+     - Frequency buckets ("freq") + distributional clusters ("dist")
+     - Each feature declares which class system it uses via class_key
      - add_feature() / remove_feature() for full flexibility
-     - Word classes from frequency buckets (NOT static POS tags!)
-     - Default: 6 features (lex_bi, word_cls_bi, cls_word_bi, lex_skip, cls_tri, lex_tri)
   3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
   4. Metropolis gate: hard-reject high-energy candidates
-  5. Repetition penalty: prevent loops
+  5. Repetition penalty: unigram + bigram n-gram blocking
 
-KEY CHANGES from v80:
-  - NO MORE POS DEPENDENCY IN FEATURES
-  - Word classes are DATA-DRIVEN (frequency buckets, K=20)
-  - Balanced classes instead of degenerate 88%-NOUN POS
-  - hash(word, class) has V*K=40000 keys vs hash(word, pos) with V*1≈2000
+KEY CHANGES from v81:
+  - MULTI-CLASS: features use BOTH freq buckets AND dist clusters
+  - Distributional clusters capture syntactic behavior (not just frequency)
+  - N-gram blocking: prevent repeated bigrams, not just unigrams
+  - Adaptive clipping: prevent energy saturation
 
 Generation loop (per step):
   1. Bigram model proposes top-K candidates with probabilities
-  2. Each feature computes its energy contribution
+  2. Each feature computes its energy contribution (using its class array)
   3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
   4. Metropolis gate zeros out candidates above threshold
-  5. Repetition penalty reduces probability of recent words
+  5. Repetition penalty reduces probability of recent words AND bigrams
   6. Sample from resulting distribution
 
 Training:
@@ -34,7 +34,7 @@ Training:
   2. NCE train all features (integer, with class-balanced negatives)
   3. Calibrate alpha (grid search on LEGD probs)
 
-Memory footprint: ~20 MB for V=2000. Runs anywhere.
+Memory footprint: ~25 MB for V=2000 with 8 features. Runs anywhere.
 """
 
 import numpy as np
@@ -49,7 +49,7 @@ from .vocabulary import Vocabulary, IDX2POS
 
 class IntegerLM:
     """
-    Pure Integer Language Model with Data-Driven Word Classes.
+    Pure Integer Language Model with Multi-Class Word System.
 
     No neural nets. No torch. No float32 matrix multiplies in the hot path.
     Just integer counting, hash table lookups, and LEGD probability adjustment.
@@ -59,7 +59,6 @@ class IntegerLM:
 
     Lower energy = more likely = higher probability.
     alpha controls how much the energy correction overrides the base model.
-    alpha=0: pure bigram model. alpha->inf: pure energy model.
     """
 
     def __init__(
@@ -74,6 +73,7 @@ class IntegerLM:
         metropolis_threshold: int = 0,
         rep_penalty: float = 3.0,
         rep_window: int = 5,
+        bigram_block_window: int = 3,
         # Bigram model
         smoothing_alpha: float = 1.0,
         log_prob_scale: int = 100,
@@ -93,11 +93,12 @@ class IntegerLM:
             seed=seed,
         )
 
-        # Feature hash energy — dynamic feature registry with DATA-DRIVEN classes
+        # Feature hash energy — MULTI-CLASS feature registry
+        # v82: pass ALL available class systems
+        word_classes = vocab.get_word_classes()
         self.energy = FeatureHashEnergyTable(
             vocab_size=self.V,
-            word_class=vocab.word_bucket,  # v81: frequency buckets, NOT word_pos
-            n_classes=vocab.n_buckets,
+            word_classes=word_classes,
             seed=seed,
         )
 
@@ -106,7 +107,8 @@ class IntegerLM:
             for feat in features:
                 self.energy.add_feature(feat)
         else:
-            for feat in default_features():
+            include_dist = "dist" in word_classes
+            for feat in default_features(include_dist=include_dist):
                 self.energy.add_feature(feat)
 
         # Generation parameters
@@ -117,6 +119,7 @@ class IntegerLM:
         self.metropolis_threshold = metropolis_threshold
         self.rep_penalty = rep_penalty
         self.rep_window = rep_window
+        self.bigram_block_window = bigram_block_window  # v82: bigram n-gram blocking
 
         # Normalization stats (calibrated after training)
         self._e_mean = 0.0
@@ -165,6 +168,7 @@ class IntegerLM:
         Calibrate alpha, metropolis_threshold, and feature weights.
 
         Searches alpha in [0.001, 0.5] and feature weights independently.
+        v82: Also tries pruning features with weight=0.
         """
         print("  Calibrating...", flush=True)
 
@@ -213,7 +217,7 @@ class IntegerLM:
 
         print(f"    Best alpha: {best_alpha} (acc={best_acc:.3f})", flush=True)
 
-        # Phase 2: Search feature weights (only if there are features)
+        # Phase 2: Search feature weights (only if there are features with alpha > 0)
         best_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
         if len(self.energy.features) > 0 and best_alpha > 0:
             print(f"    Searching feature weights...", flush=True)
@@ -318,14 +322,34 @@ class IntegerLM:
             gate = hash_e > self.metropolis_threshold
             legd_weights[gate] = 0.0
 
-        # Repetition penalty
+        # Repetition penalty — unigram + bigram blocking
         if recent_words and self.rep_penalty > 0:
             recent = recent_words[-self.rep_window:]
+
+            # Unigram penalty (original)
             for i, cid in enumerate(candidates):
                 for j, pw in enumerate(recent):
                     if cid == pw:
                         recency = (len(recent) - j) / len(recent)
                         legd_weights[i] *= np.exp(-self.rep_penalty * recency / temperature)
+
+            # v82: Bigram blocking — prevent repeating recent bigrams
+            # If context[-1] → candidate appeared recently, penalize heavily
+            if len(recent_words) >= 2 and self.bigram_block_window > 0:
+                prev_word = recent_words[-1] if recent_words else None
+                if prev_word is not None:
+                    # Check recent bigrams
+                    for j in range(max(0, len(recent_words) - self.bigram_block_window),
+                                   len(recent_words) - 1):
+                        if recent_words[j] == prev_word:
+                            # This bigram (prev_word → next) appeared before
+                            next_word = recent_words[j + 1]
+                            for i, cid in enumerate(candidates):
+                                if cid == next_word:
+                                    # Heavy penalty for repeating a bigram
+                                    legd_weights[i] *= np.exp(
+                                        -self.rep_penalty * 2.0 / temperature
+                                    )
 
         # Normalize
         total = legd_weights.sum()
@@ -341,6 +365,7 @@ class IntegerLM:
     def generate(self, prompt_ids: List[int], length: int = 100) -> List[int]:
         """
         Generate text using LEGD-adjusted probability sampling.
+        v82: Includes bigram n-gram blocking.
         """
         generated = list(prompt_ids)
         for _ in range(length):
@@ -442,25 +467,29 @@ class IntegerLM:
 
         return {'accuracy': correct / max(1, total), 'comparisons': total}
 
-    def class_transition_matrix(self) -> np.ndarray:
+    def class_transition_matrix(self, class_key: Optional[str] = None) -> np.ndarray:
         """Return K×K class transition energy matrix for visualization."""
-        return self.energy.get_class_matrix()
+        return self.energy.get_class_matrix(class_key=class_key)
 
     def diagnostics(self) -> Dict:
         """Full diagnostic report."""
         e_stats = self.energy.statistics()
         b_stats = self.bigram.statistics()
         feat_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
+        feat_class_keys = {feat.name: feat.class_key for feat in self.energy.features.values()}
         return {
             'alpha': self.alpha,
             'temperature': self.temperature,
             'metropolis_threshold': self.metropolis_threshold,
             'rep_penalty': self.rep_penalty,
             'rep_window': self.rep_window,
+            'bigram_block_window': self.bigram_block_window,
             'n_features': e_stats['n_features'],
             'feature_names': e_stats['feature_names'],
             'feature_weights': feat_weights,
-            'n_classes': e_stats.get('n_classes', 0),
+            'feature_class_keys': feat_class_keys,
+            'class_systems': e_stats.get('class_systems', []),
+            'n_classes_map': e_stats.get('n_classes_map', {}),
             'energy_mean': self._e_mean,
             'energy_std': self._e_std,
             'calibrated': self._calibrated,

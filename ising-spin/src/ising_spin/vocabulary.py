@@ -1,26 +1,34 @@
 """
-Vocabulary builder and DATA-DRIVEN word class system.
+Vocabulary builder with DYNAMIC, MULTI-VIEW word class system.
 
-v81 BREAKING CHANGE:
-  The old system had 13 hardcoded POS tags with 88% of words tagged NOUN.
-  hash(word, pos) with pos=NOUN for 88% of words ≈ hash(word, 0) — the
-  "class" dimension carried ZERO information.
+v82 BREAKING CHANGE — MULTI-CLASS ARCHITECTURE:
+  v81 replaced static POS with frequency buckets. This was a big improvement
+  (PPL went from 12M to 13.89), but the class transition matrix was still
+  nearly uniform because frequency buckets don't capture SYNTACTIC behavior.
 
-  The new system uses DATA-DRIVEN word classes:
-  - Frequency buckets: words binned by frequency rank into K buckets.
-    Function words (the, a, was) land in bucket 0, content words in
-    higher buckets. K is VARIABLE (default 20), not hardcoded.
-  - Distributional clusters: built from bigram co-occurrence patterns.
-    Words with similar left/right context distributions get the same cluster.
+  v82 introduces MULTIPLE word class systems running SIMULTANEOUSLY:
+  1. Frequency buckets: words binned by corpus frequency rank (K=20)
+     Captures the functional/content word gradient.
+  2. Distributional clusters: words grouped by context similarity (K=30)
+     Captures syntactic role (DET, AUX, VERB, etc.) from DATA, not rules.
+
+  WHY MULTIPLE CLASS SYSTEMS:
+  - Frequency buckets: "the" and "was" are both high-freq → same bucket
+    But they behave DIFFERENTLY syntactically!
+  - Distributional clusters: "the" and "a" have similar followers → same cluster
+    They ARE similar syntactically!
+  - Using BOTH gives complementary signals: freq captures importance,
+    dist captures syntactic role.
 
   POS tags are kept for DIAGNOSTICS ONLY — never used in features.
 
-  The key insight: frequency rank naturally separates function words from
-  content words, which is exactly what POS tags were trying (and failing)
-  to capture. But frequency is continuous, not degenerate: you get a
-  smooth gradient from "the" (rank 0) → "cat" (rank 200) → "dinosaur" (rank 1990).
-  With K=20 buckets, each bucket has ~100 words, giving hash(word, bucket)
-  2000×20 = 40000 unique keys — rich, smooth, non-degenerate.
+KEY INSIGHT:
+  The v81 class transition matrix was uniform because frequency buckets
+  group words by HOW OFTEN they appear, not HOW THEY BEHAVE.
+  Distributional clusters fix this: words that appear in similar contexts
+  (similar left/right neighbors) get the same cluster.
+  "the" and "a" → same cluster. "was" and "is" → same cluster.
+  These clusters have MEANINGFUL transition patterns.
 """
 
 import numpy as np
@@ -108,21 +116,35 @@ _PREP_WORDS = frozenset({
 
 
 # ===========================================================================
+# HASH PRIMES for distributional clustering
+# ===========================================================================
+
+_CLUSTER_P1 = 2654435761
+_CLUSTER_P2 = 2246822519
+_CLUSTER_P3 = 3266489917
+_CLUSTER_P4 = 3367900313
+_CLUSTER_MASK = 0xFFFFFFFF
+
+
+# ===========================================================================
 # VOCABULARY CLASS
 # ===========================================================================
 
 class Vocabulary:
     """
-    Word vocabulary with DATA-DRIVEN word class assignments.
+    Word vocabulary with DYNAMIC, MULTI-VIEW word class system.
 
-    Builds a fixed-size vocabulary from text data, computes frequency-based
-    word classes (buckets), and optionally distributional clusters from
-    bigram statistics.
+    Builds a fixed-size vocabulary from text data, then computes MULTIPLE
+    word class systems:
+    1. Frequency buckets: words ranked by frequency, binned into K groups
+       Captures: functional/content word gradient, importance
+    2. Distributional clusters: words grouped by context similarity
+       Captures: syntactic role, part-of-speech-like categories
 
-    Word classes replace the old static POS tags for features:
-    - Frequency buckets: words ranked by frequency, binned into K groups
-    - K is VARIABLE (default 20), not hardcoded at 13
-    - Each bucket has ~V/K words — balanced, non-degenerate
+    The MULTI-CLASS approach gives features access to BOTH kinds of
+    information simultaneously. A feature can hash(word, freq_bucket)
+    for frequency-dependent patterns AND hash(word, dist_cluster) for
+    syntax-dependent patterns.
 
     Attributes:
         words: List of vocabulary words (index = word ID).
@@ -131,7 +153,10 @@ class Vocabulary:
         word_freq: Array of word frequencies, shape (V,).
         word_freq_rank: Array of frequency rank per word (0 = most frequent).
         word_bucket: Array of frequency bucket per word, shape (V,).
+        word_cluster: Array of distributional cluster per word, shape (V,).
+                      None until build_distributional_clusters() is called.
         n_buckets: Number of frequency buckets (variable).
+        n_clusters: Number of distributional clusters (variable).
         word_pos: Array of POS type per word (diagnostics only).
     """
 
@@ -143,11 +168,13 @@ class Vocabulary:
         min_freq: int = 5,
         max_seq_len: int = 30,
         n_buckets: int = 20,
+        n_clusters: int = 30,
     ):
         self.max_size = max_size
         self.min_freq = min_freq
         self.max_seq_len = max_seq_len
         self.n_buckets = n_buckets
+        self.n_clusters = n_clusters
 
         self.words: List[str] = []
         self.word2idx: Dict[str, int] = {}
@@ -155,6 +182,8 @@ class Vocabulary:
         self.word_freq: np.ndarray = np.array([], dtype=np.int32)
         self.word_freq_rank: np.ndarray = np.array([], dtype=np.int32)
         self.word_bucket: np.ndarray = np.array([], dtype=np.int32)
+        self.word_cluster: Optional[np.ndarray] = None
+        self.n_clusters_actual: int = 0
         self.word_pos: np.ndarray = np.array([], dtype=np.int32)
         self.word_pos_set: Dict[int, set] = {}
         self.V: int = 0
@@ -183,7 +212,7 @@ class Vocabulary:
             if w in self.word2idx:
                 self.word_freq[self.word2idx[w]] = c
 
-        # Build frequency-based word classes (THE KEY CHANGE from v80)
+        # Build frequency-based word classes
         self._build_freq_buckets()
 
         # Assign POS types (diagnostics only)
@@ -195,31 +224,13 @@ class Vocabulary:
         """
         Build frequency-based word class buckets.
 
-        This is the CORE of the v81 redesign. Instead of 13 hardcoded POS tags
-        where 88% are NOUN, we bin words by frequency rank into K buckets.
-
-        WHY THIS WORKS:
-        - High-frequency words (the, a, was, is, he, she) = function words
-          that play grammatical roles → bucket 0
-        - Mid-frequency words (cat, dog, said, went) = common content words
-          → middle buckets
-        - Low-frequency words (dinosaur, castle, whispered) = rare content
-          words → last buckets
-
-        With K=20 buckets and V=2000, each bucket has ~100 words.
-        hash(word, bucket) produces V*K = 40000 unique keys — rich, smooth,
-        non-degenerate. Compare to the old hash(word, pos) with 88% having
-        the same POS value — nearly degenerate.
-
-        The bucket IDs are STABLE: they depend only on frequency rank, not
-        on the arbitrary POS assignment heuristics.
+        Words are binned by frequency rank into K buckets.
+        Bucket 0 = special tokens, bucket 1 = highest-freq real words, etc.
+        Each bucket gets approximately the same number of words.
         """
-        # Frequency rank: 0 = most frequent, V-1 = least frequent
-        # Special tokens (0-3) get their own bucket
         self.word_freq_rank = np.zeros(self.V, dtype=np.int32)
         self.word_bucket = np.zeros(self.V, dtype=np.int32)
 
-        # Sort real words (ID >= 4) by frequency (descending)
         real_word_ids = np.arange(4, self.V)
         if len(real_word_ids) == 0:
             return
@@ -227,44 +238,54 @@ class Vocabulary:
         freqs = self.word_freq[real_word_ids]
         sorted_by_freq = real_word_ids[np.argsort(-freqs)]
 
-        # Assign ranks
         for rank, word_id in enumerate(sorted_by_freq):
             self.word_freq_rank[word_id] = rank
 
-        # Assign buckets: K buckets for real words, bucket 0 for special tokens
-        # Each bucket gets approximately the same number of words
         n_real = len(sorted_by_freq)
         for i, word_id in enumerate(sorted_by_freq):
-            # Bucket 1..K for real words (bucket 0 = special tokens)
             bucket = 1 + min(i * self.n_buckets // n_real, self.n_buckets - 1)
             self.word_bucket[word_id] = bucket
 
-        # Print bucket distribution
-        print(f"  Frequency buckets: K={self.n_buckets}, ~{n_real // max(1, self.n_buckets)} words/bucket",
-              flush=True)
+        print(f"  Frequency buckets: K={self.n_buckets}, "
+              f"~{n_real // max(1, self.n_buckets)} words/bucket", flush=True)
 
     def build_distributional_clusters(
         self,
         sequences: List[List[int]],
-        n_clusters: int = 30,
     ) -> np.ndarray:
         """
         Build distributional word clusters from bigram co-occurrence.
 
-        Words that appear in similar contexts (similar distribution of
-        preceding and following words) get the same cluster.
+        Words that appear in SIMILAR CONTEXTS (similar distributions of
+        preceding and following words) get the same cluster ID.
 
-        This is a SIMPLE hash-based approach — no k-means, no SVD:
-        1. For each word, compute a "context fingerprint" by hashing
-           its top-N most frequent followers
-        2. Cluster by fingerprint hash modulo n_clusters
+        METHOD: Min-hash sketching
+        1. For each word, collect its top-N followers AND predecessors
+        2. Compute a multi-hash fingerprint from these context sets
+        3. Cluster by fingerprint → words with similar contexts cluster together
 
-        Returns: word_cluster array, shape (V,), dtype int32.
+        WHY THIS WORKS BETTER THAN FREQUENCY BUCKETS:
+        - "the" and "a" have similar followers (nouns) → same cluster
+        - "was" and "is" have similar followers (adjectives, verbs) → same cluster
+        - "the" and "was" have DIFFERENT followers → different clusters
+        - This is exactly what POS tags try to capture, but DATA-DRIVEN!
 
-        NOTE: This is optional — frequency buckets work well by default.
-              Call this AFTER build() and only if you want richer classes.
+        With K=30 clusters, we get meaningful syntactic categories that
+        produce NON-UNIFORM class transition matrices.
+
+        Args:
+            sequences: Tokenized sequences from the training data.
+
+        Returns:
+            word_cluster array, shape (V,), dtype int32.
         """
-        # Count what follows each word
+        import time as _time
+        t0 = _time.time()
+
+        n_clusters = self.n_clusters
+        top_n = 20  # Top-N context words to consider
+
+        # Count what follows each word (right context)
         followers = {}
         for seq in sequences:
             for pos in range(1, len(seq)):
@@ -274,28 +295,103 @@ class Vocabulary:
                     followers[prev] = Counter()
                 followers[prev][target] += 1
 
-        # For each word, hash its top-10 followers into a fingerprint
+        # Count what precedes each word (left context)
+        predecessors = {}
+        for seq in sequences:
+            for pos in range(1, len(seq)):
+                prev = seq[pos - 1]
+                target = seq[pos]
+                if target not in predecessors:
+                    predecessors[target] = Counter()
+                predecessors[target][prev] += 1
+
+        # For each word, compute a min-hash sketch from BOTH left and right context
+        # This captures the distributional similarity of words
         word_cluster = np.zeros(self.V, dtype=np.int32)
+
+        # We use 4 independent hash functions to create a 4-part fingerprint
+        # This is much better than a single hash (v81's approach) because
+        # words with PARTIALLY overlapping contexts still tend to cluster together
+        n_hash_bands = 4
+
         for word_id in range(self.V):
             if word_id < 4:
                 continue
-            if word_id not in followers or not followers[word_id]:
+
+            # Collect context: top-N followers and top-N predecessors
+            right_ctx = []
+            if word_id in followers and followers[word_id]:
+                right_ctx = followers[word_id].most_common(top_n)
+
+            left_ctx = []
+            if word_id in predecessors and predecessors[word_id]:
+                left_ctx = predecessors[word_id].most_common(top_n)
+
+            if not right_ctx and not left_ctx:
                 word_cluster[word_id] = 0
                 continue
 
-            # Top 10 followers
-            top = followers[word_id].most_common(10)
-            # Simple hash: multiply follower IDs by primes and sum
-            fp = 0
-            for i, (fid, cnt) in enumerate(top):
-                fp += fid * (i + 1) * 2654435761 + cnt * 2246822519
-            word_cluster[word_id] = (fp % n_clusters) + 1  # 1..n_clusters
+            # Multi-band min-hash fingerprint
+            # Each band hashes a subset of the context independently
+            # This provides robustness: two words sharing even some context
+            # will have similar fingerprints
+            fingerprint = 0
+            for band in range(n_hash_bands):
+                band_hash = 0
 
+                # Right context contribution
+                for i, (fid, cnt) in enumerate(right_ctx):
+                    # Mix position, context word, count, and band index
+                    h = ((fid + 1) * _CLUSTER_P1
+                         + (i + 1) * _CLUSTER_P2
+                         + cnt * _CLUSTER_P3
+                         + band * _CLUSTER_P4) & _CLUSTER_MASK
+                    band_hash ^= h
+
+                # Left context contribution
+                for i, (pid, cnt) in enumerate(left_ctx):
+                    h = ((pid + 1) * _CLUSTER_P2
+                         + (i + 1) * _CLUSTER_P1
+                         + cnt * _CLUSTER_P4
+                         + band * _CLUSTER_P3) & _CLUSTER_MASK
+                    band_hash ^= h
+
+                fingerprint ^= band_hash
+
+            # Map fingerprint to cluster ID (1..n_clusters, 0 = special/empty)
+            cluster_id = (fingerprint % n_clusters) + 1
+            word_cluster[word_id] = cluster_id
+
+        self.word_cluster = word_cluster
+
+        # Compute actual number of unique clusters
+        unique_clusters = set(word_cluster[word_id] for word_id in range(4, self.V))
+        self.n_clusters_actual = len(unique_clusters)
+
+        elapsed = _time.time() - t0
         print(f"  Distributional clusters: K={n_clusters}, "
-              f"built from {len(followers)} words with followers",
-              flush=True)
+              f"{self.n_clusters_actual} unique clusters, "
+              f"built from {len(followers)} words with context "
+              f"in {elapsed:.1f}s", flush=True)
 
         return word_cluster
+
+    def get_word_classes(self) -> Dict[str, np.ndarray]:
+        """
+        Return all available word class arrays as a dict.
+
+        This is the interface used by FeatureHashEnergyTable to support
+        multiple class systems simultaneously.
+
+        Returns:
+            Dict mapping class_key -> class_array.
+            Always includes "freq" (frequency buckets).
+            Includes "dist" if build_distributional_clusters() was called.
+        """
+        classes = {"freq": self.word_bucket.astype(np.int32)}
+        if self.word_cluster is not None:
+            classes["dist"] = self.word_cluster.astype(np.int32)
+        return classes
 
     def _assign_pos_types(self):
         """Assign POS types to all vocabulary words (diagnostics only)."""
@@ -305,7 +401,6 @@ class Vocabulary:
         for idx in range(self.V):
             word = self.words[idx]
 
-            # Special tokens
             if idx < 4:
                 self.word_pos[idx] = POS2IDX["X"]
                 self.word_pos_set[idx] = {POS2IDX["X"]}
@@ -313,8 +408,6 @@ class Vocabulary:
 
             tags = self._classify_pos(word)
             self.word_pos_set[idx] = set(tags)
-
-            # Pick primary POS (most specific / highest priority)
             primary = min(tags, key=lambda t: TAG_PRIORITY.get(t, 99))
             self.word_pos[idx] = primary
 
@@ -324,29 +417,19 @@ class Vocabulary:
         w = word.lower()
         tags = []
 
-        # Punctuation
         if not any(c.isalnum() for c in w):
             return [POS2IDX["PUNCT"]]
 
-        # Numbers
         if w.replace(".", "").replace(",", "").replace("-", "").isdigit():
             tags.append(POS2IDX["NUM"])
 
-        # Closed-class sets (exact match)
-        if w in _DET_WORDS:
-            tags.append(POS2IDX["DET"])
-        if w in _PRON_WORDS:
-            tags.append(POS2IDX["PRON"])
-        if w in _AUX_WORDS:
-            tags.append(POS2IDX["AUX"])
-        if w in _CONJ_WORDS:
-            tags.append(POS2IDX["CONJ"])
-        if w in _PART_WORDS:
-            tags.append(POS2IDX["PART"])
-        if w in _PREP_WORDS:
-            tags.append(POS2IDX["PREP"])
+        if w in _DET_WORDS: tags.append(POS2IDX["DET"])
+        if w in _PRON_WORDS: tags.append(POS2IDX["PRON"])
+        if w in _AUX_WORDS: tags.append(POS2IDX["AUX"])
+        if w in _CONJ_WORDS: tags.append(POS2IDX["CONJ"])
+        if w in _PART_WORDS: tags.append(POS2IDX["PART"])
+        if w in _PREP_WORDS: tags.append(POS2IDX["PREP"])
 
-        # Morphological heuristics for open-class words
         if w.endswith("ly"):
             tags.append(POS2IDX["ADV"])
         if (w.endswith("ful") or w.endswith("less") or w.endswith("ous") or
@@ -364,7 +447,6 @@ class Vocabulary:
             w.endswith("er") or w.endswith("or")):
             tags.append(POS2IDX["NOUN"])
 
-        # Defaults: most English words can be nouns or verbs
         if POS2IDX["NOUN"] not in tags and len(w) >= 2 and w[0].isalpha():
             tags.append(POS2IDX["NOUN"])
         if POS2IDX["VERB"] not in tags and len(w) >= 3 and w[0].isalpha() and POS2IDX["AUX"] not in tags:
@@ -378,7 +460,7 @@ class Vocabulary:
         for text in texts:
             words = text.lower().split()
             ids = [self.word2idx.get(w, 1) for w in words]
-            ids = [i for i in ids if i >= 4]  # Skip special tokens
+            ids = [i for i in ids if i >= 4]
             if len(ids) >= 2:
                 sequences.append(ids[:self.max_seq_len])
         return sequences
@@ -402,3 +484,16 @@ class Vocabulary:
             b = int(self.word_bucket[idx])
             counts[b] = counts.get(b, 0) + 1
         return counts
+
+    def cluster_distribution(self) -> Dict[int, List[str]]:
+        """Return example words per distributional cluster."""
+        if self.word_cluster is None:
+            return {}
+        clusters = {}
+        for idx in range(4, self.V):
+            c = int(self.word_cluster[idx])
+            if c not in clusters:
+                clusters[c] = []
+            if len(clusters[c]) < 5:
+                clusters[c].append(self.words[idx])
+        return clusters

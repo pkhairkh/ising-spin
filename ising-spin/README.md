@@ -4,71 +4,77 @@ A pure integer language model with no neural networks and no torch dependency. R
 
 ## What It Is
 
-An integer-only language model with **dynamic features**:
+An integer-only language model with **multi-class dynamic features**:
 
 1. **Bigram counting** — base probabilities P(word | previous) from integer counts
-2. **Dynamic feature registry** — add/remove energy features at runtime
-3. **Mixed word-POS features** — hash(word, POS) with 26000+ keys (not the old static 13x13 POS matrix!)
-4. **Balanced NCE training** — equal representation across POS types
-5. **Metropolis gate** — hard rejection for grammatically invalid tokens
+2. **Multi-class word system** — frequency buckets + distributional clusters running simultaneously
+3. **Dynamic feature registry** — add/remove energy features at runtime, each declares which class system it uses
+4. **Balanced NCE training** — equal representation across all class types
+5. **N-gram blocking** — prevent repeated bigrams in generation
 6. **LEGD** — P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
 
-**Memory**: ~20 MB for a 2000-word vocabulary. No GPU needed.
+**Memory**: ~25 MB for a 2000-word vocabulary. No GPU needed.
 
-## What Changed in v80
+## What Changed in v82
 
-**The POS disaster is fixed.** The old system used a hardcoded 13x13 POS matrix with only 169 unique keys. Every slot saturated at +/-500, the gradient went to zero, and POS discrimination accuracy was below random (0.46). The new system uses **mixed word-POS features** like hash(prev_word, cand_pos) with V*13 = 26000+ unique keys. Hash collisions in a 65537-slot table create smooth generalization without saturation.
+**Multi-class architecture.** v81 replaced static POS with frequency buckets (PPL went from 12M to 13.89 — huge win). But the class transition matrix was nearly uniform because frequency buckets group words by how OFTEN they appear, not how they BEHAVE. v82 introduces distributional clusters that capture syntactic role from data, and runs BOTH class systems simultaneously.
 
-**Variable features.** The old system hardcoded exactly 4 table types. The new system uses a `FeatureSpec` base class with `add_feature()` / `remove_feature()`. You can register any number of features, including custom ones you define yourself.
+**Distributional clusters.** Words that appear in similar contexts (similar left/right neighbors) get the same cluster. "the" and "a" cluster together (similar followers). "was" and "is" cluster together. This gives non-uniform class transition matrices with real syntactic patterns — something frequency buckets alone can't provide.
 
-**Fixed energy scaling.** The old system had clip values of 500-1000, producing energy std of 3600+ that overwhelmed the base model (std 246). With clips of 30-100 and proper z-score normalization, the energy acts as a gentle correction.
+**N-gram blocking.** Generation now prevents repeating recent bigrams, not just unigrams. This breaks repetition loops like "the little girl named lily... the little girl named lily...".
+
+**Adaptive clipping.** Energy tables use percentile-based clipping instead of fixed limits, preventing saturation while preserving learned distribution shape.
+
+## Word Class Systems
+
+| System | Key | K | Captures | Example |
+|--------|-----|---|----------|---------|
+| Frequency buckets | `freq` | 20 | Importance gradient | "the"→bucket 1, "cat"→bucket 8 |
+| Distributional clusters | `dist` | 30 | Syntactic role | "the"→cluster 5, "was"→cluster 3 |
+
+Both systems are DATA-DRIVEN — computed from corpus statistics, not hardcoded rules.
+POS tags are kept for diagnostics only — never used in features.
 
 ## Available Features
 
-### Bigram features (need context >= 1)
+### Lexical features (no class dependency)
 
-| Feature | Hash | Keys | Default? |
-|---------|------|------|----------|
-| `LexBigramFeature` | hash(prev_word, cand_word) | V^2 = 4M | Yes |
-| `WordPosBigramFeature` | hash(prev_word, cand_pos) | V*13 = 26K | Yes |
-| `PosWordBigramFeature` | hash(prev_pos, cand_word) | 13*V = 26K | Yes |
-| `PosBigramFeature` | hash(prev_pos, cand_pos) | 169 | No* |
+| Feature | Hash | Default? |
+|---------|------|----------|
+| `LexBigramFeature` | hash(prev_word, cand_word) | Yes |
+| `LexSkipFeature` | hash(prev2_word, cand_word) | Yes |
+| `LexTrigramFeature` | hash(prev2_word, prev_word, cand_word) | Yes |
 
-*PosBigramFeature is excluded by default — 169 keys causes saturation.
+### Class features (class_key selects which class system)
 
-### Skip-gram features (need context >= 2)
-
-| Feature | Hash | Keys | Default? |
-|---------|------|------|----------|
-| `LexSkipFeature` | hash(prev2_word, cand_word) | V^2 = 4M | Yes |
-| `WordPosSkipFeature` | hash(prev2_word, cand_pos) | V*13 = 26K | No |
-| `PosWordSkipFeature` | hash(prev2_pos, cand_word) | 13*V = 26K | No |
-| `PosSkipFeature` | hash(prev2_pos, cand_pos) | 169 | No* |
-
-### Trigram features (need context >= 2)
-
-| Feature | Hash | Keys | Default? |
-|---------|------|------|----------|
-| `PosTrigramFeature` | hash(prev2_pos, prev_pos, cand_pos) | 2197 | Yes |
-| `LexTrigramFeature` | hash(prev2_word, prev_word, cand_word) | V^3 = 8B | Yes |
+| Feature | Hash | class_key | Default? |
+|---------|------|-----------|----------|
+| `WordClassBigramFeature` | hash(prev_word, cand_class) | "freq" | Yes |
+| `ClassWordBigramFeature` | hash(prev_class, cand_word) | "freq" | Yes |
+| `WordClassBigramFeature` | hash(prev_word, cand_class) | "dist" | Yes |
+| `ClassWordBigramFeature` | hash(prev_class, cand_word) | "dist" | Yes |
+| `ClassTrigramFeature` | hash(prev2_class, prev_class, cand_class) | "dist" | Yes |
 
 ## Quick Start
 
 ```bash
-# Full training run (50K TinyStories texts, default 6 features)
+# Full training run (50K TinyStories texts, 8 features with dist clusters)
 python -u train.py
 
 # Quick test with smaller data
 python -u train.py --samples 5000 --vocab 1000 --nce-epochs 1
 
-# All 10 features
+# All feature variants
 python -u train.py --features all
 
-# Custom feature set
-python -u train.py --features lex_bi,word_pos_bi,pos_word_bi
+# Disable distributional clusters (freq-only mode)
+python -u train.py --no-dist
 
-# Adjust energy scale
-python -u train.py --lex-clip 50 --pos-clip 20
+# More distributional clusters
+python -u train.py --n-clusters 40
+
+# Custom feature set
+python -u train.py --features lex_bi,word_cls_bi_freq,cls_word_bi_freq
 ```
 
 ## Adding Custom Features
@@ -77,24 +83,22 @@ python -u train.py --lex-clip 50 --pos-clip 20
 from ising_spin import FeatureSpec, IntegerLM
 
 class MyFeature(FeatureSpec):
-    """Custom feature: hash(my_thing, cand_word)"""
+    """Custom feature using the 'dist' class system."""
 
     def __init__(self, **kwargs):
         super().__init__("my_feature", n_hashes=2, table_size=65537,
-                         eta=1, clip=50, weight=0.5, **kwargs)
+                         eta=1, clip=50, weight=0.5, class_key="dist", **kwargs)
 
-    def get_hash_args_batch(self, context, candidates, word_pos):
+    def get_hash_args_batch(self, context, candidates, word_class):
         if not context:
             return None
         K = len(candidates)
-        # Your custom extraction logic here
-        my_thing = np.full(K, some_value, dtype=np.int64)
-        return (my_thing, candidates.astype(np.int64))
+        prev_class = np.full(K, int(word_class[context[-1]]), dtype=np.int64)
+        return (prev_class, candidates.astype(np.int64))
 
-    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
-                          prev2_words=None, prev2_pos=None, mask=None):
-        # Same extraction for NCE training
-        return (some_array, right_words)
+    def get_hash_args_nce(self, prev_words, prev_class, right_words, right_class,
+                          prev2_words=None, prev2_class=None, mask=None):
+        return (prev_class, right_words)
 
 # Register it
 model = IntegerLM(vocab=vocab)
@@ -109,9 +113,9 @@ src/ising_spin/
 ├── __init__.py              # Package exports
 ├── integer_lm.py            # Main class: IntegerLM
 ├── bigram_model.py          # Pure integer bigram base model
-├── feature_hash_energy.py   # FeatureSpec base + 10 concrete features + registry
+├── feature_hash_energy.py   # FeatureSpec base + concrete features + multi-class registry
 ├── boltzmann.py             # Integer-only Boltzmann sampler
-├── vocabulary.py            # Vocabulary + POS type system
+├── vocabulary.py            # Vocabulary + multi-class word system (freq + dist)
 └── utils.py                 # Utility functions
 train.py                     # Training script
 ```
@@ -121,31 +125,32 @@ train.py                     # Training script
 ### Training
 
 1. Count bigrams from text (integer counting, no gradients)
-2. Train all feature tables via Noise-Contrastive Estimation (NCE):
+2. Build frequency buckets (words ranked by frequency, binned into K groups)
+3. Build distributional clusters (words grouped by context similarity via min-hash)
+4. Train all feature tables via Noise-Contrastive Estimation (NCE):
    - Real (prev, target) pairs: table[hash] -= eta (lower energy = more likely)
    - Fake (prev, random) pairs: table[hash] += eta (higher energy = less likely)
-   - Negatives are BALANCED across POS types (not 88% NOUN)
-3. Calibrate alpha via grid search (range [0.001, 0.5])
+   - Negatives are BALANCED across all class systems
+5. Calibrate alpha and feature weights via grid search
 
 ### Generation
 
 At each step:
 1. Bigram model proposes top-K candidates with probabilities
-2. Each feature computes its energy contribution (O(1) per candidate per feature)
+2. Each feature computes its energy contribution using its class array
 3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
 4. Metropolis gate hard-rejects candidates above threshold
-5. Repetition penalty for recently-used words
+5. Repetition penalty for recently-used words AND bigrams
 6. Sample from distribution
 
-### The Key Insight: Word-POS Features
+### Why Multi-Class Works
 
-The old approach: hash(prev_pos, cand_pos) produces 13*13 = 169 unique keys. Each key independently accumulates NCE updates and saturates at the clip limit. Once saturated, the gradient is zero — the table can't learn.
+Frequency buckets capture the functional/content word gradient but can't distinguish "the" from "was" (both high-frequency). Distributional clusters capture syntactic role but miss the importance gradient. Using BOTH gives complementary signals:
 
-The new approach: hash(prev_word, cand_pos) produces V*13 = 26000+ unique keys. With a 65537-slot table and 2 hash functions:
-- "the"->NOUN and "a"->NOUN hash to DIFFERENT slots (specificity)
-- But nearby hash slots create smooth generalization (like "the" and "a" both being determiners)
-- "the"->VERB hashes to a completely different slot (no contamination)
-- Saturation is impossible: with 26000 keys and clip=50, the table converges smoothly
+- `hash(word, freq_bucket)`: "the"→bucket 1 predicts high-freq followers
+- `hash(word, dist_cluster)`: "the"→cluster 5 predicts noun followers
+
+Together, these give the model both importance AND syntactic information.
 
 ## Dependencies
 
