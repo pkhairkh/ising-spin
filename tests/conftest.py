@@ -1,4 +1,4 @@
-"""Pytest configuration for Integer Language Model tests."""
+"""Pytest configuration for Integer Language Model (v80 — Dynamic Features)."""
 import sys
 from pathlib import Path
 
@@ -41,14 +41,21 @@ def small_vocab():
 def small_model(small_vocab):
     """Build a small IntegerLM for integration tests."""
     from ising_spin import IntegerLM
+    from ising_spin.feature_hash_energy import (
+        LexBigramFeature, WordPosBigramFeature, PosWordBigramFeature,
+        LexSkipFeature, PosTrigramFeature, LexTrigramFeature,
+    )
+    features = [
+        LexBigramFeature(n_hashes=1, table_size=1009, eta=1, clip=50, weight=1.0),
+        WordPosBigramFeature(n_hashes=1, table_size=1009, eta=1, clip=30, weight=0.5),
+        PosWordBigramFeature(n_hashes=1, table_size=1009, eta=1, clip=30, weight=0.5),
+        LexSkipFeature(n_hashes=1, table_size=1009, eta=1, clip=30, weight=0.3),
+        PosTrigramFeature(n_hashes=1, table_size=503, eta=1, clip=30, weight=0.5),
+        LexTrigramFeature(n_hashes=1, table_size=1009, eta=1, clip=30, weight=0.3),
+    ]
     model = IntegerLM(
         vocab=small_vocab,
-        n_pos_hashes=1,
-        pos_table_size=101,
-        n_lex_hashes=1,
-        lex_table_size=1009,
-        use_skip=False,
-        use_trigram=False,
+        features=features,
         top_k=20,
         seed=42,
     )

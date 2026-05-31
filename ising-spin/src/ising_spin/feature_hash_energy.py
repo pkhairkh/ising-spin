@@ -1,41 +1,64 @@
 """
-Feature-Hashed Integer Energy Table with POS generalization and skip-grams.
+Dynamic Feature-Hashed Integer Energy Table with Variable Features.
 
-Three layers of energy signal:
+ARCHITECTURE CHANGE (v80):
+  The old system hardcoded 4 table types (pos_bi, lex_bi, skip_lex, skip_pos_bi)
+  with a static 13x13 POS matrix. Only 169 unique POS pair keys → instant
+  saturation at ±500, no gradient signal, POS disc_acc below random.
 
-  1. POS tables — category-level RULES that generalize across words
-     With 13 POS types, only 169 possible bigram pairs. Training on
-     "the cat" (DET->NOUN) automatically improves "a dog" (DET->NOUN).
+  The new system uses a FeatureSpec base class with dynamic registration.
+  Any number of features can be added via add_feature(). Each feature is
+  self-contained: its own hash tables, eta, clip, weight.
 
-  2. Lexical tables — token-specific FACTS for fine-grained distinctions
-     Same as v77: hash(prev_id, target_id) -> energy.
-     Memorizes which specific word pairs are likely.
+KEY INSIGHT — Why the old POS table was broken:
+  With 13 POS types, hash(prev_pos, cand_pos) produces only 13x13=169 unique
+  keys. Each key independently accumulates NCE updates and saturates at the
+  clip limit. Once saturated, there's ZERO gradient — the table can't learn.
 
-  3. Skip-gram tables — structural DEPENDENCIES beyond adjacent tokens
-     hash(x_{t-2}, x_t) captures subject-verb patterns ("cat...chased").
-     hash(POS(x_{t-2}), POS(x_t)) captures DET->VERB patterns.
+  The fix: mixed word-POS features like hash(prev_word, cand_pos) produce
+  Vx13 = 26000+ unique keys. Hash collisions in a 65537-slot table create
+  SMOOTH generalization: "the"->NOUN and "a"->NOUN hash to nearby slots,
+  learning that DET->NOUN is good. But "the"->VERB hashes differently,
+  allowing fine-grained distinctions.
 
-Combined energy at each generation step:
+AVAILABLE FEATURES:
+  Bigram (2-token context):
+    LexBigramFeature    — hash(prev_word, cand_word)   token-specific pairs
+    WordPosBigramFeature — hash(prev_word, cand_pos)   word→POS transitions
+    PosWordBigramFeature — hash(prev_pos, cand_word)   POS→word transitions
+    PosBigramFeature    — hash(prev_pos, cand_pos)     POS pair (optional)
 
-  E = pos_weight * E_pos(prev_pos, cand_pos)
-    + lex_weight * E_lex(prev_id, cand_id)
-    + skip_weight * E_skip(context[-2], candidate)
-    + tri_weight  * (pos_trigram + lex_trigram)
+  Skip-gram (skip-1 context):
+    LexSkipFeature      — hash(prev2_word, cand_word)  long-range lexical
+    WordPosSkipFeature  — hash(prev2_word, cand_pos)   word→POS at distance 2
+    PosWordSkipFeature  — hash(prev2_pos, cand_word)   POS→word at distance 2
+    PosSkipFeature      — hash(prev2_pos, cand_pos)    POS skip (optional)
 
-All tables trained simultaneously via integer NCE:
-  Real pair: table[hash] -= eta  (lower energy = more likely)
-  Fake pair: table[hash] += eta  (higher energy = less likely)
+  Trigram (3-token context):
+    LexTrigramFeature   — hash(prev2_word, prev_word, cand_word) lexical 3-gram
+    PosTrigramFeature   — hash(prev2_pos, prev_pos, cand_pos)    POS 3-gram
 
-CRITICAL: POS negatives are BALANCED across POS types. Random negatives
-are 88% NOUN (because 88% of words are NOUN), which destroys the POS
-signal. Balanced negatives give equal weight to all 13 POS types,
-allowing the POS table to actually learn DET→NOUN vs DET→VERB rules.
+DEFAULT FEATURE SET (recommended):
+  LexBigramFeature, WordPosBigramFeature, PosWordBigramFeature,
+  LexSkipFeature, PosTrigramFeature, LexTrigramFeature
 
+  Note: PosBigramFeature is EXCLUDED by default — the 169-key static
+  POS matrix is the disaster we're fixing. WordPosBigramFeature and
+  PosWordBigramFeature provide the same POS generalization but with
+  Vx13 richness instead of 13x13 poverty.
+
+ADD YOUR OWN FEATURE:
+  1. Subclass FeatureSpec
+  2. Implement get_hash_args_batch() and get_hash_args_nce()
+  3. Call energy_table.add_feature(your_feature)
+
+All tables trained via integer NCE with balanced POS negatives.
 O(1) per candidate. Pure integer arithmetic. No neural nets.
 """
 
 import numpy as np
-from typing import List, Dict, Optional
+from collections import OrderedDict
+from typing import List, Dict, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -93,20 +116,592 @@ def _next_prime(n: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# FeatureHashEnergyTable
+# FeatureSpec — base class for energy features
 # ---------------------------------------------------------------------------
+
+class FeatureSpec:
+    """
+    Base class for energy features. Each feature is self-contained:
+    its own hash tables, learning rate (eta), clipping range, and weight.
+
+    To add a new feature:
+      1. Subclass FeatureSpec
+      2. Implement get_hash_args_batch() and get_hash_args_nce()
+      3. Call energy_table.add_feature(your_feature)
+
+    The feature's contribution to the total energy is:
+        E_feature = weight * sum_h(table[h][hash(inputs, h)])
+    """
+
+    def __init__(
+        self,
+        name: str,
+        n_hashes: int = 2,
+        table_size: int = 65537,
+        eta: int = 1,
+        clip: int = 100,
+        weight: float = 1.0,
+    ):
+        self.name = name
+        self.n_hashes = n_hashes
+        self.table_size = table_size
+        self.eta = eta
+        self.clip = clip
+        self.weight = weight
+        # Initialize hash tables (all zeros = no prior)
+        self.tables = [np.zeros(table_size, dtype=np.int32) for _ in range(n_hashes)]
+
+    # -------------------------------------------------------------------
+    # Subclasses MUST implement these two methods
+    # -------------------------------------------------------------------
+
+    def get_hash_args_batch(
+        self,
+        context: List[int],
+        candidates: np.ndarray,
+        word_pos: np.ndarray,
+    ) -> Optional[Tuple]:
+        """
+        Extract hash input arrays from context + candidates (generation-time).
+
+        Returns: tuple of (a, b) or (a, b, c) as np.int64 arrays, shape (K,)
+                 Or None if this feature doesn't apply (e.g., context too short).
+        """
+        raise NotImplementedError(
+            f"{self.name}: get_hash_args_batch() not implemented"
+        )
+
+    def get_hash_args_nce(
+        self,
+        prev_words: np.ndarray,
+        prev_pos: np.ndarray,
+        right_words: np.ndarray,
+        right_pos: np.ndarray,
+        prev2_words: Optional[np.ndarray] = None,
+        prev2_pos: Optional[np.ndarray] = None,
+        mask: Optional[np.ndarray] = None,
+    ) -> Optional[Tuple]:
+        """
+        Extract hash input arrays from NCE training batch.
+
+        Args:
+            prev_words:  shape (N,) — previous word IDs
+            prev_pos:    shape (N,) — previous POS IDs
+            right_words: shape (N,) — target word IDs (positive) or negative word IDs
+            right_pos:   shape (N,) — target/negative POS IDs
+            prev2_words: shape (N,) — word at t-2 (0 if none), or None
+            prev2_pos:   shape (N,) — POS at t-2 (0 if none), or None
+            mask:        shape (N,) — bool, True where prev2 is valid
+
+        Returns: tuple of arrays for hashing, or None if inapplicable.
+                 For features using prev2, apply mask and return masked arrays.
+        """
+        raise NotImplementedError(
+            f"{self.name}: get_hash_args_nce() not implemented"
+        )
+
+    # -------------------------------------------------------------------
+    # Provided methods — energy computation
+    # -------------------------------------------------------------------
+
+    def energy_batch(
+        self,
+        context: List[int],
+        candidates: np.ndarray,
+        word_pos: np.ndarray,
+    ) -> np.ndarray:
+        """Compute energy contribution for all candidates."""
+        args = self.get_hash_args_batch(context, candidates, word_pos)
+        if args is None:
+            return np.zeros(len(candidates), dtype=np.int64)
+        K = len(candidates)
+        e = np.zeros(K, dtype=np.int64)
+        for h in range(self.n_hashes):
+            if len(args) == 2:
+                slots = _hash2_vec(args[0], args[1], h, self.table_size)
+            else:
+                slots = _hash3_vec(args[0], args[1], args[2], h, self.table_size)
+            e += self.tables[h][slots]
+        return e
+
+    def energy_scalar(
+        self,
+        context: List[int],
+        candidate: int,
+        word_pos: np.ndarray,
+    ) -> int:
+        """Compute energy for a single candidate."""
+        args = self.get_hash_args_batch(context, np.array([candidate], dtype=np.int64), word_pos)
+        if args is None:
+            return 0
+        e = 0
+        for h in range(self.n_hashes):
+            if len(args) == 2:
+                slot = _hash2(int(args[0][0]), int(args[1][0]), h, self.table_size)
+            else:
+                slot = _hash3(int(args[0][0]), int(args[1][0]), int(args[2][0]), h, self.table_size)
+            e += int(self.tables[h][slot])
+        return e
+
+    # -------------------------------------------------------------------
+    # Provided methods — NCE training
+    # -------------------------------------------------------------------
+
+    def nce_positive(
+        self,
+        prev_words: np.ndarray,
+        prev_pos: np.ndarray,
+        targets: np.ndarray,
+        target_pos: np.ndarray,
+        prev2_words: Optional[np.ndarray] = None,
+        prev2_pos: Optional[np.ndarray] = None,
+        mask: Optional[np.ndarray] = None,
+    ):
+        """Apply positive NCE update (real pairs): table[hash] -= eta."""
+        args = self.get_hash_args_nce(
+            prev_words, prev_pos, targets, target_pos,
+            prev2_words, prev2_pos, mask,
+        )
+        if args is None:
+            return
+        for h in range(self.n_hashes):
+            if len(args) == 2:
+                slots = _hash2_vec(args[0], args[1], h, self.table_size)
+            else:
+                slots = _hash3_vec(args[0], args[1], args[2], h, self.table_size)
+            np.add.at(self.tables[h], slots, -self.eta)
+
+    def nce_negative(
+        self,
+        prev_words: np.ndarray,
+        prev_pos: np.ndarray,
+        neg_words: np.ndarray,
+        neg_pos: np.ndarray,
+        prev2_words: Optional[np.ndarray] = None,
+        prev2_pos: Optional[np.ndarray] = None,
+        mask: Optional[np.ndarray] = None,
+    ):
+        """Apply negative NCE update (corrupt pairs): table[hash] += eta."""
+        args = self.get_hash_args_nce(
+            prev_words, prev_pos, neg_words, neg_pos,
+            prev2_words, prev2_pos, mask,
+        )
+        if args is None:
+            return
+        for h in range(self.n_hashes):
+            if len(args) == 2:
+                slots = _hash2_vec(args[0], args[1], h, self.table_size)
+            else:
+                slots = _hash3_vec(args[0], args[1], args[2], h, self.table_size)
+            np.add.at(self.tables[h], slots, self.eta)
+
+    def clip_tables(self):
+        """Clip all table values to prevent energy explosion."""
+        for h in range(self.n_hashes):
+            np.clip(self.tables[h], -self.clip, self.clip, out=self.tables[h])
+
+    def statistics(self) -> Dict:
+        """Return feature statistics."""
+        all_vals = np.concatenate([t.ravel() for t in self.tables])
+        return {
+            'name': self.name,
+            'weight': self.weight,
+            'eta': self.eta,
+            'clip': self.clip,
+            'table_size': self.table_size,
+            'n_hashes': self.n_hashes,
+            'nnz': int(np.count_nonzero(all_vals)),
+            'range': (int(all_vals.min()), int(all_vals.max())),
+            'mean': float(all_vals.mean()),
+            'std': float(all_vals.std()),
+            'memory_kb': sum(t.nbytes for t in self.tables) / 1024,
+        }
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(name={self.name!r}, "
+                f"n_hashes={self.n_hashes}, table_size={self.table_size}, "
+                f"eta={self.eta}, clip={self.clip}, weight={self.weight})")
+
+
+# ===========================================================================
+# CONCRETE FEATURE IMPLEMENTATIONS
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Bigram features (need context >= 1)
+# ---------------------------------------------------------------------------
+
+class LexBigramFeature(FeatureSpec):
+    """
+    hash(prev_word, cand_word) — lexical bigram transitions.
+
+    The main workhorse: token-specific pairs like ("the", "cat"), ("a", "dog").
+    With V=2000 and table_size=65537, about 6% collision rate — enough for
+    smooth generalization without losing too much specificity.
+    """
+
+    def __init__(self, n_hashes=3, table_size=65537, eta=1, clip=100, weight=1.0):
+        super().__init__("lex_bi", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if not context:
+            return None
+        K = len(candidates)
+        prev = np.full(K, context[-1], dtype=np.int64)
+        return (prev, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        return (prev_words, right_words)
+
+
+class WordPosBigramFeature(FeatureSpec):
+    """
+    hash(prev_word, cand_pos) — word→POS transitions.
+
+    REPLACES the old static POS bigram table. Instead of hash(pos, pos)
+    with 169 keys, this uses hash(word, pos) with V*13 = 26000+ keys.
+
+    This is the key fix for the "POS disaster": "the"->NOUN and "a"->NOUN
+    hash to DIFFERENT slots, but collisions in a 65537-slot table create
+    natural generalization. The model learns that after determiners, nouns
+    are likely — but it also learns which specific determiners prefer which
+    specific noun types.
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50, weight=0.5):
+        super().__init__("word_pos_bi", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if not context:
+            return None
+        K = len(candidates)
+        prev = np.full(K, context[-1], dtype=np.int64)
+        cand_pos = word_pos[candidates].astype(np.int64)
+        return (prev, cand_pos)
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        return (prev_words, right_pos)
+
+
+class PosWordBigramFeature(FeatureSpec):
+    """
+    hash(prev_pos, cand_word) — POS→word transitions.
+
+    Complementary to WordPosBigramFeature: after POS type X, which specific
+    word is likely? Learns patterns like "after DET, 'the' is the most
+    common word" while also capturing that "after AUX, 'was' is likely."
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50, weight=0.5):
+        super().__init__("pos_word_bi", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if not context:
+            return None
+        K = len(candidates)
+        prev_pos = np.full(K, int(word_pos[context[-1]]), dtype=np.int64)
+        return (prev_pos, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        return (prev_pos, right_words)
+
+
+class PosBigramFeature(FeatureSpec):
+    """
+    hash(prev_pos, cand_pos) — pure POS pair transitions.
+
+    WARNING: This is the OLD static POS feature. With 13x13 = 169 unique
+    keys, it saturates quickly and provides poor gradient signal. Included
+    for backward compatibility and ablation studies, but NOT in the default
+    feature set.
+
+    If used, set a SMALL table_size (e.g. 1009) and SMALL clip (e.g. 30)
+    to prevent saturation.
+    """
+
+    def __init__(self, n_hashes=2, table_size=1009, eta=1, clip=30, weight=0.3):
+        super().__init__("pos_bi", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if not context:
+            return None
+        K = len(candidates)
+        prev_pos = np.full(K, int(word_pos[context[-1]]), dtype=np.int64)
+        cand_pos = word_pos[candidates].astype(np.int64)
+        return (prev_pos, cand_pos)
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        return (prev_pos, right_pos)
+
+
+# ---------------------------------------------------------------------------
+# Skip-gram features (need context >= 2)
+# ---------------------------------------------------------------------------
+
+class LexSkipFeature(FeatureSpec):
+    """
+    hash(prev2_word, cand_word) — skip-gram lexical.
+
+    Captures patterns where a word at distance 2 predicts the current word.
+    Example: "the cat sat" → hash("the", "sat") captures DET→VERB at distance 2.
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=80, weight=0.3):
+        super().__init__("lex_skip", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2 = np.full(K, context[-2], dtype=np.int64)
+        return (prev2, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_words is None:
+            return None
+        if mask is None:
+            return (prev2_words, right_words)
+        if not np.any(mask):
+            return None
+        return (prev2_words[mask], right_words[mask])
+
+
+class WordPosSkipFeature(FeatureSpec):
+    """
+    hash(prev2_word, cand_pos) — word→POS at distance 2.
+
+    Like WordPosBigramFeature but at skip distance. Learns that after
+    "the ... ", a VERB is unlikely (you'd expect NOUN after "the X ...").
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50, weight=0.3):
+        super().__init__("word_pos_skip", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2 = np.full(K, context[-2], dtype=np.int64)
+        cand_pos = word_pos[candidates].astype(np.int64)
+        return (prev2, cand_pos)
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_words is None:
+            return None
+        if mask is None:
+            return (prev2_words, right_pos)
+        if not np.any(mask):
+            return None
+        return (prev2_words[mask], right_pos[mask])
+
+
+class PosWordSkipFeature(FeatureSpec):
+    """
+    hash(prev2_pos, cand_word) — POS→word at distance 2.
+
+    Like PosWordBigramFeature but at skip distance. Learns that after
+    "DET ... ", specific nouns are likely to follow.
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50, weight=0.3):
+        super().__init__("pos_word_skip", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2_pos = np.full(K, int(word_pos[context[-2]]), dtype=np.int64)
+        return (prev2_pos, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_pos is None:
+            return None
+        if mask is None:
+            return (prev2_pos, right_words)
+        if not np.any(mask):
+            return None
+        return (prev2_pos[mask], right_words[mask])
+
+
+class PosSkipFeature(FeatureSpec):
+    """
+    hash(prev2_pos, cand_pos) — POS skip-gram.
+
+    WARNING: Like PosBigramFeature, this has only 13x13 = 169 unique keys.
+    Use with small clip to prevent saturation.
+    """
+
+    def __init__(self, n_hashes=2, table_size=1009, eta=1, clip=30, weight=0.2):
+        super().__init__("pos_skip", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2_pos = np.full(K, int(word_pos[context[-2]]), dtype=np.int64)
+        cand_pos = word_pos[candidates].astype(np.int64)
+        return (prev2_pos, cand_pos)
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_pos is None:
+            return None
+        if mask is None:
+            return (prev2_pos, right_pos)
+        if not np.any(mask):
+            return None
+        return (prev2_pos[mask], right_pos[mask])
+
+
+# ---------------------------------------------------------------------------
+# Trigram features (need context >= 2)
+# ---------------------------------------------------------------------------
+
+class LexTrigramFeature(FeatureSpec):
+    """
+    hash(prev2_word, prev_word, cand_word) — lexical trigram.
+
+    Three-word token patterns: "once upon a", "there was a", etc.
+    Much more specific than bigrams — captures local collocations.
+    """
+
+    def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=80, weight=0.3):
+        super().__init__("lex_tri", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2 = np.full(K, context[-2], dtype=np.int64)
+        prev1 = np.full(K, context[-1], dtype=np.int64)
+        return (prev2, prev1, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_words is None:
+            return None
+        if mask is None:
+            return (prev2_words, prev_words, right_words)
+        if not np.any(mask):
+            return None
+        return (prev2_words[mask], prev_words[mask], right_words[mask])
+
+
+class PosTrigramFeature(FeatureSpec):
+    """
+    hash(prev2_pos, prev_pos, cand_pos) — POS trigram.
+
+    With 13^3 = 2197 unique POS triple patterns, this is much richer than
+    the 169-key POS bigram. Learns patterns like DET NOUN VERB, PRON AUX VERB,
+    etc. With table_size=1301 and 2 hashes, there are meaningful collisions
+    that create smooth generalization.
+    """
+
+    def __init__(self, n_hashes=2, table_size=1301, eta=1, clip=50, weight=0.5):
+        super().__init__("pos_tri", n_hashes, table_size, eta, clip, weight)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if len(context) < 2:
+            return None
+        K = len(candidates)
+        prev2_pos = np.full(K, int(word_pos[context[-2]]), dtype=np.int64)
+        prev1_pos = np.full(K, int(word_pos[context[-1]]), dtype=np.int64)
+        cand_pos = word_pos[candidates].astype(np.int64)
+        return (prev2_pos, prev1_pos, cand_pos)
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        if prev2_pos is None:
+            return None
+        if mask is None:
+            return (prev2_pos, prev_pos, right_pos)
+        if not np.any(mask):
+            return None
+        return (prev2_pos[mask], prev_pos[mask], right_pos[mask])
+
+
+# ---------------------------------------------------------------------------
+# Default feature set factory
+# ---------------------------------------------------------------------------
+
+def default_features(
+    vocab_size: int = 2000,
+    n_pos_types: int = 13,
+    lex_table_size: int = 65537,
+    pos_table_size: int = 65537,
+    tri_table_size: int = 65537,
+    pos_tri_table_size: int = 1301,
+) -> List[FeatureSpec]:
+    """
+    Create the recommended default feature set.
+
+    These 6 features replace the old hardcoded 4-table system:
+      - LexBigramFeature: main workhorse (token-specific pairs)
+      - WordPosBigramFeature: word→POS (replaces static POS bigram!)
+      - PosWordBigramFeature: POS→word (complementary direction)
+      - LexSkipFeature: skip-gram lexical (long-range dependencies)
+      - PosTrigramFeature: POS trigram patterns (2197 unique keys)
+      - LexTrigramFeature: lexical trigram patterns (collocations)
+
+    With default clip values (50-100) and weights (0.3-1.0), the maximum
+    combined energy is ~546 — manageable with z-score normalization and
+    alpha in [0.01, 0.5].
+
+    Total memory: ~3.5 MB for V=2000.
+    """
+    return [
+        LexBigramFeature(
+            n_hashes=3, table_size=lex_table_size,
+            eta=1, clip=100, weight=1.0,
+        ),
+        WordPosBigramFeature(
+            n_hashes=2, table_size=pos_table_size,
+            eta=1, clip=50, weight=0.5,
+        ),
+        PosWordBigramFeature(
+            n_hashes=2, table_size=pos_table_size,
+            eta=1, clip=50, weight=0.5,
+        ),
+        LexSkipFeature(
+            n_hashes=2, table_size=lex_table_size,
+            eta=1, clip=80, weight=0.3,
+        ),
+        PosTrigramFeature(
+            n_hashes=2, table_size=pos_tri_table_size,
+            eta=1, clip=50, weight=0.5,
+        ),
+        LexTrigramFeature(
+            n_hashes=2, table_size=tri_table_size,
+            eta=1, clip=80, weight=0.3,
+        ),
+    ]
+
+
+# ===========================================================================
+# FeatureHashEnergyTable — dynamic feature registry
+# ===========================================================================
 
 class FeatureHashEnergyTable:
     """
-    Feature-Hashed Integer Energy Table.
+    Feature-Hashed Integer Energy Table with dynamic feature registration.
 
-    Three signal layers:
-      1. POS tables: category-level rules (generalize across words)
-      2. Lexical tables: token-specific facts
-      3. Skip-gram tables: structural dependencies (skip one token)
+    Instead of hardcoded table types, features are registered via add_feature().
+    Each feature is a self-contained FeatureSpec with its own tables, eta,
+    clip, and weight. The energy table simply sums their weighted contributions.
 
-    All trained via integer NCE with BALANCED POS negatives.
-    All O(1) per candidate lookup.
+    Usage:
+        energy = FeatureHashEnergyTable(vocab_size=2000, word_pos=word_pos)
+        for feat in default_features():
+            energy.add_feature(feat)
+        energy.train_nce(sequences)
+        E = energy.compute_local_energy_batch(context, candidates)
     """
 
     def __init__(
@@ -114,113 +709,33 @@ class FeatureHashEnergyTable:
         vocab_size: int,
         word_pos: np.ndarray,
         n_pos_types: int = 13,
-        # POS tables
-        n_pos_hashes: int = 2,
-        pos_table_size: int = 1009,
-        pos_eta: int = 3,
-        pos_clip: int = 500,
-        # Lexical tables
-        n_lex_hashes: int = 3,
-        lex_table_size: int = 65537,
-        lex_eta: int = 1,
-        lex_clip: int = 1000,
-        # Skip-gram tables
-        use_skip: bool = True,
-        n_skip_hashes: int = 2,
-        skip_table_size: int = 65537,
-        skip_eta: int = 1,
-        skip_clip: int = 800,
-        # Trigram
-        use_trigram: bool = True,
-        trigram_weight: int = 1,
-        # Energy combination weights
-        pos_weight: float = 1.0,
-        lex_weight: float = 1.0,
-        skip_weight: float = 0.5,
-        # Seed
         seed: int = 42,
     ):
         self.V = vocab_size
         self.word_pos = word_pos.astype(np.int32)
         self.n_pos_types = n_pos_types
-
-        self.n_pos_hashes = n_pos_hashes
-        self.pos_table_size = pos_table_size
-        self.pos_eta = pos_eta
-        self.pos_clip = pos_clip
-
-        self.n_lex_hashes = n_lex_hashes
-        self.lex_table_size = lex_table_size
-        self.lex_eta = lex_eta
-        self.lex_clip = lex_clip
-
-        self.use_skip = use_skip
-        self.n_skip_hashes = n_skip_hashes
-        self.skip_table_size = skip_table_size
-        self.skip_eta = skip_eta
-        self.skip_clip = skip_clip
-
-        self.use_trigram = use_trigram
-        self.trigram_weight = trigram_weight
-
-        self.pos_weight = pos_weight
-        self.lex_weight = lex_weight
-        self.skip_weight = skip_weight
         self.seed = seed
-
-        # POS bigram + trigram tables
-        self._pos_bi = [np.zeros(pos_table_size, dtype=np.int32) for _ in range(n_pos_hashes)]
-        self._pos_tri = None
-        self._pos_tri_size = 0
-        if use_trigram:
-            self._pos_tri_size = _next_prime(pos_table_size + 256)
-            self._pos_tri = [np.zeros(self._pos_tri_size, dtype=np.int32) for _ in range(n_pos_hashes)]
-
-        # Lexical bigram + trigram tables
-        self._lex_bi = [np.zeros(lex_table_size, dtype=np.int32) for _ in range(n_lex_hashes)]
-        self._lex_tri = None
-        self._lex_tri_size = 0
-        if use_trigram:
-            self._lex_tri_size = _next_prime(lex_table_size + 256)
-            self._lex_tri = [np.zeros(self._lex_tri_size, dtype=np.int32) for _ in range(n_lex_hashes)]
-
-        # Skip-gram tables (hash context[-2], candidate)
-        self._skip_bi = None
-        self._skip_pos_bi = None
-        if use_skip:
-            self._skip_bi = [np.zeros(skip_table_size, dtype=np.int32) for _ in range(n_skip_hashes)]
-            self._skip_pos_bi = [np.zeros(pos_table_size, dtype=np.int32) for _ in range(n_skip_hashes)]
+        self.features: OrderedDict[str, FeatureSpec] = OrderedDict()
 
         # Build POS-indexed word lists for BALANCED negative sampling
-        # This is critical: with 88% NOUN vocab, random negatives are
-        # almost all NOUN, which destroys POS table signal.
-        self._pos_word_indices = {}
+        self._pos_word_indices: Dict[int, np.ndarray] = {}
         for pt in range(n_pos_types):
             indices = np.where(self.word_pos == pt)[0]
             if len(indices) > 0:
                 self._pos_word_indices[pt] = indices.astype(np.int64)
 
-    def _sample_balanced_negatives(self, rng: np.random.RandomState, size: int):
-        """
-        Sample negative words with BALANCED POS distribution.
+    def add_feature(self, feature: FeatureSpec):
+        """Register a feature. Can be called any time before training."""
+        self.features[feature.name] = feature
 
-        Instead of random words (88% NOUN), we pick a random POS type
-        uniformly from all 13 types, then a random word with that POS.
+    def remove_feature(self, name: str):
+        """Remove a feature by name."""
+        if name in self.features:
+            del self.features[name]
 
-        Returns (neg_word_ids, neg_pos_types) as int64 arrays.
-        """
-        # Pick random POS types uniformly
-        neg_pos_types = rng.randint(0, self.n_pos_types, size=size)
-
-        # Pick random words with those POS types
-        neg_words = np.empty(size, dtype=np.int64)
-        for pt, indices in self._pos_word_indices.items():
-            mask = neg_pos_types == pt
-            n = int(mask.sum())
-            if n > 0:
-                neg_words[mask] = rng.choice(indices, size=n)
-
-        return neg_words, neg_pos_types.astype(np.int64)
+    def get_feature(self, name: str) -> Optional[FeatureSpec]:
+        """Get a feature by name."""
+        return self.features.get(name)
 
     # -------------------------------------------------------------------
     # Energy computation — the hot path
@@ -234,71 +749,20 @@ class FeatureHashEnergyTable:
         """
         Compute total local energy for all candidates given context.
 
-        E = pos_weight * E_pos + lex_weight * E_lex + skip_weight * E_skip
+        E = sum_features(weight_f * E_f)
 
         Returns integer energy array. Lower = more likely = better.
         """
         K = len(candidates)
-        if len(context_word_ids) == 0:
+        if not context_word_ids:
             return np.zeros(K, dtype=np.int64)
 
-        prev = context_word_ids[-1]
-        prev_pos = int(self.word_pos[prev])
-        cand_pos = self.word_pos[candidates].astype(np.int64)
+        total = np.zeros(K, dtype=np.float64)
+        for feat in self.features.values():
+            e = feat.energy_batch(context_word_ids, candidates, self.word_pos)
+            total += feat.weight * e.astype(np.float64)
 
-        # --- POS bigram ---
-        pos_e = np.zeros(K, dtype=np.int64)
-        prev_pos_arr = np.full(K, prev_pos, dtype=np.int64)
-        for h in range(self.n_pos_hashes):
-            slots = _hash2_vec(prev_pos_arr, cand_pos, h, self.pos_table_size)
-            pos_e += self._pos_bi[h][slots]
-
-        # --- Lexical bigram ---
-        lex_e = np.zeros(K, dtype=np.int64)
-        prev_arr = np.full(K, prev, dtype=np.int64)
-        for h in range(self.n_lex_hashes):
-            slots = _hash2_vec(prev_arr, candidates.astype(np.int64), h, self.lex_table_size)
-            lex_e += self._lex_bi[h][slots]
-
-        # --- Skip-gram (context[-2], candidate) ---
-        skip_e = np.zeros(K, dtype=np.int64)
-        if self.use_skip and self._skip_bi is not None and len(context_word_ids) >= 2:
-            prev2 = context_word_ids[-2]
-            prev2_pos = int(self.word_pos[prev2])
-            prev2_arr = np.full(K, prev2, dtype=np.int64)
-            prev2_pos_arr = np.full(K, prev2_pos, dtype=np.int64)
-
-            for h in range(self.n_skip_hashes):
-                slots = _hash2_vec(prev2_arr, candidates.astype(np.int64), h, self.skip_table_size)
-                skip_e += self._skip_bi[h][slots]
-                # POS skip
-                slots_pos = _hash2_vec(prev2_pos_arr, cand_pos, h, self.pos_table_size)
-                skip_e += self._skip_pos_bi[h][slots_pos]
-
-        # --- Trigrams ---
-        if self.use_trigram and len(context_word_ids) >= 2:
-            prev2 = context_word_ids[-2]
-            prev2_pos = int(self.word_pos[prev2])
-
-            # POS trigram
-            if self._pos_tri is not None:
-                prev2_pos_arr = np.full(K, prev2_pos, dtype=np.int64)
-                for h in range(self.n_pos_hashes):
-                    slots = _hash3_vec(prev2_pos_arr, prev_pos_arr, cand_pos, h, self._pos_tri_size)
-                    pos_e += self.trigram_weight * self._pos_tri[h][slots]
-
-            # Lexical trigram
-            if self._lex_tri is not None:
-                prev2_arr = np.full(K, prev2, dtype=np.int64)
-                for h in range(self.n_lex_hashes):
-                    slots = _hash3_vec(prev2_arr, prev_arr, candidates.astype(np.int64), h, self._lex_tri_size)
-                    lex_e += self.trigram_weight * self._lex_tri[h][slots]
-
-        # --- Weighted combination ---
-        combined = (self.pos_weight * pos_e.astype(np.float64)
-                    + self.lex_weight * lex_e.astype(np.float64)
-                    + self.skip_weight * skip_e.astype(np.float64))
-        return combined.astype(np.int64)
+        return total.astype(np.int64)
 
     def compute_local_energy(
         self,
@@ -306,46 +770,41 @@ class FeatureHashEnergyTable:
         candidate: int,
     ) -> int:
         """Scalar version for single candidate."""
-        if len(context_word_ids) == 0:
+        if not context_word_ids:
             return 0
 
-        prev = context_word_ids[-1]
-        prev_pos = int(self.word_pos[prev])
-        cand_pos = int(self.word_pos[candidate]) if candidate < self.V else 0
-
-        # POS bigram
-        pos_e = sum(int(self._pos_bi[h][_hash2(prev_pos, cand_pos, h, self.pos_table_size)])
-                    for h in range(self.n_pos_hashes))
-
-        # Lexical bigram
-        lex_e = sum(int(self._lex_bi[h][_hash2(prev, candidate, h, self.lex_table_size)])
-                    for h in range(self.n_lex_hashes))
-
-        # Skip-gram
-        skip_e = 0
-        if self.use_skip and self._skip_bi is not None and len(context_word_ids) >= 2:
-            prev2 = context_word_ids[-2]
-            prev2_pos = int(self.word_pos[prev2])
-            for h in range(self.n_skip_hashes):
-                skip_e += int(self._skip_bi[h][_hash2(prev2, candidate, h, self.skip_table_size)])
-                skip_e += int(self._skip_pos_bi[h][_hash2(prev2_pos, cand_pos, h, self.pos_table_size)])
-
-        # Trigrams
-        if self.use_trigram and len(context_word_ids) >= 2:
-            prev2 = context_word_ids[-2]
-            prev2_pos = int(self.word_pos[prev2])
-            if self._pos_tri is not None:
-                for h in range(self.n_pos_hashes):
-                    pos_e += self.trigram_weight * int(self._pos_tri[h][_hash3(prev2_pos, prev_pos, cand_pos, h, self._pos_tri_size)])
-            if self._lex_tri is not None:
-                for h in range(self.n_lex_hashes):
-                    lex_e += self.trigram_weight * int(self._lex_tri[h][_hash3(prev2, prev, candidate, h, self._lex_tri_size)])
-
-        return int(self.pos_weight * pos_e + self.lex_weight * lex_e + self.skip_weight * skip_e)
+        total = 0.0
+        for feat in self.features.values():
+            total += feat.weight * feat.energy_scalar(
+                context_word_ids, candidate, self.word_pos
+            )
+        return int(total)
 
     # -------------------------------------------------------------------
     # NCE Training — vectorized batch integer updates
     # -------------------------------------------------------------------
+
+    def _sample_balanced_negatives(
+        self, rng: np.random.RandomState, size: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Sample negative words with BALANCED POS distribution.
+
+        Instead of random words (88% NOUN), we pick a random POS type
+        uniformly from all types, then a random word with that POS.
+
+        Returns (neg_word_ids, neg_pos_types) as int64 arrays.
+        """
+        neg_pos_types = rng.randint(0, self.n_pos_types, size=size)
+        neg_words = np.empty(size, dtype=np.int64)
+
+        for pt, indices in self._pos_word_indices.items():
+            mask = neg_pos_types == pt
+            n = int(mask.sum())
+            if n > 0:
+                neg_words[mask] = rng.choice(indices, size=n)
+
+        return neg_words, neg_pos_types.astype(np.int64)
 
     def train_nce(
         self,
@@ -355,18 +814,20 @@ class FeatureHashEnergyTable:
         callback=None,
     ) -> Dict:
         """
-        Train all energy tables via vectorized integer NCE.
+        Train all feature tables via vectorized integer NCE.
 
         For each (prev, target) pair:
-          Positive: table[hash(real_pair)] -= eta
-          Negative: table[hash(fake_pair)] += eta
+          Positive: feature.tables[h][hash(real_pair)] -= eta
+          Negative: feature.tables[h][hash(fake_pair)] += eta
 
-        KEY FIX: POS negatives are BALANCED across POS types.
-        Random words are 88% NOUN, which makes the POS table unable to
-        distinguish DET→NOUN (good) from DET→NOUN (also the negative!).
-        Balanced negatives give each POS type equal representation.
+        KEY: POS negatives are BALANCED across POS types.
         """
         import time as _time
+
+        if not self.features:
+            print("    WARNING: No features registered — nothing to train!", flush=True)
+            return {'epochs': []}
+
         rng = np.random.RandomState(self.seed)
 
         # Precompute all pairs
@@ -387,9 +848,12 @@ class FeatureHashEnergyTable:
         all_prev_pos = self.word_pos[all_prev].astype(np.int64)
         all_target_pos = self.word_pos[all_target].astype(np.int64)
         all_prev2_pos = self.word_pos[all_prev2].astype(np.int64)
+        has_prev2 = all_prev2 > 0
 
-        print(f"    {N:,} training pairs, {self.n_pos_types}x{self.n_pos_types}={self.n_pos_types**2} POS patterns", flush=True)
-        print(f"    Balanced POS negatives: {len(self._pos_word_indices)} POS types", flush=True)
+        feat_names = [f.name for f in self.features.values()]
+        print(f"    {N:,} training pairs", flush=True)
+        print(f"    Features: {', '.join(feat_names)}", flush=True)
+        print(f"    Balanced POS negatives: {len(self._pos_word_indices)} types", flush=True)
 
         all_stats = []
 
@@ -403,185 +867,199 @@ class FeatureHashEnergyTable:
             sp_pos = all_prev_pos[order]
             st_pos = all_target_pos[order]
             sp2_pos = all_prev2_pos[order]
+            hp2 = has_prev2[order]
 
             chunk = 100000
             for c0 in range(0, N, chunk):
                 c1 = min(c0 + chunk, N)
                 cp = sp[c0:c1]; ct = st[c0:c1]; cp2 = sp2[c0:c1]
                 cpp = sp_pos[c0:c1]; ctp = st_pos[c0:c1]; cp2p = sp2_pos[c0:c1]
+                chp2 = hp2[c0:c1]
                 C = len(cp)
 
-                # Positive updates
-                for h in range(self.n_pos_hashes):
-                    np.add.at(self._pos_bi[h], _hash2_vec(cpp, ctp, h, self.pos_table_size), -self.pos_eta)
-                for h in range(self.n_lex_hashes):
-                    np.add.at(self._lex_bi[h], _hash2_vec(cp, ct, h, self.lex_table_size), -self.lex_eta)
+                # Positive updates — all features
+                for feat in self.features.values():
+                    feat.nce_positive(
+                        cp, cpp, ct, ctp,
+                        prev2_words=cp2, prev2_pos=cp2p, mask=chp2,
+                    )
 
-                # Skip-gram positive (context[-2], target)
-                if self.use_skip and self._skip_bi is not None:
-                    has_p2 = cp2 > 0
-                    if np.any(has_p2):
-                        cp2v = cp2[has_p2]; ctv = ct[has_p2]; cp2pv = cp2p[has_p2]; ctpv = ctp[has_p2]
-                        for h in range(self.n_skip_hashes):
-                            np.add.at(self._skip_bi[h], _hash2_vec(cp2v, ctv, h, self.skip_table_size), -self.skip_eta)
-                            np.add.at(self._skip_pos_bi[h], _hash2_vec(cp2pv, ctpv, h, self.pos_table_size), -self.skip_eta)
-
-                # Negative updates — BALANCED POS negatives
+                # Negative updates — balanced POS negatives
                 for _ in range(n_negatives):
-                    # Balanced negatives: uniform across POS types
                     neg, neg_pos = self._sample_balanced_negatives(rng, C)
 
-                    # POS table gets balanced negatives (key fix!)
-                    for h in range(self.n_pos_hashes):
-                        np.add.at(self._pos_bi[h], _hash2_vec(cpp, neg_pos, h, self.pos_table_size), self.pos_eta)
-
-                    # Lexical table gets same balanced negatives
-                    # (This is fine — lexical table needs diverse negatives too)
-                    for h in range(self.n_lex_hashes):
-                        np.add.at(self._lex_bi[h], _hash2_vec(cp, neg, h, self.lex_table_size), self.lex_eta)
-
-                    # Skip-gram negatives (balanced)
-                    if self.use_skip and self._skip_bi is not None and np.any(has_p2 if C > 0 else False):
-                        for h in range(self.n_skip_hashes):
-                            np.add.at(self._skip_bi[h], _hash2_vec(cp2v, neg[has_p2], h, self.skip_table_size), self.skip_eta)
-                            np.add.at(self._skip_pos_bi[h], _hash2_vec(cp2pv, neg_pos[has_p2], h, self.pos_table_size), self.skip_eta)
-
-                # Trigram updates
-                if self.use_trigram:
-                    has_p2 = cp2 > 0
-                    if np.any(has_p2):
-                        cp2v = cp2[has_p2]; cpv = cp[has_p2]; ctv = ct[has_p2]
-                        cp2pv = cp2p[has_p2]; cppv = cpp[has_p2]; ctpv = ctp[has_p2]
-                        if self._pos_tri is not None:
-                            for h in range(self.n_pos_hashes):
-                                np.add.at(self._pos_tri[h], _hash3_vec(cp2pv, cppv, ctpv, h, self._pos_tri_size), -self.pos_eta)
-                        if self._lex_tri is not None:
-                            for h in range(self.n_lex_hashes):
-                                np.add.at(self._lex_tri[h], _hash3_vec(cp2v, cpv, ctv, h, self._lex_tri_size), -self.lex_eta)
-
-                        # Trigram negatives (balanced)
-                        for _ in range(n_negatives):
-                            neg_t, neg_tp = self._sample_balanced_negatives(rng, len(cp2v))
-                            if self._pos_tri is not None:
-                                for h in range(self.n_pos_hashes):
-                                    np.add.at(self._pos_tri[h], _hash3_vec(cp2pv, cppv, neg_tp, h, self._pos_tri_size), self.pos_eta)
-                            if self._lex_tri is not None:
-                                for h in range(self.n_lex_hashes):
-                                    np.add.at(self._lex_tri[h], _hash3_vec(cp2v, cpv, neg_t, h, self._lex_tri_size), self.lex_eta)
+                    for feat in self.features.values():
+                        feat.nce_negative(
+                            cp, cpp, neg, neg_pos,
+                            prev2_words=cp2, prev2_pos=cp2p, mask=chp2,
+                        )
 
             t_elapsed = _time.time() - t0
 
-            # Clip
-            self._clip_tables()
+            # Clip all features
+            for feat in self.features.values():
+                feat.clip_tables()
 
-            # Discriminative accuracy — check with BALANCED negatives
+            # Discriminative accuracy per feature + combined
             n_check = min(2000, N)
             ci = rng.choice(N, n_check, replace=False)
             cp_chk = all_prev[ci]; ct_chk = all_target[ci]
             cpp_chk = all_prev_pos[ci]; ctp_chk = all_target_pos[ci]
+            cp2_chk = all_prev2[ci]; cp2p_chk = all_prev2_pos[ci]
+            hp2_chk = has_prev2[ci]
 
-            # Use balanced negatives for evaluation too
             neg_chk, neg_pos_chk = self._sample_balanced_negatives(rng, n_check)
 
-            pos_e = sum(self._pos_bi[h][_hash2_vec(cpp_chk, ctp_chk, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
-            neg_e = sum(self._pos_bi[h][_hash2_vec(cpp_chk, neg_pos_chk, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
-            pos_d = float(np.sum(pos_e < neg_e)) / n_check
+            # Per-feature discrimination
+            # NOTE: must pass (prev_words, prev_pos, right_words, right_pos, ...)
+            # correctly — NOT mixing up word and POS arrays!
+            feat_discs = {}
+            for feat in self.features.values():
+                # Positive: (prev_word, prev_pos, target_word, target_pos, prev2_word, prev2_pos, mask)
+                pos_args = feat.get_hash_args_nce(
+                    cp_chk, cpp_chk, ct_chk, ctp_chk,
+                    cp2_chk, cp2p_chk, hp2_chk,
+                )
+                # Negative: same context, but target replaced by negative
+                neg_args = feat.get_hash_args_nce(
+                    cp_chk, cpp_chk, neg_chk, neg_pos_chk,
+                    cp2_chk, cp2p_chk, hp2_chk,
+                )
+                if pos_args is not None and neg_args is not None:
+                    # Skip/trigram features return masked arrays — may be shorter than n_check
+                    n_eval = len(pos_args[0])
+                    pe = np.zeros(n_eval, dtype=np.int64)
+                    ne = np.zeros(n_eval, dtype=np.int64)
+                    for h in range(feat.n_hashes):
+                        if len(pos_args) == 2:
+                            pe += feat.tables[h][_hash2_vec(pos_args[0], pos_args[1], h, feat.table_size)]
+                            ne += feat.tables[h][_hash2_vec(neg_args[0], neg_args[1], h, feat.table_size)]
+                        else:
+                            pe += feat.tables[h][_hash3_vec(pos_args[0], pos_args[1], pos_args[2], h, feat.table_size)]
+                            ne += feat.tables[h][_hash3_vec(neg_args[0], neg_args[1], neg_args[2], h, feat.table_size)]
+                    feat_discs[feat.name] = float(np.sum(pe < ne)) / max(1, n_eval)
+                else:
+                    feat_discs[feat.name] = 0.5
 
-            lex_pe = sum(self._lex_bi[h][_hash2_vec(cp_chk, ct_chk, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
-            lex_ne = sum(self._lex_bi[h][_hash2_vec(cp_chk, neg_chk, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
-            lex_d = float(np.sum(lex_pe < lex_ne)) / n_check
+            # Combined discrimination (only on bigram features for consistent shape)
+            comb_real = np.zeros(n_check, dtype=np.float64)
+            comb_neg = np.zeros(n_check, dtype=np.float64)
+            for feat in self.features.values():
+                # For combined metric, we need features that work on ALL n_check entries
+                # (bigram features). Skip/trigram features would need separate handling.
+                pos_args = feat.get_hash_args_nce(
+                    cp_chk, cpp_chk, ct_chk, ctp_chk,
+                    cp2_chk, cp2p_chk, None,  # pass mask=None to get unmasked arrays
+                )
+                neg_args = feat.get_hash_args_nce(
+                    cp_chk, cpp_chk, neg_chk, neg_pos_chk,
+                    cp2_chk, cp2p_chk, None,
+                )
+                if pos_args is not None and neg_args is not None and len(pos_args[0]) == n_check:
+                    pe = np.zeros(n_check, dtype=np.int64)
+                    ne = np.zeros(n_check, dtype=np.int64)
+                    for h in range(feat.n_hashes):
+                        if len(pos_args) == 2:
+                            pe += feat.tables[h][_hash2_vec(pos_args[0], pos_args[1], h, feat.table_size)]
+                            ne += feat.tables[h][_hash2_vec(neg_args[0], neg_args[1], h, feat.table_size)]
+                        else:
+                            pe += feat.tables[h][_hash3_vec(pos_args[0], pos_args[1], pos_args[2], h, feat.table_size)]
+                            ne += feat.tables[h][_hash3_vec(neg_args[0], neg_args[1], neg_args[2], h, feat.table_size)]
+                    comb_real += feat.weight * pe.astype(np.float64)
+                    comb_neg += feat.weight * ne.astype(np.float64)
 
-            comb_real = self.pos_weight * pos_e.astype(np.float64) + self.lex_weight * lex_pe.astype(np.float64)
-            comb_neg = self.pos_weight * neg_e.astype(np.float64) + self.lex_weight * lex_ne.astype(np.float64)
-            comb_d = float(np.sum(comb_real < comb_neg)) / n_check
+            comb_d = float(np.sum(comb_real < comb_neg)) / max(1, n_check)
 
             stats = {
                 'epoch': epoch,
-                'pos_disc': pos_d,
-                'lex_disc': lex_d,
                 'combined_disc': comb_d,
+                'feature_disc': feat_discs,
                 'time_s': t_elapsed,
             }
             all_stats.append(stats)
 
+            disc_str = ", ".join(f"{k}={v:.3f}" for k, v in feat_discs.items())
             print(f"    Epoch {epoch+1}/{n_epochs}: "
-                  f"pos_disc={pos_d:.3f}, lex_disc={lex_d:.3f}, "
-                  f"combined={comb_d:.3f}, time={t_elapsed:.1f}s", flush=True)
+                  f"combined={comb_d:.3f} | {disc_str} | "
+                  f"time={t_elapsed:.1f}s", flush=True)
 
-            # Show top POS rules
-            rules = self._top_pos_rules(5)
-            print(f"      Top rules (low=likely):", flush=True)
-            for r in rules:
-                print(f"        {r['from']} -> {r['to']}: {r['energy']:.0f}", flush=True)
+            # Show per-feature table stats
+            for feat in self.features.values():
+                fs = feat.statistics()
+                print(f"      {feat.name}: range=[{fs['range'][0]},{fs['range'][1]}], "
+                      f"mean={fs['mean']:.1f}, std={fs['std']:.1f}, "
+                      f"nnz={fs['nnz']}", flush=True)
 
             if callback:
                 callback(epoch, stats)
 
         return {'epochs': all_stats}
 
-    def _clip_tables(self):
-        """Clip all table values to prevent energy explosion."""
-        for h in range(self.n_pos_hashes):
-            np.clip(self._pos_bi[h], -self.pos_clip, self.pos_clip, out=self._pos_bi[h])
-        for h in range(self.n_lex_hashes):
-            np.clip(self._lex_bi[h], -self.lex_clip, self.lex_clip, out=self._lex_bi[h])
-        if self._pos_tri is not None:
-            for h in range(self.n_pos_hashes):
-                np.clip(self._pos_tri[h], -self.pos_clip, self.pos_clip, out=self._pos_tri[h])
-        if self._lex_tri is not None:
-            for h in range(self.n_lex_hashes):
-                np.clip(self._lex_tri[h], -self.lex_clip, self.lex_clip, out=self._lex_tri[h])
-        if self._skip_bi is not None:
-            for h in range(self.n_skip_hashes):
-                np.clip(self._skip_bi[h], -self.skip_clip, self.skip_clip, out=self._skip_bi[h])
-                np.clip(self._skip_pos_bi[h], -self.skip_clip, self.skip_clip, out=self._skip_pos_bi[h])
-
-    def _top_pos_rules(self, k: int = 5) -> List[Dict]:
-        """Return the k most and least likely POS transitions."""
-        from .vocabulary import IDX2POS
-        pairs = {}
-        for t1 in range(self.n_pos_types):
-            for t2 in range(self.n_pos_types):
-                total = sum(int(self._pos_bi[h][_hash2(t1, t2, h, self.pos_table_size)])
-                            for h in range(self.n_pos_hashes))
-                pairs[(IDX2POS.get(t1, "X"), IDX2POS.get(t2, "X"))] = total / max(1, self.n_pos_hashes)
-
-        sorted_p = sorted(pairs.items(), key=lambda x: x[1])
-        rules = [{'from': p[0], 'to': p[1], 'energy': e} for p, e in sorted_p[:k]]
-        rules += [{'from': p[0], 'to': p[1], 'energy': e} for p, e in sorted_p[-k:]]
-        return rules
+    # -------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------
 
     def get_pos_matrix(self) -> np.ndarray:
-        """Return 13x13 POS transition energy matrix for visualization."""
+        """
+        Return 13x13 POS transition energy matrix for visualization.
+
+        NOTE: This is computed from the WordPosBigramFeature (if present),
+        by marginalizing over prev_word. If not present, falls back to
+        PosBigramFeature. If neither exists, returns zeros.
+        """
         matrix = np.zeros((self.n_pos_types, self.n_pos_types), dtype=np.float64)
-        for t1 in range(self.n_pos_types):
-            for t2 in range(self.n_pos_types):
-                total = sum(int(self._pos_bi[h][_hash2(t1, t2, h, self.pos_table_size)])
-                            for h in range(self.n_pos_hashes))
-                matrix[t1, t2] = total / max(1, self.n_pos_hashes)
+
+        # Try to use PosBigramFeature directly
+        pos_bi = self.features.get("pos_bi")
+        if pos_bi is not None:
+            for t1 in range(self.n_pos_types):
+                for t2 in range(self.n_pos_types):
+                    total = sum(
+                        int(pos_bi.tables[h][_hash2(t1, t2, h, pos_bi.table_size)])
+                        for h in range(pos_bi.n_hashes)
+                    )
+                    matrix[t1, t2] = total / max(1, pos_bi.n_hashes)
+            return matrix
+
+        # Fall back: estimate from WordPosBigramFeature by averaging over words
+        word_pos_feat = self.features.get("word_pos_bi")
+        if word_pos_feat is not None:
+            # For each (pos_prev, pos_cand) pair, average the energy over
+            # all words with pos_prev
+            from .vocabulary import IDX2POS
+            for p1 in range(self.n_pos_types):
+                words_with_p1 = np.where(self.word_pos == p1)[0]
+                if len(words_with_p1) == 0:
+                    continue
+                for p2 in range(self.n_pos_types):
+                    energies = []
+                    # Sample up to 20 words with this POS
+                    sample_words = words_with_p1[:20]
+                    for w in sample_words:
+                        e = 0
+                        for h in range(word_pos_feat.n_hashes):
+                            slot = _hash2(int(w), p2, h, word_pos_feat.table_size)
+                            e += int(word_pos_feat.tables[h][slot])
+                        energies.append(e)
+                    matrix[p1, p2] = np.mean(energies)
+            return matrix
+
         return matrix
 
     def memory_mb(self) -> float:
-        """Estimate memory usage in MB."""
-        total = (self.pos_table_size * self.n_pos_hashes +
-                 self.lex_table_size * self.n_lex_hashes +
-                 self._pos_tri_size * self.n_pos_hashes +
-                 self._lex_tri_size * self.n_lex_hashes)
-        if self._skip_bi is not None:
-            total += self.skip_table_size * self.n_skip_hashes * 2  # skip_bi + skip_pos_bi
-        return total * 4 / (1024 * 1024)
+        """Estimate total memory usage in MB."""
+        total = sum(
+            sum(t.nbytes for t in feat.tables)
+            for feat in self.features.values()
+        )
+        return total / (1024 * 1024)
 
     def statistics(self) -> Dict:
-        """Return table statistics."""
+        """Return combined table statistics."""
+        feat_stats = {feat.name: feat.statistics() for feat in self.features.values()}
         return {
-            'pos_nnz': sum(int(np.count_nonzero(t)) for t in self._pos_bi),
-            'lex_nnz': sum(int(np.count_nonzero(t)) for t in self._lex_bi),
-            'pos_range': (int(min(t.min() for t in self._pos_bi)),
-                          int(max(t.max() for t in self._pos_bi))),
-            'lex_range': (int(min(t.min() for t in self._lex_bi)),
-                          int(max(t.max() for t in self._lex_bi))),
+            'n_features': len(self.features),
+            'feature_names': list(self.features.keys()),
+            'features': feat_stats,
             'memory_mb': self.memory_mb(),
-            'pos_weight': self.pos_weight,
-            'lex_weight': self.lex_weight,
-            'skip_weight': self.skip_weight,
         }

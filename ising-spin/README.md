@@ -4,82 +4,102 @@ A pure integer language model with no neural networks and no torch dependency. R
 
 ## What It Is
 
-An integer-only language model that combines:
+An integer-only language model with **dynamic features**:
 
 1. **Bigram counting** — base probabilities P(word | previous) from integer counts
-2. **POS energy rules** — category-level syntax that generalizes across words ("the cat" improves "a dog" because both are DET→NOUN)
-3. **Lexical hash tables** — token-specific knowledge for fine-grained distinctions
-4. **Skip-gram patterns** — structural dependencies beyond adjacent tokens (subject-verb, determiner-verb)
+2. **Dynamic feature registry** — add/remove energy features at runtime
+3. **Mixed word-POS features** — hash(word, POS) with 26000+ keys (not the old static 13x13 POS matrix!)
+4. **Balanced NCE training** — equal representation across POS types
 5. **Metropolis gate** — hard rejection for grammatically invalid tokens
-6. **Boltzmann sampling** — stochastic generation from energy distribution
+6. **LEGD** — P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
 
 **Memory**: ~20 MB for a 2000-word vocabulary. No GPU needed.
 
-## What It Can Do
+## What Changed in v80
 
-- Generate grammatically coherent text for simple domains
-- Score text for grammaticality (energy-based discrimination)
-- Provide an interpretable 13×13 POS transition matrix showing what rules it learned
-- Run on any device with Python and numpy — no torch, no GPU
+**The POS disaster is fixed.** The old system used a hardcoded 13x13 POS matrix with only 169 unique keys. Every slot saturated at +/-500, the gradient went to zero, and POS discrimination accuracy was below random (0.46). The new system uses **mixed word-POS features** like hash(prev_word, cand_pos) with V*13 = 26000+ unique keys. Hash collisions in a 65537-slot table create smooth generalization without saturation.
 
-## What It Cannot Do
+**Variable features.** The old system hardcoded exactly 4 table types. The new system uses a `FeatureSpec` base class with `add_feature()` / `remove_feature()`. You can register any number of features, including custom ones you define yourself.
 
-- Generate creative or surprising text (it's a bigram model with syntactic corrections)
-- Handle long-range semantic coherence beyond a few tokens
-- Compete with neural language models on perplexity
-- Understand meaning — it knows syntax, not semantics
+**Fixed energy scaling.** The old system had clip values of 500-1000, producing energy std of 3600+ that overwhelmed the base model (std 246). With clips of 30-100 and proper z-score normalization, the energy acts as a gentle correction.
 
-## How It Works
+## Available Features
 
-### Training
+### Bigram features (need context >= 1)
 
-1. Count bigrams from text (integer counting, no gradients)
-2. Train energy tables via Noise-Contrastive Estimation (NCE):
-   - For real (prev, target) pairs: table[hash] -= eta (lower energy = more likely)
-   - For fake (prev, random) pairs: table[hash] += eta (higher energy = less likely)
-3. Calibrate mixing weights via grid search
+| Feature | Hash | Keys | Default? |
+|---------|------|------|----------|
+| `LexBigramFeature` | hash(prev_word, cand_word) | V^2 = 4M | Yes |
+| `WordPosBigramFeature` | hash(prev_word, cand_pos) | V*13 = 26K | Yes |
+| `PosWordBigramFeature` | hash(prev_pos, cand_word) | 13*V = 26K | Yes |
+| `PosBigramFeature` | hash(prev_pos, cand_pos) | 169 | No* |
 
-### Generation
+*PosBigramFeature is excluded by default — 169 keys causes saturation.
 
-At each step:
-1. Bigram model proposes top-K candidates with probabilities
-2. Feature hash energy computes ΔE for each candidate (O(1) per candidate)
-3. Metropolis gate hard-rejects candidates above energy threshold
-4. Repetition penalty added for recently-used words
-5. Combined energy = base_energy + α × hash_energy + rep_penalty
-6. Boltzmann sample from adjusted distribution
+### Skip-gram features (need context >= 2)
 
-### The Key Insight: POS Generalization
+| Feature | Hash | Keys | Default? |
+|---------|------|------|----------|
+| `LexSkipFeature` | hash(prev2_word, cand_word) | V^2 = 4M | Yes |
+| `WordPosSkipFeature` | hash(prev2_word, cand_pos) | V*13 = 26K | No |
+| `PosWordSkipFeature` | hash(prev2_pos, cand_word) | 13*V = 26K | No |
+| `PosSkipFeature` | hash(prev2_pos, cand_pos) | 169 | No* |
 
-With 13 POS categories, there are only 13×13 = 169 possible POS bigram pairs. Every DET→NOUN transition ("the cat", "a dog", "this house", ...) maps to the **same** energy table slot. Training on "the cat" automatically improves the score for "a dog" — without ever seeing that pair. This is generalization through shared structure, not through learned representations.
+### Trigram features (need context >= 2)
 
-The POS table learns rules like:
-- DET→NOUN = strongly negative energy (good transition)
-- NOUN→DET = strongly positive energy (bad transition)
-- AUX→VERB = negative energy (good)
-- PUNCT→PUNCT = positive energy (bad)
-
-These rules apply to **all** words with those POS tags, including words the model has never seen together.
-
-### Skip-grams
-
-Skip-gram tables hash (context[-2], candidate), skipping the immediately preceding word. This captures patterns like:
-- "the cat **sat**" → skip2("the", "sat") captures DET→VERB at distance 2
-- POS version: hash(POS("the"), POS("sat")) = hash(DET, VERB)
-
-This provides structural awareness beyond what adjacent bigrams can capture.
+| Feature | Hash | Keys | Default? |
+|---------|------|------|----------|
+| `PosTrigramFeature` | hash(prev2_pos, prev_pos, cand_pos) | 2197 | Yes |
+| `LexTrigramFeature` | hash(prev2_word, prev_word, cand_word) | V^3 = 8B | Yes |
 
 ## Quick Start
 
 ```bash
-# Full training run (50K TinyStories texts)
+# Full training run (50K TinyStories texts, default 6 features)
 python -u train.py
 
 # Quick test with smaller data
 python -u train.py --samples 5000 --vocab 1000 --nce-epochs 1
 
-# Custom configuration
-python -u train.py --nce-epochs 5 --lex-table-size 131071 --pos-eta 5
+# All 10 features
+python -u train.py --features all
+
+# Custom feature set
+python -u train.py --features lex_bi,word_pos_bi,pos_word_bi
+
+# Adjust energy scale
+python -u train.py --lex-clip 50 --pos-clip 20
+```
+
+## Adding Custom Features
+
+```python
+from ising_spin import FeatureSpec, IntegerLM
+
+class MyFeature(FeatureSpec):
+    """Custom feature: hash(my_thing, cand_word)"""
+
+    def __init__(self, **kwargs):
+        super().__init__("my_feature", n_hashes=2, table_size=65537,
+                         eta=1, clip=50, weight=0.5, **kwargs)
+
+    def get_hash_args_batch(self, context, candidates, word_pos):
+        if not context:
+            return None
+        K = len(candidates)
+        # Your custom extraction logic here
+        my_thing = np.full(K, some_value, dtype=np.int64)
+        return (my_thing, candidates.astype(np.int64))
+
+    def get_hash_args_nce(self, prev_words, prev_pos, right_words, right_pos,
+                          prev2_words=None, prev2_pos=None, mask=None):
+        # Same extraction for NCE training
+        return (some_array, right_words)
+
+# Register it
+model = IntegerLM(vocab=vocab)
+model.add_feature(MyFeature())
+model.train(sequences)
 ```
 
 ## Project Structure
@@ -89,40 +109,43 @@ src/ising_spin/
 ├── __init__.py              # Package exports
 ├── integer_lm.py            # Main class: IntegerLM
 ├── bigram_model.py          # Pure integer bigram base model
-├── feature_hash_energy.py   # POS + lexical + skip-gram energy tables
+├── feature_hash_energy.py   # FeatureSpec base + 10 concrete features + registry
 ├── boltzmann.py             # Integer-only Boltzmann sampler
 ├── vocabulary.py            # Vocabulary + POS type system
 └── utils.py                 # Utility functions
 train.py                     # Training script
 ```
 
-## Architecture Details
+## How It Works
 
-### BigramModel (base model)
+### Training
 
-- Dense 2000×2000 int32 count matrix (16 MB)
-- Laplace-smoothed probabilities: P(j|i) = (count[i][j] + α) / (total[i] + αV)
-- Returns top-K candidates with log-probabilities
+1. Count bigrams from text (integer counting, no gradients)
+2. Train all feature tables via Noise-Contrastive Estimation (NCE):
+   - Real (prev, target) pairs: table[hash] -= eta (lower energy = more likely)
+   - Fake (prev, random) pairs: table[hash] += eta (higher energy = less likely)
+   - Negatives are BALANCED across POS types (not 88% NOUN)
+3. Calibrate alpha via grid search (range [0.001, 0.5])
 
-### FeatureHashEnergyTable (energy correction)
+### Generation
 
-| Table | Size | What It Captures |
-|-------|------|-----------------|
-| POS bigram | 1009 × 2 hashes | DET→NOUN, NOUN→VERB rules (169 possible pairs) |
-| POS trigram | 1265 × 2 hashes | Three-word POS patterns |
-| Lexical bigram | 65537 × 3 hashes | Token-specific "the cat" vs "the dog" |
-| Lexical trigram | 65569 × 3 hashes | Three-word token patterns |
-| Skip-gram lexical | 65537 × 2 hashes | Long-range token dependencies |
-| Skip-gram POS | 1009 × 2 hashes | Long-range POS dependencies |
+At each step:
+1. Bigram model proposes top-K candidates with probabilities
+2. Each feature computes its energy contribution (O(1) per candidate per feature)
+3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+4. Metropolis gate hard-rejects candidates above threshold
+5. Repetition penalty for recently-used words
+6. Sample from distribution
 
-Total memory: ~3 MB for the energy tables + 16 MB for bigrams = ~19 MB.
+### The Key Insight: Word-POS Features
 
-### IntegerBoltzmannSampler
+The old approach: hash(prev_pos, cand_pos) produces 13*13 = 169 unique keys. Each key independently accumulates NCE updates and saturates at the clip limit. Once saturated, the gradient is zero — the table can't learn.
 
-Pre-computes a lookup table via integer geometric recurrence (no `math.exp`):
-- Table construction: integer Taylor expansion of exp(-β)
-- Sampling: integer array lookup + cumulative sum + binary search
-- Zero floating-point operations in the hot path
+The new approach: hash(prev_word, cand_pos) produces V*13 = 26000+ unique keys. With a 65537-slot table and 2 hash functions:
+- "the"->NOUN and "a"->NOUN hash to DIFFERENT slots (specificity)
+- But nearby hash slots create smooth generalization (like "the" and "a" both being determiners)
+- "the"->VERB hashes to a completely different slot (no contamination)
+- Saturation is impossible: with 26000 keys and clip=50, the table converges smoothly
 
 ## Dependencies
 

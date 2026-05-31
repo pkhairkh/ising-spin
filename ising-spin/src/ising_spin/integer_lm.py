@@ -4,25 +4,36 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture:
+Architecture (v80 — Dynamic Features):
   1. BigramModel: P(word | prev) from integer counts (the base)
-  2. FeatureHashEnergy: POS rules + lexical facts + skip-gram patterns
-  3. LEGD: P(c) ∝ P_base(c) × exp(-α × E_norm(c))
-  4. Metropolis gate: hard-reject grammatically invalid tokens
+  2. Dynamic FeatureHashEnergy: variable features registered at runtime
+     - Each feature is a self-contained FeatureSpec (own tables, eta, clip, weight)
+     - add_feature() / remove_feature() for full flexibility
+     - Default: 6 features (lex_bi, word_pos_bi, pos_word_bi, lex_skip, pos_tri, lex_tri)
+  3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+  4. Metropolis gate: hard-reject high-energy candidates
   5. Repetition penalty: prevent loops
+
+KEY CHANGES from v79:
+  - No more hardcoded 13x13 POS matrix (the "POS disaster")
+  - Mixed word-POS features (hash(word, pos)) with 26000+ keys
+    replace static POS pairs (hash(pos, pos)) with 169 keys
+  - Variable number of features via FeatureSpec registry
+  - Proper energy scaling: smaller clip values (50-100 vs 500-1000)
+  - Calibration searches smaller alpha range (0.001-0.5 vs 0-10)
 
 Generation loop (per step):
   1. Bigram model proposes top-K candidates with probabilities
-  2. Feature hash energy computes E for each candidate
-  3. LEGD combines: P(c) ∝ P_base(c) × exp(-α × E_norm(c))
+  2. Each feature computes its energy contribution
+  3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
   4. Metropolis gate zeros out candidates above threshold
   5. Repetition penalty reduces probability of recent words
   6. Sample from resulting distribution
 
 Training:
   1. Count bigrams (integer)
-  2. NCE train energy tables (integer, with balanced POS negatives)
-  3. Calibrate alpha + feature weights (grid search on LEGD probs)
+  2. NCE train all features (integer, with balanced POS negatives)
+  3. Calibrate alpha (grid search on LEGD probs)
 
 Memory footprint: ~20 MB for V=2000. Runs anywhere.
 """
@@ -31,58 +42,42 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 
 from .bigram_model import BigramModel
-from .feature_hash_energy import FeatureHashEnergyTable
+from .feature_hash_energy import (
+    FeatureHashEnergyTable, FeatureSpec, default_features,
+)
 from .vocabulary import Vocabulary, IDX2POS
 
 
 class IntegerLM:
     """
-    Pure Integer Language Model.
+    Pure Integer Language Model with Dynamic Features.
 
     No neural nets. No torch. No float32 matrix multiplies in the hot path.
     Just integer counting, hash table lookups, and LEGD probability adjustment.
 
     The LEGD formula:
-        P(c | ctx) ∝ P_base(c | prev) × exp(-α × E_norm(c, ctx))
+        P(c | ctx) proportional to P_base(c | prev) * exp(-alpha * E_norm(c))
 
     Lower energy = more likely = higher probability.
-    α controls how much the energy correction overrides the base model.
-    α=0: pure bigram model. α→∞: pure energy model.
+    alpha controls how much the energy correction overrides the base model.
+    alpha=0: pure bigram model. alpha->inf: pure energy model.
     """
 
     def __init__(
         self,
         vocab: Vocabulary,
-        # Energy table parameters
-        n_pos_hashes: int = 2,
-        pos_table_size: int = 1009,
-        pos_eta: int = 3,
-        pos_clip: int = 500,
-        n_lex_hashes: int = 3,
-        lex_table_size: int = 65537,
-        lex_eta: int = 1,
-        lex_clip: int = 1000,
-        use_skip: bool = True,
-        n_skip_hashes: int = 2,
-        skip_table_size: int = 65537,
-        skip_eta: int = 1,
-        skip_clip: int = 800,
-        use_trigram: bool = True,
-        trigram_weight: int = 1,
-        # Energy combination weights
-        pos_weight: float = 1.0,
-        lex_weight: float = 1.0,
-        skip_weight: float = 0.5,
-        # Bigram model
-        smoothing_alpha: float = 1.0,
-        log_prob_scale: int = 100,
+        # Feature configuration — either pass a list of features OR use defaults
+        features: Optional[List[FeatureSpec]] = None,
         # Generation
         top_k: int = 50,
-        alpha: float = 1.0,
+        alpha: float = 0.1,
         temperature: float = 1.0,
         metropolis_threshold: int = 0,
         rep_penalty: float = 3.0,
         rep_window: int = 5,
+        # Bigram model
+        smoothing_alpha: float = 1.0,
+        log_prob_scale: int = 100,
         # Seed
         seed: int = 42,
     ):
@@ -99,31 +94,21 @@ class IntegerLM:
             seed=seed,
         )
 
-        # Feature hash energy
+        # Feature hash energy — dynamic feature registry
         self.energy = FeatureHashEnergyTable(
             vocab_size=self.V,
             word_pos=vocab.word_pos,
             n_pos_types=13,
-            n_pos_hashes=n_pos_hashes,
-            pos_table_size=pos_table_size,
-            pos_eta=pos_eta,
-            pos_clip=pos_clip,
-            n_lex_hashes=n_lex_hashes,
-            lex_table_size=lex_table_size,
-            lex_eta=lex_eta,
-            lex_clip=lex_clip,
-            use_skip=use_skip,
-            n_skip_hashes=n_skip_hashes,
-            skip_table_size=skip_table_size,
-            skip_eta=skip_eta,
-            skip_clip=skip_clip,
-            use_trigram=use_trigram,
-            trigram_weight=trigram_weight,
-            pos_weight=pos_weight,
-            lex_weight=lex_weight,
-            skip_weight=skip_weight,
             seed=seed,
         )
+
+        # Register features
+        if features is not None:
+            for feat in features:
+                self.energy.add_feature(feat)
+        else:
+            for feat in default_features():
+                self.energy.add_feature(feat)
 
         # Generation parameters
         self.top_k = top_k
@@ -140,12 +125,28 @@ class IntegerLM:
         self._calibrated = False
 
     # -------------------------------------------------------------------
+    # Feature management — add/remove features at any time
+    # -------------------------------------------------------------------
+
+    def add_feature(self, feature: FeatureSpec):
+        """Add a feature to the energy table. Must be done before training."""
+        self.energy.add_feature(feature)
+
+    def remove_feature(self, name: str):
+        """Remove a feature by name."""
+        self.energy.remove_feature(name)
+
+    def list_features(self) -> List[str]:
+        """List registered feature names."""
+        return list(self.energy.features.keys())
+
+    # -------------------------------------------------------------------
     # Training
     # -------------------------------------------------------------------
 
     def train(self, sequences: List[List[int]], n_epochs: int = 3, n_negatives: int = 3) -> Dict:
         """
-        Train the model: build bigram counts + NCE train energy tables.
+        Train the model: build bigram counts + NCE train all features.
         """
         print("  Training bigram model...", flush=True)
         self.bigram.build(sequences)
@@ -163,6 +164,13 @@ class IntegerLM:
     def calibrate(self, sequences: List[List[int]]) -> Dict:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
+
+        v80 FIX: The old calibration searched alpha in [0, 10] which was
+        way too large. With z-score normalized energy and smaller clip
+        values, the right range is [0.001, 0.5].
+
+        Also: we now calibrate feature weights by searching a small grid
+        per feature, rather than the old monolithic 3D grid search.
         """
         print("  Calibrating...", flush=True)
 
@@ -183,7 +191,7 @@ class IntegerLM:
 
         print(f"    Energy: mean={self._e_mean:.1f}, std={self._e_std:.1f}", flush=True)
 
-        # Build test data
+        # Build test data for re-ranking accuracy
         rerank_data = []
         for seq in sequences[:200]:
             if len(seq) < 3:
@@ -202,33 +210,44 @@ class IntegerLM:
 
         print(f"    Grid search on {len(rerank_data)} pairs...", flush=True)
 
+        # Phase 1: Search alpha in reasonable range
+        # v80 FIX: old range was [0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]
+        # With z-score normalization, alpha should be small
         best_alpha, best_acc = self.alpha, 0.0
-        best_pw = self.energy.pos_weight
-        best_lw = self.energy.lex_weight
-        best_sw = self.energy.skip_weight
-
-        # Phase 1: search alpha
-        for alpha in [0.0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]:
+        for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:
             acc = self._eval_rerank(rerank_data, alpha)
             if acc > best_acc:
                 best_acc, best_alpha = acc, alpha
 
-        # Phase 2: search feature weights
         print(f"    Best alpha: {best_alpha} (acc={best_acc:.3f})", flush=True)
-        print(f"    Searching feature weights...", flush=True)
-        for pw in [0.5, 1.0, 2.0, 3.0, 5.0]:
-            for lw in [0.5, 1.0, 2.0, 3.0]:
-                for sw in [0.0, 0.3, 0.5, 1.0]:
-                    self.energy.pos_weight = pw
-                    self.energy.lex_weight = lw
-                    self.energy.skip_weight = sw
-                    acc = self._eval_rerank(rerank_data, best_alpha)
-                    if acc > best_acc:
-                        best_acc, best_pw, best_lw, best_sw = acc, pw, lw, sw
 
-        self.energy.pos_weight = best_pw
-        self.energy.lex_weight = best_lw
-        self.energy.skip_weight = best_sw
+        # Phase 2: Search feature weights (only if there are features)
+        best_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
+        if len(self.energy.features) > 0 and best_alpha > 0:
+            print(f"    Searching feature weights...", flush=True)
+
+            # Search each feature's weight independently (greedy)
+            for feat in self.energy.features.values():
+                original_weight = feat.weight
+                best_w = original_weight
+                best_feat_acc = best_acc
+
+                for w in [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]:
+                    feat.weight = w
+                    acc = self._eval_rerank(rerank_data, best_alpha)
+                    if acc > best_feat_acc:
+                        best_feat_acc = acc
+                        best_w = w
+
+                feat.weight = best_w
+                if best_feat_acc > best_acc:
+                    best_acc = best_feat_acc
+                    best_weights[feat.name] = best_w
+
+            # Restore best weights
+            for feat in self.energy.features.values():
+                feat.weight = best_weights.get(feat.name, feat.weight)
+
         self.alpha = best_alpha
 
         # Metropolis threshold: reject candidates in the top 30% of energy
@@ -248,11 +267,12 @@ class IntegerLM:
             'alpha': best_alpha,
             'metropolis_threshold': best_threshold,
             'rerank_acc': best_acc,
-            'pos_weight': best_pw, 'lex_weight': best_lw, 'skip_weight': best_sw,
+            'feature_weights': best_weights,
         }
-        print(f"    Result: alpha={best_alpha}, "
-              f"pos_w={best_pw}, lex_w={best_lw}, skip_w={best_sw}, "
-              f"threshold={best_threshold}, acc={best_acc:.3f}", flush=True)
+        w_str = ", ".join(f"{k}={v:.1f}" for k, v in best_weights.items())
+        print(f"    Result: alpha={best_alpha}, threshold={best_threshold}, "
+              f"acc={best_acc:.3f}", flush=True)
+        print(f"    Weights: {w_str}", flush=True)
         return result
 
     def _eval_rerank(self, data, alpha):
@@ -283,16 +303,11 @@ class IntegerLM:
         """
         Compute LEGD-adjusted probabilities.
 
-        P(c) ∝ P_base(c)^(1/T) × exp(-α × E_norm(c) / T)
+        P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E_norm(c) / T)
 
-        This is the proper LEGD (Local Energy-Guided Decoding) formula:
-          - Base probability is adjusted by energy in probability space
-          - α controls energy influence (0 = pure bigram, ∞ = pure energy)
-          - T controls sampling diversity (1.0 = normal, >1 = more random)
-
-        The key insight: we work in PROBABILITY space, not energy space.
-        The old formula combined base_e + α×h_scaled and applied Boltzmann,
-        which produced P_base^{β×scale} = P_base^{10} — absurdly peaked.
+        The energy is z-score normalized: E_norm = (E - mean) / std
+        With proper normalization and alpha in [0.001, 0.5], the energy
+        acts as a gentle correction to the base model, not a sledgehammer.
         """
         K = len(candidates)
         if K == 0:
@@ -306,7 +321,7 @@ class IntegerLM:
         hash_e = self.energy.compute_local_energy_batch(context, candidates)
         h_norm = (hash_e.astype(np.float64) - self._e_mean) / max(1.0, self._e_std)
 
-        # LEGD: P(c) ∝ P_base(c) × exp(-alpha × h_norm(c) / T)
+        # LEGD: P(c) proportional to P_base(c) * exp(-alpha * h_norm(c) / T)
         legd_weights = base_probs * np.exp(-alpha * h_norm / temperature)
 
         # Metropolis gate: zero out candidates above threshold
@@ -315,8 +330,6 @@ class IntegerLM:
             legd_weights[gate] = 0.0
 
         # Repetition penalty (in probability space)
-        # rep_penalty is in natural-log units: weight *= exp(-penalty × recency / T)
-        # Default 3.0 means the most recent word gets exp(-3) ≈ 0.05 weight
         if recent_words and self.rep_penalty > 0:
             recent = recent_words[-self.rep_window:]
             for i, cid in enumerate(candidates):
@@ -388,8 +401,8 @@ class IntegerLM:
         Compute base PPL and LEGD-adjusted PPL.
 
         LEGD PPL uses the proper formula:
-          P_legd(target) = P_base(target) × exp(-α × E_norm(target)) / Z
-        where Z = Σ_c P_base(c) × exp(-α × E_norm(c))
+          P_legd(target) = P_base(target) * exp(-alpha * E_norm(target)) / Z
+        where Z = sum_c P_base(c) * exp(-alpha * E_norm(c))
         """
         base_lps, legd_lps, n_tok = [], [], 0
 
@@ -452,28 +465,27 @@ class IntegerLM:
         return {'accuracy': correct / max(1, total), 'comparisons': total}
 
     def pos_transition_matrix(self) -> np.ndarray:
-        """Return 13x13 POS transition energy matrix."""
+        """Return 13x13 POS transition energy matrix for visualization."""
         return self.energy.get_pos_matrix()
 
     def diagnostics(self) -> Dict:
         """Full diagnostic report."""
         e_stats = self.energy.statistics()
         b_stats = self.bigram.statistics()
+        feat_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
         return {
             'alpha': self.alpha,
             'temperature': self.temperature,
             'metropolis_threshold': self.metropolis_threshold,
             'rep_penalty': self.rep_penalty,
             'rep_window': self.rep_window,
-            'pos_weight': e_stats['pos_weight'],
-            'lex_weight': e_stats['lex_weight'],
-            'skip_weight': e_stats['skip_weight'],
+            'n_features': e_stats['n_features'],
+            'feature_names': e_stats['feature_names'],
+            'feature_weights': feat_weights,
             'energy_mean': self._e_mean,
             'energy_std': self._e_std,
             'calibrated': self._calibrated,
             'energy_memory_mb': e_stats['memory_mb'],
             'bigram_memory_mb': b_stats.get('memory_mb', 0),
             'bigram_nnz': b_stats.get('nonzero_bigrams', 0),
-            'pos_nnz': e_stats['pos_nnz'],
-            'lex_nnz': e_stats['lex_nnz'],
         }

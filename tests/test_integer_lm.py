@@ -1,4 +1,4 @@
-"""Basic tests for the Integer Language Model."""
+"""Tests for the Integer Language Model (v80 — Dynamic Features)."""
 import numpy as np
 import pytest
 
@@ -44,23 +44,103 @@ class TestBigramModel:
         assert lp < 0  # Log prob should be negative
 
 
+class TestFeatureSpec:
+    def test_lex_bigram_feature(self, small_vocab):
+        from ising_spin.feature_hash_energy import LexBigramFeature
+        feat = LexBigramFeature(n_hashes=1, table_size=101, eta=1, clip=50)
+        seqs = small_vocab.tokenize(["the cat sat on the mat"] * 10)
+        # Test batch energy
+        context = seqs[0][:2]
+        candidates = np.array(seqs[0][2:5], dtype=np.int64)
+        e = feat.energy_batch(context, candidates, small_vocab.word_pos)
+        assert len(e) == 3
+        # Before training, all energies should be 0
+        assert np.all(e == 0)
+
+    def test_word_pos_bigram_feature(self, small_vocab):
+        from ising_spin.feature_hash_energy import WordPosBigramFeature
+        feat = WordPosBigramFeature(n_hashes=1, table_size=101, eta=1, clip=30)
+        seqs = small_vocab.tokenize(["the cat sat on the mat"] * 10)
+        context = seqs[0][:2]
+        candidates = np.array(seqs[0][2:5], dtype=np.int64)
+        e = feat.energy_batch(context, candidates, small_vocab.word_pos)
+        assert len(e) == 3
+        # Before training, all energies should be 0
+        assert np.all(e == 0)
+
+    def test_feature_registration(self, small_vocab):
+        """Test dynamic add/remove of features."""
+        from ising_spin import FeatureHashEnergyTable
+        from ising_spin.feature_hash_energy import LexBigramFeature, WordPosBigramFeature
+
+        table = FeatureHashEnergyTable(
+            vocab_size=small_vocab.V,
+            word_pos=small_vocab.word_pos,
+        )
+        assert len(table.features) == 0
+
+        feat1 = LexBigramFeature(n_hashes=1, table_size=101)
+        table.add_feature(feat1)
+        assert len(table.features) == 1
+        assert "lex_bi" in table.features
+
+        feat2 = WordPosBigramFeature(n_hashes=1, table_size=101)
+        table.add_feature(feat2)
+        assert len(table.features) == 2
+
+        table.remove_feature("lex_bi")
+        assert len(table.features) == 1
+        assert "word_pos_bi" in table.features
+
+    def test_variable_number_of_features(self, small_vocab):
+        """Test that any number of features can be added."""
+        from ising_spin import FeatureHashEnergyTable
+        from ising_spin.feature_hash_energy import (
+            LexBigramFeature, WordPosBigramFeature, PosWordBigramFeature,
+            LexSkipFeature, PosTrigramFeature, LexTrigramFeature,
+        )
+
+        # 1 feature
+        table1 = FeatureHashEnergyTable(
+            vocab_size=small_vocab.V, word_pos=small_vocab.word_pos,
+        )
+        table1.add_feature(LexBigramFeature(n_hashes=1, table_size=101))
+        assert len(table1.features) == 1
+
+        # 6 features (default)
+        table6 = FeatureHashEnergyTable(
+            vocab_size=small_vocab.V, word_pos=small_vocab.word_pos,
+        )
+        for feat in [
+            LexBigramFeature(n_hashes=1, table_size=101),
+            WordPosBigramFeature(n_hashes=1, table_size=101),
+            PosWordBigramFeature(n_hashes=1, table_size=101),
+            LexSkipFeature(n_hashes=1, table_size=101),
+            PosTrigramFeature(n_hashes=1, table_size=101),
+            LexTrigramFeature(n_hashes=1, table_size=101),
+        ]:
+            table6.add_feature(feat)
+        assert len(table6.features) == 6
+
+
 class TestFeatureHashEnergy:
     def test_train_and_query(self, small_vocab):
         from ising_spin import FeatureHashEnergyTable
-        e = FeatureHashEnergyTable(
+        from ising_spin.feature_hash_energy import (
+            LexBigramFeature, WordPosBigramFeature,
+        )
+        table = FeatureHashEnergyTable(
             vocab_size=small_vocab.V,
             word_pos=small_vocab.word_pos,
-            n_pos_hashes=1, pos_table_size=101,
-            n_lex_hashes=1, lex_table_size=1009,
-            use_skip=False, use_trigram=False,
-            seed=42,
         )
+        table.add_feature(LexBigramFeature(n_hashes=1, table_size=1009, eta=1, clip=50))
+        table.add_feature(WordPosBigramFeature(n_hashes=1, table_size=1009, eta=1, clip=30))
         seqs = small_vocab.tokenize(["the cat sat on the mat"] * 10)
-        e.train_nce(seqs, n_epochs=1, n_negatives=2)
-        # Energy for real pair should be lower than random
+        table.train_nce(seqs, n_epochs=1, n_negatives=2)
+        # Energy for real pair should be computable
         ctx = seqs[0][:2]
         target = seqs[0][2]
-        real_e = e.compute_local_energy(ctx, target)
+        real_e = table.compute_local_energy(ctx, target)
         assert isinstance(real_e, int)
 
 
@@ -80,9 +160,48 @@ class TestIntegerLM:
         assert 0.0 <= result['accuracy'] <= 1.0
 
     def test_perplexity(self, small_model, small_vocab):
-        """Test that perplexity computation doesn't crash (the bug we fixed)."""
+        """Test that perplexity computation doesn't crash."""
         seqs = small_vocab.tokenize(["the cat sat on the mat"] * 5)
         result = small_model.perplexity(seqs, n_samples=5)
         assert 'base_ppl' in result
         assert 'legd_ppl' in result
         assert result['base_ppl'] > 0
+
+    def test_dynamic_features(self, small_vocab):
+        """Test add_feature / remove_feature on IntegerLM."""
+        from ising_spin import IntegerLM
+        from ising_spin.feature_hash_energy import (
+            LexBigramFeature, WordPosBigramFeature,
+        )
+
+        model = IntegerLM(
+            vocab=small_vocab,
+            features=[
+                LexBigramFeature(n_hashes=1, table_size=101, eta=1, clip=50),
+            ],
+            top_k=20,
+            seed=42,
+        )
+        assert model.list_features() == ["lex_bi"]
+
+        model.add_feature(WordPosBigramFeature(n_hashes=1, table_size=101, eta=1, clip=30))
+        assert model.list_features() == ["lex_bi", "word_pos_bi"]
+
+        model.remove_feature("lex_bi")
+        assert model.list_features() == ["word_pos_bi"]
+
+    def test_default_features(self, small_vocab):
+        """Test that default_features() produces a working model."""
+        from ising_spin import IntegerLM
+        from ising_spin.feature_hash_energy import default_features
+
+        features = default_features(vocab_size=small_vocab.V)
+        assert len(features) == 6
+
+        model = IntegerLM(
+            vocab=small_vocab,
+            features=features,
+            top_k=20,
+            seed=42,
+        )
+        assert len(model.list_features()) == 6
