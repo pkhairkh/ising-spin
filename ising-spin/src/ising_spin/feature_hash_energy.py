@@ -1,5 +1,5 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v86 PER-FEATURE NORMALIZATION.
+Dynamic Feature-Hashed Integer Energy Table — v87 RAW ENERGY + HIGHER NCE RATE.
 
 v86 FIXES over v85 (PPL 14.27 — still worse than v83's 13.77):
   v85's NCE subsampling (nce_rate=0.02) fixed saturation but made class features
@@ -73,18 +73,18 @@ AVAILABLE FEATURES:
     ClassWordSkipFeature   — hash(prev2_class, cand_word) [class_key selectable]
     WordClassSkipFeature   — hash(prev2_word, cand_class) [class_key selectable]
 
-DEFAULT FEATURE SET (v86):
+DEFAULT FEATURE SET (v87):
   LexBigramFeature(class_key=None, nce_rate=1.0),              # pure lexical
-  WordClassBigramFeature(class_key="freq", nce_rate=0.10),     # freq word→class
-  ClassWordBigramFeature(class_key="freq", nce_rate=0.10),     # freq class→word
+  WordClassBigramFeature(class_key="freq", nce_rate=0.50),     # freq word→class
+  ClassWordBigramFeature(class_key="freq", nce_rate=0.50),     # freq class→word
   LexSkipFeature(class_key=None, nce_rate=1.0),               # pure lexical skip
-  WordClassBigramFeature(class_key="dist", nce_rate=0.10),     # dist word→class
-  ClassWordBigramFeature(class_key="dist", nce_rate=0.10),     # dist class→word
-  ClassTrigramFeature(class_key="dist", nce_rate=0.10),        # dist class 3-gram
-  ClassTrigramFeature(class_key="freq", nce_rate=0.10),        # freq class 3-gram
+  WordClassBigramFeature(class_key="dist", nce_rate=0.50),     # dist word→class
+  ClassWordBigramFeature(class_key="dist", nce_rate=0.50),     # dist class→word
+  ClassTrigramFeature(class_key="dist", nce_rate=0.50),        # dist class 3-gram
+  ClassTrigramFeature(class_key="freq", nce_rate=0.50),        # freq class 3-gram
   LexTrigramFeature(class_key=None, nce_rate=1.0),             # pure lexical 3-gram
 
-  9 features total: 3 lexical (nce_rate=1.0) + 6 class (nce_rate=0.10)
+  9 features total: 3 lexical (nce_rate=1.0) + 6 class (nce_rate=0.50)
 
 ADD YOUR OWN FEATURE:
   1. Subclass FeatureSpec, set class_key
@@ -505,7 +505,7 @@ class ClassWordBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.10):
+                 weight=0.5, class_key="freq", nce_rate=0.50):
         name = f"cls_word_bi_{class_key}" if class_key else "cls_word_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -533,7 +533,7 @@ class WordClassBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.10):
+                 weight=0.5, class_key="freq", nce_rate=0.50):
         name = f"word_cls_bi_{class_key}" if class_key else "word_cls_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -560,7 +560,7 @@ class ClassTrigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.10):
+                 weight=0.5, class_key="freq", nce_rate=0.50):
         name = f"cls_tri_{class_key}" if class_key else "cls_tri"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -590,7 +590,7 @@ class ClassWordSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.10):
+                 weight=0.3, class_key="freq", nce_rate=0.50):
         name = f"cls_word_skip_{class_key}" if class_key else "cls_word_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -618,7 +618,7 @@ class WordClassSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.10):
+                 weight=0.3, class_key="freq", nce_rate=0.50):
         name = f"word_cls_skip_{class_key}" if class_key else "word_cls_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -656,7 +656,7 @@ def default_features(
     include_dist: bool = True,
 ) -> List[FeatureSpec]:
     """
-    Create the recommended default feature set for v85.
+    Create the recommended default feature set for v87.
 
     MULTI-CLASS: Features use BOTH frequency buckets AND distributional
     clusters simultaneously. This gives the model access to:
@@ -691,15 +691,15 @@ def default_features(
             n_hashes=3, table_size=lex_table_size,
             eta=1, clip=100, weight=1.0, nce_rate=1.0,
         ),
-        # Frequency bucket class features — v86: clip=50, nce_rate=0.10
-        # (nce_rate=0.10 + per-feature normalization = balanced contribution)
+        # Frequency bucket class features — v87: clip=50, nce_rate=0.50
+        # (nce_rate=0.50 = 50% of pairs, values approach ±50 but not all rows identical)
         WordClassBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
         ),
         ClassWordBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
         ),
         # Lexical skip
         LexSkipFeature(
@@ -709,19 +709,19 @@ def default_features(
     ]
 
     if include_dist:
-        # Distributional cluster class features — v86: clip=50, nce_rate=0.10
+        # Distributional cluster class features — v87: clip=50, nce_rate=0.50
         features.extend([
             WordClassBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
             ),
             ClassWordBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
             ),
             ClassTrigramFeature(
                 n_hashes=2, table_size=class_tri_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.50,
             ),
         ])
 
@@ -729,7 +729,7 @@ def default_features(
     features.append(
         ClassTrigramFeature(
             n_hashes=2, table_size=class_tri_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.50,
         )
     )
 
@@ -787,9 +787,9 @@ class FeatureHashEnergyTable:
         self.seed = seed
         self.features: OrderedDict[str, FeatureSpec] = OrderedDict()
 
-        # v86: Per-feature z-score normalization stats
-        # Computed during calibration, used during inference
-        self.feature_stats: Dict[str, Dict[str, float]] = {}
+        # v87: Per-feature normalization REMOVED — was harmful (destroyed mean signal)
+        # Global z-score normalization in _compute_legd_probs is sufficient
+        self.feature_stats: Dict[str, Dict[str, float]] = {}  # kept for API compat, unused
 
         # Primary class system for balanced negative sampling
         # Use the first available class system (usually "freq")
@@ -871,10 +871,6 @@ class FeatureHashEnergyTable:
         for feat in self.features.values():
             wc = self._get_class_array(feat)
             e = feat.energy_batch(context_word_ids, candidates, wc).astype(np.float64)
-            # v86: per-feature z-score normalization
-            if feat.name in self.feature_stats:
-                stats = self.feature_stats[feat.name]
-                e = (e - stats['mean']) / max(stats['std'], 1.0)
             total += feat.weight * e
 
         return total
@@ -884,7 +880,7 @@ class FeatureHashEnergyTable:
         context_word_ids: List[int],
         candidate: int,
     ) -> float:
-        """Scalar version for single candidate. v86: returns float with per-feature norm."""
+        """Scalar version for single candidate. v87: raw energy, no per-feature norm."""
         if not context_word_ids:
             return 0.0
 
@@ -892,10 +888,6 @@ class FeatureHashEnergyTable:
         for feat in self.features.values():
             wc = self._get_class_array(feat)
             e = float(feat.energy_scalar(context_word_ids, candidate, wc))
-            # v86: per-feature z-score normalization
-            if feat.name in self.feature_stats:
-                stats = self.feature_stats[feat.name]
-                e = (e - stats['mean']) / max(stats['std'], 1.0)
             total += feat.weight * e
         return total
 

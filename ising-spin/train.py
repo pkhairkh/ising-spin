@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v86 — Per-Feature Normalization)
+Integer Language Model — Training Script (v87 — Raw Energy + Higher NCE Rate)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v86 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
-  v84 raised class feature clips from 50→200 and added sqrt(n_classes) scaling.
-  This caused massive energy explosion (mean=-7951, std=5787). PPL regressed.
+v87 FIXES over v86 (PPL 14.16 — still worse than v83's 13.77):
+  v86 added per-feature z-score normalization to balance feature scales.
+  Result: PPL 14.16, slightly better than v85 (14.27) but still behind v83 (13.77).
 
-  ROOT CAUSE: Raising the clip ceiling doesn't fix saturation — it makes it worse.
-  Class features have only ~441 unique patterns but get ~2950 updates/pattern/epoch.
-  Any clip level will saturate under this pressure.
+  ROOT CAUSE: Per-feature normalization was HARMFUL:
+  1. Destroyed mean signal (centering at 0 loses discriminative direction)
+  2. Double normalization (per-feature + global) over-compressed energy
+  3. Calibration weight search already handles relative feature scaling
 
-  FIX: Per-feature NCE subsampling (nce_rate parameter).
-  Class features update on only 2% of training pairs (nce_rate=0.02),
-  giving ~59 updates/pattern/epoch instead of 2950.
-  This keeps values within clip=50 bounds.
-
-  Also reverted: class clip back to 50, adaptive_clip back to v83 formula.
-
-  Preserved from v84: cls_tri_freq, per-feature negatives, softer bigram rep penalty.
+  FIX: Remove per-feature normalization. Use RAW energies like v83.
+  Also: increase class nce_rate from 0.10 → 0.50 (5x more updates).
+  This gives class features much more signal, pushing values near ±50
+  saturation but providing useful discriminative energy.
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
@@ -204,7 +201,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v86 — Per-Feature Normalization)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v87 — Raw Energy + Higher NCE Rate)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -230,9 +227,9 @@ def main():
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
     parser.add_argument("--cls-clip", type=int, default=50,
-                        help="Clip for class features (v86: reverted to 50, nce_rate handles saturation)")
-    parser.add_argument("--cls-nce-rate", type=float, default=0.10,
-                        help="NCE subsampling rate for class features (v86: 0.10 = update on 10%% of pairs)")
+                        help="Clip for class features (v87: clip=50, nce_rate=0.50)")
+    parser.add_argument("--cls-nce-rate", type=float, default=0.50,
+                        help="NCE subsampling rate for class features (v87: 0.50 = update on 50%% of pairs)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -269,7 +266,7 @@ def main():
             "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
             "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-            "cls_tri_freq",  # v84+, kept in v86
+            "cls_tri_freq",  # v84+, kept through v87
             "lex_tri",
         ]
         if not use_dist:
@@ -287,7 +284,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v86 — Per-Feature Normalization", flush=True)
+    print("INTEGER LANGUAGE MODEL v87 — Raw Energy + Higher NCE Rate", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -447,8 +444,8 @@ def main():
     diag = model.diagnostics()
     t_total = time.time() - t0
     results = {
-        "version": "2.4.0",
-        "architecture": "Integer Language Model v86 — Per-Feature Normalization",
+        "version": "2.5.0",
+        "architecture": "Integer Language Model v87 — Raw Energy + Higher NCE Rate",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -484,7 +481,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v86")
+    print(f"DONE — Integer Language Model v87")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "
