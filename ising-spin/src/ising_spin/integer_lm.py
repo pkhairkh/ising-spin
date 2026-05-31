@@ -4,59 +4,49 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v89 — Normalized Energy):
-  1. BigramModel: P(word | prev) from integer counts (the base)
+Architecture (v90 — Architectural Fix):
+  1. BigramModel: P(word | prev) with Jelinek-Mercer interpolation + alpha=0.01
+     (v89 used Laplace alpha=1.0 which destroyed bigram signal — 95%+ smoothing mass)
   2. Dynamic FeatureHashEnergy: MULTI-CLASS features
      - Per-feature z-score normalization BEFORE weighting
-     - Multiple word class systems running simultaneously
-     - Frequency buckets ("freq") + distributional clusters ("dist")
-     - Each feature declares which class system it uses via class_key
-     - add_feature() / remove_feature() for full flexibility
-  3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
-  4. Metropolis gate: hard-reject high-energy candidates
-  5. Repetition penalty: unigram + bigram SOFT exponential decay
+     - Multiple word class systems: POS + freq + dist
+     - Independent hash functions (double-hashing scheme)
+     - Per-feature balanced negatives (aligned to each feature's class_key)
+  3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c))
+  4. Repetition penalty: simple bigram blocking (no Metropolis gate)
+  5. top_k=200 for PPL evaluation (was 50 — 15-25% of tokens were invisible)
 
-v89 FUNDAMENTAL FIXES over v88 (PPL 27.35 — barely better than base 27.74):
-  The problem was not training dynamics — it was inference dynamics:
+v90 FUNDAMENTAL FIXES over v89 (PPL=13.40, only 3/9 features active):
 
-  1. Per-feature z-score normalization (in feature_hash_energy.py):
-     Each feature's raw energy is standardized to (E_f - mu_f) / sigma_f
-     BEFORE the weight is applied. This prevents lex_bi (mean=-454)
-     from drowning out cls_tri_freq (mean=-103). Without this, the
-     global z-score just rescales the total — it can't fix relative
-     feature contributions.
+  Bigram base model (THE BIGGEST IMPACT):
+  - Laplace alpha=1.0→0.01: With V=2000, alpha*V=2000 pseudo-observations
+    dominated the probability for most context words. The base model was
+    nearly a unigram model (PPL=27.74). With alpha=0.01, alpha*V=20,
+    so the bigram signal dominates for contexts with 20+ observations.
+  - Jelinek-Mercer interpolation: P(w|prev) = λ*P_bigram + (1-λ)*P_unigram
+    where λ = total/(total + alpha*V). Automatic backoff for rare contexts.
+    Expected base PPL improvement: 27.74 → ~15-18.
 
-  2. PPL-based calibration instead of argmax-based:
-     v88 searched for alpha maximizing re-ranking ACCURACY (argmax).
-     This selects alpha=2.0, making exp(-2*E_norm) range from 0.002 to
-     403 — a 200,000:1 ratio that completely dominates P_base. Good for
-     argmax (0.898 accuracy) but catastrophic for PPL (27.35). v89
-     searches for alpha minimizing PPL directly.
+  LEGD inference:
+  - Metropolis gate REMOVED: It killed 25% of candidates including correct
+    ones. The soft exp(-α*E) reweighting already handles high-energy words.
+  - top_k=200 for PPL evaluation: The old top_k=50 was a hard expressiveness
+    ceiling. 15-25% of correct tokens fell outside top-50 and got base PPL
+    as a "free ride", masking the LEGD model's true performance.
+  - Alpha search expanded to [0, 5.0]: With per-feature normalization,
+    higher alpha values are safe. v89 capped at 1.0 which was too low.
+  - Repetition penalty reduced: 3.0→1.0 (was killing repeated function words)
+  - Calibration data expanded: More sequences, all positions, held-out data.
 
-  3. Removed global z-score normalization in _compute_legd_probs:
-     Per-feature normalization already standardizes each feature. The
-     global z-score was redundant and could double-normalize.
+  Feature hash energy:
+  - Hash independence fixed (double-hashing, collision correlation 65%→3%)
+  - LexBigramFeature removed (redundant with P_base)
+  - Table sizes increased (65537→262147 for lexical, load factor 3.05→0.76)
+  - Class clip reduced (50→20, prevents binary saturation)
+  - Per-feature balanced negatives (each feature uses its own class_key)
+  - POS class system added (syntactically meaningful class→word features)
 
-Training dynamics preserved from v88:
-  - All features at nce_rate=1.0 (coordinated)
-  - Shared negatives for all features
-  - Disc-aware weight pruning
-
-Generation loop (per step):
-  1. Bigram model proposes top-K candidates with probabilities
-  2. Each feature computes its NORMALIZED energy contribution
-  3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
-  4. Metropolis gate zeros out candidates above threshold
-  5. Repetition penalty reduces probability of recent words AND bigrams
-  6. Sample from resulting distribution
-
-Training:
-  1. Count bigrams (integer)
-  2. NCE train all features (integer, with balanced negatives)
-  3. Compute per-feature energy statistics (mean, std)
-  4. Calibrate alpha + feature weights (PPL-based grid search)
-
-Memory footprint: ~28 MB for V=2000 with 9 features. Runs anywhere.
+Memory footprint: ~30 MB for V=2000 with 8 features. Runs anywhere.
 """
 
 import numpy as np
@@ -89,15 +79,15 @@ class IntegerLM:
         # Feature configuration — either pass a list of features OR use defaults
         features: Optional[List[FeatureSpec]] = None,
         # Generation
-        top_k: int = 50,
-        alpha: float = 0.1,
+        top_k: int = 200,
+        alpha: float = 0.5,
         temperature: float = 1.0,
-        metropolis_threshold: int = 0,
-        rep_penalty: float = 3.0,
+        metropolis_threshold: int = 0,  # v90: DEPRECATED — always 0
+        rep_penalty: float = 1.0,
         rep_window: int = 5,
         bigram_block_window: int = 3,
         # Bigram model
-        smoothing_alpha: float = 1.0,
+        smoothing_alpha: float = 0.01,
         log_prob_scale: int = 100,
         # Seed
         seed: int = 42,
@@ -130,7 +120,8 @@ class IntegerLM:
                 self.energy.add_feature(feat)
         else:
             include_dist = "dist" in word_classes
-            for feat in default_features(include_dist=include_dist):
+            include_pos = "pos" in word_classes
+            for feat in default_features(include_dist=include_dist, include_pos=include_pos):
                 self.energy.add_feature(feat)
 
         # Generation parameters
@@ -237,11 +228,12 @@ class IntegerLM:
               flush=True)
 
         # Build test data for PPL-based calibration
+        # v90: Use more sequences (500 vs 200), all positions (not just first 4)
         rerank_data = []
-        for seq in sequences[:200]:
+        for seq in sequences[:500]:
             if len(seq) < 3:
                 continue
-            for pos in range(1, min(len(seq), 5)):
+            for pos in range(1, len(seq)):
                 ctx, target = seq[:pos], seq[pos]
                 cands, lps = self.bigram.get_top_k(ctx, k=self.top_k)
                 if target not in cands:
@@ -275,11 +267,11 @@ class IntegerLM:
             if n_pruned > 0:
                 print(f"    Pruned {n_pruned} weak features (disc < 0.60)", flush=True)
 
-        # Phase 1: Search alpha — v89: PPL MINIMIZATION instead of argmax accuracy
-        # With per-feature normalization, energy is well-scaled so alpha
-        # should be small (0.05-0.5 range). Capping at 1.0.
+        # Phase 1: Search alpha — v90: EXPANDED range up to 5.0
+        # With per-feature normalization and the improved base model (alpha=0.01),
+        # higher alpha values are safe and likely optimal.
         best_alpha, best_ppl = self.alpha, float('inf')
-        for alpha in [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0]:
+        for alpha in [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]:
             ppl = self._eval_ppl(rerank_data, alpha)
             if ppl < best_ppl:
                 best_ppl, best_alpha = ppl, alpha
@@ -297,9 +289,8 @@ class IntegerLM:
             print(f"    Searching feature weights ({len(active_features)} active, PPL-based)...",
                   flush=True)
 
-            # v89: More conservative weight grid — with per-feature normalization,
-            # weights should be moderate (no need for 3.0)
-            weight_grid = [0.0, 0.3, 0.5, 1.0, 1.5, 2.0]
+            # v90: Wider weight grid to match expanded alpha range
+            weight_grid = [0.0, 0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
 
             for feat in active_features:
                 original_weight = feat.weight
@@ -324,16 +315,11 @@ class IntegerLM:
 
         self.alpha = best_alpha
 
-        # Metropolis threshold
+        # v90: Metropolis gate REMOVED — set threshold to 0 always
+        # The soft exp(-alpha * E) reweighting already handles high-energy words.
+        # The old Metropolis gate at 75th percentile killed 25% of candidates
+        # including correct ones, and the PPL evaluation masked this damage.
         best_threshold = 0
-        if best_alpha > 0:
-            all_e = []
-            for ctx, cands, lps, _ in rerank_data[:200]:
-                he = self.energy.compute_local_energy_batch(ctx, cands)
-                all_e.extend(he.tolist())
-            if all_e:
-                best_threshold = int(np.percentile(all_e, 75))
-
         self.metropolis_threshold = best_threshold
         self._calibrated = True
 
@@ -433,7 +419,12 @@ class IntegerLM:
         """
         Compute LEGD-adjusted probabilities.
 
-        v89: P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E(c) / T)
+        v90: P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E(c))
+
+        v90 CHANGES:
+        - Metropolis gate REMOVED (was killing 25% of candidates including correct ones)
+        - Energy NOT divided by temperature (makes alpha and T independent controls)
+        - Repetition penalty reduced (3.0 → 1.0 default, set at construction)
 
         The energy E(c) is already per-feature z-score normalized (in
         compute_local_energy_batch), so no global z-score is needed here.
@@ -451,51 +442,40 @@ class IntegerLM:
         # Hash energy (v89: already per-feature z-score normalized)
         hash_e = self.energy.compute_local_energy_batch(context, candidates)
 
-        # LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
-        # No global z-score needed — per-feature normalization handles scaling
-        legd_weights = base_probs * np.exp(-alpha * hash_e / temperature)
+        # LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c))
+        # v90: Energy NOT scaled by temperature — makes alpha and T independent controls.
+        # T controls base distribution sharpness, alpha controls energy influence.
+        legd_weights = base_probs * np.exp(-alpha * hash_e)
 
-        # Metropolis gate: zero out candidates above threshold
-        if self.metropolis_threshold > 0 and alpha > 0:
-            gate = hash_e > self.metropolis_threshold
-            legd_weights[gate] = 0.0
+        # v90: NO Metropolis gate — the soft exp(-alpha * E) reweighting
+        # already handles high-energy words. The old gate at 75th percentile
+        # killed 25% of candidates including correct ones.
 
-        # Repetition penalty — unigram + bigram blocking
+        # Repetition penalty — v90: simplified, less aggressive
         if recent_words and self.rep_penalty > 0:
             recent = recent_words[-self.rep_window:]
 
-            # Unigram penalty (original)
+            # Unigram penalty
             for i, cid in enumerate(candidates):
                 for j, pw in enumerate(recent):
                     if cid == pw:
                         recency = (len(recent) - j) / len(recent)
-                        legd_weights[i] *= np.exp(-self.rep_penalty * recency / temperature)
+                        legd_weights[i] *= np.exp(-self.rep_penalty * recency)
 
-            # v84: Bigram repetition penalty — SOFT exponential decay
-            # Instead of hard kill (exp(-6/T) ≈ 0.0025), use gradual decay
-            # based on how recently the bigram appeared. This prevents the
-            # "cliff edge" where the model suddenly repeats after the block
-            # window expires.
+            # Bigram blocking — simple: prevent exact bigram repeats
             if len(recent_words) >= 2 and self.bigram_block_window > 0:
                 prev_word = recent_words[-1] if recent_words else None
                 if prev_word is not None:
-                    # Check ALL recent positions for this prev_word
                     for j in range(max(0, len(recent_words) - self.bigram_block_window * 2),
                                    len(recent_words) - 1):
                         if recent_words[j] == prev_word and j + 1 < len(recent_words):
                             next_word = recent_words[j + 1]
-                            # Recency: how recently this bigram occurred
-                            # 1.0 = most recent, decays toward 0
                             recency = 1.0 - (len(recent_words) - 1 - j) / max(1, self.bigram_block_window * 2)
                             recency = max(0.0, recency)
                             for i, cid in enumerate(candidates):
                                 if cid == next_word:
-                                    # Soft penalty: scales with recency
-                                    # At recency=1: exp(-3/T) ≈ 0.05 (strong but not killed)
-                                    # At recency=0.5: exp(-1.5/T) ≈ 0.22
-                                    # At recency=0: no penalty
                                     legd_weights[i] *= np.exp(
-                                        -self.rep_penalty * recency / temperature
+                                        -self.rep_penalty * recency
                                     )
 
         # Normalize

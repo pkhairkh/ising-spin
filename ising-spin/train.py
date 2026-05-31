@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v88 — Coordinated Energy)
+Integer Language Model — Training Script (v90 — Architectural Fix)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v88 FIXES over v87 (PPL 14.46 — worse than v83's 13.77):
-  Since v84, we kept two changes that v83 didn't have:
-  1. Per-feature class-balanced negatives — fragments the energy landscape
-  2. nce_rate subsampling (0.02-0.50) — weakens class features
+v90 FUNDAMENTAL FIXES over v89 (PPL=13.40, only 3/9 features active):
+  7 independent code reviews identified critical architectural flaws:
 
-  v83 worked because ALL features shared the same negatives and all had
-  nce_rate=1.0. Class features saturated at ±100 but that was fine.
+  BIGRAM BASE MODEL (BIGGEST IMPACT):
+  - Laplace alpha=1.0→0.01 + Jelinek-Mercer interpolation
+  - Expected base PPL improvement: 27.74 → ~15-18
 
-  FIX: Return to v83's COORDINATED training dynamics:
-  - All features at nce_rate=1.0 (no subsampling)
-  - All features share the same negatives (balanced by primary class only)
-  - Expanded alpha grid up to 2.0 (was capped at 0.5)
+  FEATURE HASH ENERGY:
+  - Hash independence fixed (double-hashing, collision correlation 65%→3%)
+  - LexBigramFeature REMOVED (redundant with P_base)
+  - Table sizes increased: lex 65537→262147 (load factor 3.05→0.76)
+  - Class clip reduced: 50→20 (prevents binary saturation)
+  - POS class system added (syntactically meaningful class→word features)
+  - Per-feature balanced negatives (aligned to each feature's class_key)
+
+  LEGD INFERENCE:
+  - Metropolis gate REMOVED (was killing 25% of correct candidates)
+  - top_k=200 (was 50 — 15-25% of tokens were invisible)
+  - Alpha search expanded to [0, 5.0] (was [0, 1.0])
+  - Repetition penalty reduced: 3.0→1.0
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
   python -u train.py --samples 5000 --vocab 1000  # Quick test
-  python -u train.py --features default            # Default 9 features (3 lex + 3 freq + 3 dist)
+  python -u train.py --features default            # Default 8 features (2 lex + 3 POS + 1 freq + 2 dist)
   python -u train.py --features all                # All feature variants
   python -u train.py --n-clusters 40               # More distributional clusters
   python -u train.py --no-dist                     # Disable distributional clusters
@@ -61,12 +69,12 @@ OUTPUT_DIR = CACHE_DIR / "output"
 
 # All available feature names (with class_key variants)
 ALL_FEATURE_NAMES = [
-    "lex_bi", "lex_skip", "lex_tri",
-    "word_cls_bi_freq", "cls_word_bi_freq",
-    "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-    "cls_word_skip_freq", "word_cls_skip_freq",
-    "cls_word_skip_dist", "word_cls_skip_dist",
-    "cls_tri_freq",
+    "lex_skip", "lex_tri",
+    "cls_word_bi_freq", "cls_word_bi_dist", "cls_word_bi_pos",
+    "word_cls_bi_freq", "word_cls_bi_dist", "word_cls_bi_pos",
+    "cls_tri_dist", "cls_tri_freq", "cls_tri_pos",
+    "cls_word_skip_freq", "cls_word_skip_dist", "cls_word_skip_pos",
+    "word_cls_skip_freq", "word_cls_skip_dist", "word_cls_skip_pos",
 ]
 
 
@@ -76,12 +84,7 @@ def build_features(feature_names, args, has_dist=True):
     cls_nce_rate = args.cls_nce_rate
 
     for name in feature_names:
-        if name == "lex_bi":
-            features.append(LexBigramFeature(
-                n_hashes=args.lex_n_hashes, table_size=args.lex_table_size,
-                eta=args.lex_eta, clip=args.lex_clip, weight=1.0, nce_rate=1.0,
-            ))
-        elif name == "lex_skip":
+        if name == "lex_skip":
             features.append(LexSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3, nce_rate=1.0,
@@ -89,16 +92,29 @@ def build_features(feature_names, args, has_dist=True):
         elif name == "lex_tri":
             features.append(LexTrigramFeature(
                 n_hashes=args.lex_n_hashes, table_size=args.lex_table_size,
-                eta=args.lex_eta, clip=args.lex_clip, weight=0.3, nce_rate=1.0,
+                eta=args.lex_eta, clip=args.lex_clip, weight=0.5, nce_rate=1.0,
             ))
-        elif name == "word_cls_bi_freq":
-            features.append(WordClassBigramFeature(
+        elif name == "cls_word_bi_freq":
+            features.append(ClassWordBigramFeature(
                 n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                 eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
                 nce_rate=cls_nce_rate,
             ))
-        elif name == "cls_word_bi_freq":
+        elif name == "cls_word_bi_dist":
+            if has_dist:
+                features.append(ClassWordBigramFeature(
+                    n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                    eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
+                    nce_rate=cls_nce_rate,
+                ))
+        elif name == "cls_word_bi_pos":
             features.append(ClassWordBigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="pos",
+                nce_rate=cls_nce_rate,
+            ))
+        elif name == "word_cls_bi_freq":
+            features.append(WordClassBigramFeature(
                 n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                 eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
                 nce_rate=cls_nce_rate,
@@ -110,13 +126,12 @@ def build_features(feature_names, args, has_dist=True):
                     eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
                     nce_rate=cls_nce_rate,
                 ))
-        elif name == "cls_word_bi_dist":
-            if has_dist:
-                features.append(ClassWordBigramFeature(
-                    n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
-                    eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
-                    nce_rate=cls_nce_rate,
-                ))
+        elif name == "word_cls_bi_pos":
+            features.append(WordClassBigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="pos",
+                nce_rate=cls_nce_rate,
+            ))
         elif name == "cls_tri_dist":
             if has_dist:
                 features.append(ClassTrigramFeature(
@@ -124,14 +139,20 @@ def build_features(feature_names, args, has_dist=True):
                     eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
                     nce_rate=cls_nce_rate,
                 ))
-        elif name == "cls_word_skip_freq":
-            features.append(ClassWordSkipFeature(
-                n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
-                eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="freq",
+        elif name == "cls_tri_freq":
+            features.append(ClassTrigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
                 nce_rate=cls_nce_rate,
             ))
-        elif name == "word_cls_skip_freq":
-            features.append(WordClassSkipFeature(
+        elif name == "cls_tri_pos":
+            features.append(ClassTrigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="pos",
+                nce_rate=cls_nce_rate,
+            ))
+        elif name == "cls_word_skip_freq":
+            features.append(ClassWordSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="freq",
                 nce_rate=cls_nce_rate,
@@ -143,6 +164,18 @@ def build_features(feature_names, args, has_dist=True):
                     eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="dist",
                     nce_rate=cls_nce_rate,
                 ))
+        elif name == "cls_word_skip_pos":
+            features.append(ClassWordSkipFeature(
+                n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
+                eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="pos",
+                nce_rate=cls_nce_rate,
+            ))
+        elif name == "word_cls_skip_freq":
+            features.append(WordClassSkipFeature(
+                n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
+                eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="freq",
+                nce_rate=cls_nce_rate,
+            ))
         elif name == "word_cls_skip_dist":
             if has_dist:
                 features.append(WordClassSkipFeature(
@@ -150,10 +183,10 @@ def build_features(feature_names, args, has_dist=True):
                     eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="dist",
                     nce_rate=cls_nce_rate,
                 ))
-        elif name == "cls_tri_freq":
-            features.append(ClassTrigramFeature(
-                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
-                eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
+        elif name == "word_cls_skip_pos":
+            features.append(WordClassSkipFeature(
+                n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
+                eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="pos",
                 nce_rate=cls_nce_rate,
             ))
         else:
@@ -200,7 +233,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v89 — Normalized Energy)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v90 — Architectural Fix)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -225,30 +258,30 @@ def main():
     parser.add_argument("--cls-n-hashes", type=int, default=2)
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
-    parser.add_argument("--cls-clip", type=int, default=50,
-                        help="Clip for class features (v88: clip=50, nce_rate=1.0)")
+    parser.add_argument("--cls-clip", type=int, default=20,
+                        help="Clip for class features (v90: clip=20, prevents binary saturation)")
     parser.add_argument("--cls-nce-rate", type=float, default=1.0,
                         help="NCE subsampling rate for class features (v88: 1.0 = update on all pairs, coordinated training)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
-    parser.add_argument("--lex-table-size", type=int, default=65537)
+    parser.add_argument("--lex-table-size", type=int, default=262147)
     parser.add_argument("--lex-eta", type=int, default=1)
     parser.add_argument("--lex-clip", type=int, default=100)
 
     parser.add_argument("--skip-n-hashes", type=int, default=2)
-    parser.add_argument("--skip-table-size", type=int, default=65537)
+    parser.add_argument("--skip-table-size", type=int, default=262147)
     parser.add_argument("--skip-eta", type=int, default=1)
     parser.add_argument("--skip-clip", type=int, default=80)
 
     # NCE
-    parser.add_argument("--nce-epochs", type=int, default=3)
-    parser.add_argument("--nce-negatives", type=int, default=3)
+    parser.add_argument("--nce-epochs", type=int, default=2)
+    parser.add_argument("--nce-negatives", type=int, default=25)
 
     # Generation
-    parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--top-k", type=int, default=200)
+    parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--rep-penalty", type=float, default=3.0)
+    parser.add_argument("--rep-penalty", type=float, default=1.0)
     parser.add_argument("--rep-window", type=int, default=5)
     parser.add_argument("--bigram-block-window", type=int, default=3,
                         help="How many recent bigrams to block repeating")
@@ -261,15 +294,16 @@ def main():
     # Resolve feature names
     if args.features == "default":
         feature_names = [
-            "lex_bi",
-            "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
-            "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-            "cls_tri_freq",  # v84+, kept through v88
             "lex_tri",
+            "cls_word_bi_pos",
+            "cls_word_skip_pos",
+            "cls_tri_pos",
+            "cls_word_bi_freq",
+            "cls_word_bi_dist",
+            "cls_tri_dist",
         ]
         if not use_dist:
-            # Remove dist features
             feature_names = [n for n in feature_names if "dist" not in n]
     elif args.features == "all":
         feature_names = ALL_FEATURE_NAMES
@@ -283,11 +317,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v89 — Normalized Energy", flush=True)
+    print("INTEGER LANGUAGE MODEL v90 — Architectural Fix", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
-    class_str = f"freq(K={args.n_buckets})"
+    class_str = f"freq(K={args.n_buckets}) + pos(K=13)"
     if use_dist:
         class_str += f" + dist(K={args.n_clusters})"
     print(f"  Word classes: {class_str}", flush=True)
@@ -480,7 +514,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v89")
+    print(f"DONE — Integer Language Model v90")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

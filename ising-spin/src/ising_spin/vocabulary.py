@@ -395,6 +395,11 @@ class Vocabulary:
         classes = {"freq": self.word_bucket.astype(np.int32)}
         if self.word_cluster is not None:
             classes["dist"] = self.word_cluster.astype(np.int32)
+        # v90: POS as a class system — syntactically meaningful categories
+        # DET, NOUN, VERB, ADJ, etc. provide much better class→word generalization
+        # than frequency buckets ("the", "was", "and" all in same bucket).
+        if self.word_pos is not None and len(self.word_pos) > 0:
+            classes["pos"] = self.word_pos.astype(np.int32)
         return classes
 
     def _assign_pos_types(self):

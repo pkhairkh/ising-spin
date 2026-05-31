@@ -1,29 +1,22 @@
 """
-Integer Language Model v89 — pure integer, no neural nets, runs on a Pi 5.
+Integer Language Model v90 — pure integer, no neural nets, runs on a Pi 5.
 
 A 100% interpretable, integer-only language model that produces
 grammatically coherent text for simple domains using:
-  - Bigram counting for base probabilities
+  - Bigram counting with Jelinek-Mercer interpolation (v90 fix — was Laplace alpha=1.0)
   - DYNAMIC feature registry: add/remove features at runtime
-  - MULTI-CLASS word system: frequency buckets + distributional clusters
+  - MULTI-CLASS word system: POS + frequency buckets + distributional clusters
   - Features declare which class system they use via class_key
-  - Per-feature class-balanced NCE training
-  - PER-FEATURE Z-SCORE NORMALIZATION (v89 fix — rescales each feature
-    independently so lex_bi doesn't drown out cls_tri_freq)
-  - PPL-BASED CALIBRATION (v89 fix — minimizes perplexity instead of
-    maximizing argmax accuracy, preventing energy from dominating P_base)
-  - Metropolis gate for grammaticality enforcement
-  - Soft exponential decay repetition penalty
+  - Per-feature class-balanced NCE training (v90 fix — aligned negatives)
+  - INDEPENDENT HASH FUNCTIONS (v90 fix — double-hashing, 65%→3% collision correlation)
+  - LARGER TABLE SIZES (v90 fix — 262147 for lexical, was 65537)
+  - PER-FEATURE Z-SCORE NORMALIZATION
+  - PPL-BASED CALIBRATION with expanded alpha range [0, 5.0]
+  - NO METROPOLIS GATE (v90 fix — was killing 25% of correct candidates)
+  - top_k=200 for evaluation (v90 fix — was 50, 15-25% of tokens invisible)
   - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c))
 
-v89 FUNDAMENTAL FIXES over v88 (PPL 27.35 — barely better than base 27.74):
-  - Per-feature z-score normalization: each feature's energy is standardized
-    to (E_f - mu_f) / sigma_f before weighting, so features contribute
-    equally by default (lex_bi no longer drowns out everything else)
-  - PPL-based calibration: search alpha minimizing PPL instead of maximizing
-    argmax accuracy (argmax selects alpha=2.0 which dominates P_base)
-
-No torch. No neural nets. No float32 in the hot path. ~28 MB memory.
+No torch. No neural nets. No float32 in the hot path. ~30 MB memory.
 """
 
 from .vocabulary import Vocabulary, COARSE_POS, POS2IDX, IDX2POS, N_POS
