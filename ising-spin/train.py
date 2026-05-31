@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v82 — Multi-Class)
+Integer Language Model — Training Script (v83 — Multi-Class + Fixes)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-KEY CHANGES v82 — MULTI-CLASS ARCHITECTURE:
-  - MULTIPLE word class systems running simultaneously
-  - Frequency buckets ("freq"): K=20, captures importance gradient
-  - Distributional clusters ("dist"): K=30, captures syntactic role
-  - Features declare which class system they use via class_key
-  - 8 default features: 3 lexical + 2 freq-class + 3 dist-class
-  - N-gram blocking for generation (prevent repeated bigrams)
-  - Adaptive clipping for energy tables (prevent saturation)
+v83 FIXES over v82 (PPL regression 13.89 → 15.43):
+  1. Fixed adaptive_clip() — was a no-op, now clips to 2*clip max
+  2. Fixed dist clustering — sorted partition guarantees all K clusters non-empty
+  3. Disc-aware weight pruning — features with disc < 0.60 get weight=0
+  4. Wider weight grid — [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
@@ -185,7 +182,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v82 — Multi-Class)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v83 — Multi-Class + Fixes)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -264,7 +261,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v82 — Multi-Class Architecture", flush=True)
+    print("INTEGER LANGUAGE MODEL v83 — Multi-Class + Fixes", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -322,7 +319,7 @@ def main():
     train_seqs, test_seqs = sequences[:n_train], sequences[n_train:]
     print(f"  Train: {len(train_seqs):,}, Test: {len(test_seqs):,}", flush=True)
 
-    # Build distributional clusters (v82 key addition)
+    # Build distributional clusters (v83: sorted partition clustering)
     if use_dist:
         print("\n  Building distributional clusters...", flush=True)
         vocab.build_distributional_clusters(train_seqs)
@@ -424,7 +421,7 @@ def main():
     t_total = time.time() - t0
     results = {
         "version": "2.2.0",
-        "architecture": "Integer Language Model v82 — Multi-Class Architecture",
+        "architecture": "Integer Language Model v83 — Multi-Class + Fixes",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -459,7 +456,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v82")
+    print(f"DONE — Integer Language Model v83")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

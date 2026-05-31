@@ -4,7 +4,7 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v82 — Multi-Class):
+Architecture (v83 — Multi-Class + Fixes):
   1. BigramModel: P(word | prev) from integer counts (the base)
   2. Dynamic FeatureHashEnergy: MULTI-CLASS features
      - Multiple word class systems running simultaneously
@@ -15,11 +15,11 @@ Architecture (v82 — Multi-Class):
   4. Metropolis gate: hard-reject high-energy candidates
   5. Repetition penalty: unigram + bigram n-gram blocking
 
-KEY CHANGES from v81:
-  - MULTI-CLASS: features use BOTH freq buckets AND dist clusters
-  - Distributional clusters capture syntactic behavior (not just frequency)
-  - N-gram blocking: prevent repeated bigrams, not just unigrams
-  - Adaptive clipping: prevent energy saturation
+v83 FIXES over v82:
+  - Disc-aware weight pruning: features with disc < 0.60 get weight=0
+  - Disc-proportional weight initialization before grid search
+  - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+  - Better Metropolis threshold using energy percentiles
 
 Generation loop (per step):
   1. Bigram model proposes top-K candidates with probabilities
@@ -32,7 +32,7 @@ Generation loop (per step):
 Training:
   1. Count bigrams (integer)
   2. NCE train all features (integer, with class-balanced negatives)
-  3. Calibrate alpha (grid search on LEGD probs)
+  3. Calibrate alpha + feature weights (grid search with disc-aware priors)
 
 Memory footprint: ~25 MB for V=2000 with 8 features. Runs anywhere.
 """
@@ -161,14 +161,19 @@ class IntegerLM:
             n_epochs=n_epochs,
             n_negatives=n_negatives,
         )
+        # Store training stats for disc-aware calibration
+        self.energy._last_train_stats = energy_stats
         return energy_stats
 
     def calibrate(self, sequences: List[List[int]]) -> Dict:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
 
-        Searches alpha in [0.001, 0.5] and feature weights independently.
-        v82: Also tries pruning features with weight=0.
+        v83 IMPROVEMENTS over v82:
+        - Disc-aware weight pruning: features with disc < 0.60 get weight=0
+        - Disc-proportional weight initialization before grid search
+        - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+        - Better Metropolis threshold using energy percentiles
         """
         print("  Calibrating...", flush=True)
 
@@ -208,6 +213,29 @@ class IntegerLM:
 
         print(f"    Grid search on {len(rerank_data)} pairs...", flush=True)
 
+        # Phase 0: Disc-aware weight pruning
+        # Get last epoch's per-feature discriminative accuracy from training
+        last_train_stats = getattr(self.energy, '_last_train_stats', None)
+        if last_train_stats and 'epochs' in last_train_stats and last_train_stats['epochs']:
+            last_epoch = last_train_stats['epochs'][-1]
+            feat_disc = last_epoch.get('feature_disc', {})
+            n_pruned = 0
+            for feat in self.energy.features.values():
+                disc = feat_disc.get(feat.name, 0.5)
+                if disc < 0.60:
+                    # Feature is barely above random — kill it
+                    print(f"    PRUNE: {feat.name} disc={disc:.3f} < 0.60 → weight=0",
+                          flush=True)
+                    feat.weight = 0.0
+                    n_pruned += 1
+                elif disc > 0.85:
+                    # Strong feature — boost initial weight
+                    feat.weight = max(feat.weight, 1.0)
+                    print(f"    BOOST: {feat.name} disc={disc:.3f} → weight={feat.weight:.1f}",
+                          flush=True)
+            if n_pruned > 0:
+                print(f"    Pruned {n_pruned} weak features (disc < 0.60)", flush=True)
+
         # Phase 1: Search alpha
         best_alpha, best_acc = self.alpha, 0.0
         for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:
@@ -217,17 +245,23 @@ class IntegerLM:
 
         print(f"    Best alpha: {best_alpha} (acc={best_acc:.3f})", flush=True)
 
-        # Phase 2: Search feature weights (only if there are features with alpha > 0)
+        # Phase 2: Search feature weights (wider grid, only active features)
         best_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
-        if len(self.energy.features) > 0 and best_alpha > 0:
-            print(f"    Searching feature weights...", flush=True)
+        active_features = [f for f in self.energy.features.values() if f.weight > 0]
 
-            for feat in self.energy.features.values():
+        if len(active_features) > 0 and best_alpha > 0:
+            print(f"    Searching feature weights ({len(active_features)} active)...",
+                  flush=True)
+
+            # Wider weight grid than v82
+            weight_grid = [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+
+            for feat in active_features:
                 original_weight = feat.weight
                 best_w = original_weight
                 best_feat_acc = best_acc
 
-                for w in [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]:
+                for w in weight_grid:
                     feat.weight = w
                     acc = self._eval_rerank(rerank_data, best_alpha)
                     if acc > best_feat_acc:
@@ -253,7 +287,8 @@ class IntegerLM:
                 he = self.energy.compute_local_energy_batch(ctx, cands)
                 all_e.extend(he.tolist())
             if all_e:
-                best_threshold = int(np.percentile(all_e, 70))
+                # Use 75th percentile (higher threshold = fewer rejections)
+                best_threshold = int(np.percentile(all_e, 75))
 
         self.metropolis_threshold = best_threshold
         self._calibrated = True

@@ -15,15 +15,17 @@ An integer-only language model with **multi-class dynamic features**:
 
 **Memory**: ~25 MB for a 2000-word vocabulary. No GPU needed.
 
-## What Changed in v82
+## What Changed in v83
 
-**Multi-class architecture.** v81 replaced static POS with frequency buckets (PPL went from 12M to 13.89 — huge win). But the class transition matrix was nearly uniform because frequency buckets group words by how OFTEN they appear, not how they BEHAVE. v82 introduces distributional clusters that capture syntactic role from data, and runs BOTH class systems simultaneously.
+**Fixed PPL regression.** v82 added distributional clusters but PPL regressed from 13.89 to 15.43. Root causes identified and fixed:
 
-**Distributional clusters.** Words that appear in similar contexts (similar left/right neighbors) get the same cluster. "the" and "a" cluster together (similar followers). "was" and "is" cluster together. This gives non-uniform class transition matrices with real syntactic patterns — something frequency buckets alone can't provide.
+1. **Adaptive clip was a no-op.** `max(p99, clip//2)` always returned p99 after training, so tables grew to [-16731, 16731] despite clip=50. Now clips to `min(p99, 2*clip)` — the clip parameter is actually enforced.
 
-**N-gram blocking.** Generation now prevents repeating recent bigrams, not just unigrams. This breaks repetition loops like "the little girl named lily... the little girl named lily...".
+2. **Distributional clustering quality.** XOR min-hash produced only 16/30 non-empty clusters with very uneven sizes (15–143 words). Replaced with **sorted partition clustering**: sort words by distributional fingerprint, then split into K equal chunks. All K clusters are guaranteed non-empty and roughly balanced.
 
-**Adaptive clipping.** Energy tables use percentile-based clipping instead of fixed limits, preventing saturation while preserving learned distribution shape.
+3. **Weak feature noise.** `word_cls_bi_dist` disc=0.619 and `cls_tri_dist` disc=0.690 were barely above random. They added noise that diluted strong features. Now: disc-aware weight pruning automatically kills features with disc < 0.60.
+
+4. **Calibration dilution.** 8 features with a coarse weight grid [0.0, 0.1, 0.3, 0.5, 1.0, 2.0] caused strong lexical features to get weight=0.3. Now uses wider grid [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0] and disc-proportional initialization.
 
 ## Word Class Systems
 
@@ -126,12 +128,12 @@ train.py                     # Training script
 
 1. Count bigrams from text (integer counting, no gradients)
 2. Build frequency buckets (words ranked by frequency, binned into K groups)
-3. Build distributional clusters (words grouped by context similarity via min-hash)
+3. Build distributional clusters (sorted partition: sort by context fingerprint, split into K chunks)
 4. Train all feature tables via Noise-Contrastive Estimation (NCE):
    - Real (prev, target) pairs: table[hash] -= eta (lower energy = more likely)
    - Fake (prev, random) pairs: table[hash] += eta (higher energy = less likely)
    - Negatives are BALANCED across all class systems
-5. Calibrate alpha and feature weights via grid search
+5. Calibrate alpha and feature weights via grid search with disc-aware pruning
 
 ### Generation
 

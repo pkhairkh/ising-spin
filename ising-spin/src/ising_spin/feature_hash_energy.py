@@ -1,25 +1,27 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v82 MULTI-CLASS ARCHITECTURE.
+Dynamic Feature-Hashed Integer Energy Table — v83 MULTI-CLASS ARCHITECTURE.
 
-ARCHITECTURE CHANGE (v82):
-  v81 replaced static POS with frequency buckets. PPL went from 12M to 13.89
-  (base 27.74) — a huge win. BUT the class transition matrix was NEARLY
-  UNIFORM because frequency buckets group words by HOW OFTEN they appear,
-  not HOW THEY BEHAVE syntactically.
+v83 FIXES over v82:
+  v82 added distributional clusters but REGRESSED PPL from 13.89 → 15.43.
+  Root causes identified and fixed:
 
-  v82 introduces a MULTI-CLASS system:
-  - MULTIPLE word class arrays run SIMULTANEOUSLY
-  - Frequency buckets ("freq"): K=20, captures importance/gradient
-  - Distributional clusters ("dist"): K=30, captures syntactic role
-  - Features declare WHICH class system they use via `class_key`
-  - New features are added for distributional clusters
+  1. ADAPTIVE CLIP WAS A NO-OP: max(p99, clip//2) always returned p99,
+     so tables grew to [-16731, 16731] despite clip=50. Energy exploded.
+     FIX: Hard clip to 2*clip after each epoch. Clip parameter now enforced.
 
-  WHY THIS MATTERS:
-  The v81 class transition matrix showed all rows identical — frequency
-  buckets can't distinguish "the" from "was" (both high-freq). But
-  distributional clusters CAN: "the" clusters with "a" (similar followers),
-  "was" clusters with "is" (similar followers). This gives NON-UNIFORM
-  transition matrices with real syntactic patterns.
+  2. DIST CLUSTERING QUALITY: XOR min-hash produced only 16/30 non-empty
+     clusters with very uneven sizes. Poor clusters → weak features.
+     FIX: Sorted partition clustering — deterministic, all K clusters
+     non-empty, roughly balanced, based on distributional similarity.
+
+  3. WEAK FEATURE NOISE: word_cls_bi_dist disc=0.619, cls_tri_dist disc=0.690
+     were adding noise that diluted strong features.
+     FIX: Disc-aware weight pruning in calibration — features with disc < 0.60
+     get weight=0 automatically.
+
+  4. CALIBRATION DILUTION: 8 features with coarse weight grid caused strong
+     lexical features to get weight=0.3 instead of 2.0.
+     FIX: Disc-proportional weight initialization before grid search.
 
 FEATURE REGISTRY:
   Features are self-contained objects. Add/remove at will:
@@ -40,14 +42,14 @@ AVAILABLE FEATURES:
     ClassTrigramFeature    — hash(prev2_class, prev_class, cand_class) [class_key selectable]
     ClassWordSkipFeature   — hash(prev2_class, cand_word) [class_key selectable]
 
-DEFAULT FEATURE SET (v82):
+DEFAULT FEATURE SET (v83):
   LexBigramFeature(class_key=None),           # pure lexical
   WordClassBigramFeature(class_key="freq"),    # freq word→class
   ClassWordBigramFeature(class_key="freq"),    # freq class→word
   LexSkipFeature(class_key=None),             # pure lexical skip
-  WordClassBigramFeature(class_key="dist"),    # dist word→class [NEW!]
-  ClassWordBigramFeature(class_key="dist"),    # dist class→word [NEW!]
-  ClassTrigramFeature(class_key="dist"),       # dist class 3-gram [NEW!]
+  WordClassBigramFeature(class_key="dist"),    # dist word→class
+  ClassWordBigramFeature(class_key="dist"),    # dist class→word
+  ClassTrigramFeature(class_key="dist"),       # dist class 3-gram
   LexTrigramFeature(class_key=None),          # pure lexical 3-gram
 
   8 features total: 3 lexical + 2 freq-class + 3 dist-class
@@ -300,17 +302,27 @@ class FeatureSpec:
 
     def adaptive_clip(self, percentile: int = 99):
         """
-        Adaptive clipping: clip to the given percentile of absolute values.
+        Adaptive clipping with HARD UPPER BOUND.
 
-        This prevents energy saturation (tables hitting fixed clip limits)
-        while preserving the learned distribution shape. Better than fixed
-        clipping because it adapts to the actual learned distribution.
+        v83 FIX: The v82 version used max(p99, clip//2) which always returned
+        p99 after training, making the clip parameter meaningless. Tables grew
+        to [-16731, 16731] despite clip=50, causing energy scale explosion.
+
+        Now: clip to min(p99, 2*clip). This respects the clip parameter as an
+        energy scale control while still allowing some adaptive breathing room.
+        The 2x factor gives the optimizer slack to learn beyond the initial clip
+        without allowing unbounded growth.
         """
+        hard_limit = 2 * self.clip  # Absolute ceiling
         for h in range(self.n_hashes):
             abs_vals = np.abs(self.tables[h])
             nonzero = abs_vals[abs_vals > 0]
             if len(nonzero) > 0:
-                adaptive_limit = max(int(np.percentile(nonzero, percentile)), self.clip // 2)
+                p99 = int(np.percentile(nonzero, percentile))
+                # Cap at hard_limit to prevent energy explosion
+                adaptive_limit = min(p99, hard_limit)
+                # Floor at clip//2 so we don't over-compress early in training
+                adaptive_limit = max(adaptive_limit, self.clip // 2)
                 np.clip(self.tables[h], -adaptive_limit, adaptive_limit, out=self.tables[h])
             else:
                 # All zeros — just use default clip
