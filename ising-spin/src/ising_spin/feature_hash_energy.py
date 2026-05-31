@@ -26,6 +26,11 @@ All tables trained simultaneously via integer NCE:
   Real pair: table[hash] -= eta  (lower energy = more likely)
   Fake pair: table[hash] += eta  (higher energy = less likely)
 
+CRITICAL: POS negatives are BALANCED across POS types. Random negatives
+are 88% NOUN (because 88% of words are NOUN), which destroys the POS
+signal. Balanced negatives give equal weight to all 13 POS types,
+allowing the POS table to actually learn DET→NOUN vs DET→VERB rules.
+
 O(1) per candidate. Pure integer arithmetic. No neural nets.
 """
 
@@ -100,7 +105,8 @@ class FeatureHashEnergyTable:
       2. Lexical tables: token-specific facts
       3. Skip-gram tables: structural dependencies (skip one token)
 
-    All trained via integer NCE. All O(1) per candidate lookup.
+    All trained via integer NCE with BALANCED POS negatives.
+    All O(1) per candidate lookup.
     """
 
     def __init__(
@@ -184,6 +190,37 @@ class FeatureHashEnergyTable:
         if use_skip:
             self._skip_bi = [np.zeros(skip_table_size, dtype=np.int32) for _ in range(n_skip_hashes)]
             self._skip_pos_bi = [np.zeros(pos_table_size, dtype=np.int32) for _ in range(n_skip_hashes)]
+
+        # Build POS-indexed word lists for BALANCED negative sampling
+        # This is critical: with 88% NOUN vocab, random negatives are
+        # almost all NOUN, which destroys POS table signal.
+        self._pos_word_indices = {}
+        for pt in range(n_pos_types):
+            indices = np.where(self.word_pos == pt)[0]
+            if len(indices) > 0:
+                self._pos_word_indices[pt] = indices.astype(np.int64)
+
+    def _sample_balanced_negatives(self, rng: np.random.RandomState, size: int):
+        """
+        Sample negative words with BALANCED POS distribution.
+
+        Instead of random words (88% NOUN), we pick a random POS type
+        uniformly from all 13 types, then a random word with that POS.
+
+        Returns (neg_word_ids, neg_pos_types) as int64 arrays.
+        """
+        # Pick random POS types uniformly
+        neg_pos_types = rng.randint(0, self.n_pos_types, size=size)
+
+        # Pick random words with those POS types
+        neg_words = np.empty(size, dtype=np.int64)
+        for pt, indices in self._pos_word_indices.items():
+            mask = neg_pos_types == pt
+            n = int(mask.sum())
+            if n > 0:
+                neg_words[mask] = rng.choice(indices, size=n)
+
+        return neg_words, neg_pos_types.astype(np.int64)
 
     # -------------------------------------------------------------------
     # Energy computation — the hot path
@@ -323,6 +360,11 @@ class FeatureHashEnergyTable:
         For each (prev, target) pair:
           Positive: table[hash(real_pair)] -= eta
           Negative: table[hash(fake_pair)] += eta
+
+        KEY FIX: POS negatives are BALANCED across POS types.
+        Random words are 88% NOUN, which makes the POS table unable to
+        distinguish DET→NOUN (good) from DET→NOUN (also the negative!).
+        Balanced negatives give each POS type equal representation.
         """
         import time as _time
         rng = np.random.RandomState(self.seed)
@@ -347,6 +389,7 @@ class FeatureHashEnergyTable:
         all_prev2_pos = self.word_pos[all_prev2].astype(np.int64)
 
         print(f"    {N:,} training pairs, {self.n_pos_types}x{self.n_pos_types}={self.n_pos_types**2} POS patterns", flush=True)
+        print(f"    Balanced POS negatives: {len(self._pos_word_indices)} POS types", flush=True)
 
         all_stats = []
 
@@ -383,19 +426,24 @@ class FeatureHashEnergyTable:
                             np.add.at(self._skip_bi[h], _hash2_vec(cp2v, ctv, h, self.skip_table_size), -self.skip_eta)
                             np.add.at(self._skip_pos_bi[h], _hash2_vec(cp2pv, ctpv, h, self.pos_table_size), -self.skip_eta)
 
-                # Negative updates
+                # Negative updates — BALANCED POS negatives
                 for _ in range(n_negatives):
-                    neg = rng.randint(4, self.V, size=C)
-                    neg_pos = self.word_pos[neg].astype(np.int64)
+                    # Balanced negatives: uniform across POS types
+                    neg, neg_pos = self._sample_balanced_negatives(rng, C)
 
+                    # POS table gets balanced negatives (key fix!)
                     for h in range(self.n_pos_hashes):
                         np.add.at(self._pos_bi[h], _hash2_vec(cpp, neg_pos, h, self.pos_table_size), self.pos_eta)
+
+                    # Lexical table gets same balanced negatives
+                    # (This is fine — lexical table needs diverse negatives too)
                     for h in range(self.n_lex_hashes):
                         np.add.at(self._lex_bi[h], _hash2_vec(cp, neg, h, self.lex_table_size), self.lex_eta)
 
+                    # Skip-gram negatives (balanced)
                     if self.use_skip and self._skip_bi is not None and np.any(has_p2 if C > 0 else False):
                         for h in range(self.n_skip_hashes):
-                            np.add.at(self._skip_bi[h], _hash2_vec(cp2v, neg[has_p2] if C == len(neg) else rng.randint(4, self.V, size=len(cp2v)), h, self.skip_table_size), self.skip_eta)
+                            np.add.at(self._skip_bi[h], _hash2_vec(cp2v, neg[has_p2], h, self.skip_table_size), self.skip_eta)
                             np.add.at(self._skip_pos_bi[h], _hash2_vec(cp2pv, neg_pos[has_p2], h, self.pos_table_size), self.skip_eta)
 
                 # Trigram updates
@@ -411,9 +459,9 @@ class FeatureHashEnergyTable:
                             for h in range(self.n_lex_hashes):
                                 np.add.at(self._lex_tri[h], _hash3_vec(cp2v, cpv, ctv, h, self._lex_tri_size), -self.lex_eta)
 
+                        # Trigram negatives (balanced)
                         for _ in range(n_negatives):
-                            neg_t = rng.randint(4, self.V, size=len(cp2v))
-                            neg_tp = self.word_pos[neg_t].astype(np.int64)
+                            neg_t, neg_tp = self._sample_balanced_negatives(rng, len(cp2v))
                             if self._pos_tri is not None:
                                 for h in range(self.n_pos_hashes):
                                     np.add.at(self._pos_tri[h], _hash3_vec(cp2pv, cppv, neg_tp, h, self._pos_tri_size), self.pos_eta)
@@ -426,19 +474,21 @@ class FeatureHashEnergyTable:
             # Clip
             self._clip_tables()
 
-            # Discriminative accuracy
+            # Discriminative accuracy — check with BALANCED negatives
             n_check = min(2000, N)
             ci = rng.choice(N, n_check, replace=False)
-            cp = all_prev[ci]; ct = all_target[ci]; cpp = all_prev_pos[ci]; ctp = all_target_pos[ci]
-            neg = rng.randint(4, self.V, size=n_check)
-            neg_pos = self.word_pos[neg].astype(np.int64)
+            cp_chk = all_prev[ci]; ct_chk = all_target[ci]
+            cpp_chk = all_prev_pos[ci]; ctp_chk = all_target_pos[ci]
 
-            pos_e = sum(self._pos_bi[h][_hash2_vec(cpp, ctp, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
-            neg_e = sum(self._pos_bi[h][_hash2_vec(cpp, neg_pos, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
+            # Use balanced negatives for evaluation too
+            neg_chk, neg_pos_chk = self._sample_balanced_negatives(rng, n_check)
+
+            pos_e = sum(self._pos_bi[h][_hash2_vec(cpp_chk, ctp_chk, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
+            neg_e = sum(self._pos_bi[h][_hash2_vec(cpp_chk, neg_pos_chk, h, self.pos_table_size)] for h in range(self.n_pos_hashes))
             pos_d = float(np.sum(pos_e < neg_e)) / n_check
 
-            lex_pe = sum(self._lex_bi[h][_hash2_vec(cp, ct, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
-            lex_ne = sum(self._lex_bi[h][_hash2_vec(cp, neg, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
+            lex_pe = sum(self._lex_bi[h][_hash2_vec(cp_chk, ct_chk, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
+            lex_ne = sum(self._lex_bi[h][_hash2_vec(cp_chk, neg_chk, h, self.lex_table_size)] for h in range(self.n_lex_hashes))
             lex_d = float(np.sum(lex_pe < lex_ne)) / n_check
 
             comb_real = self.pos_weight * pos_e.astype(np.float64) + self.lex_weight * lex_pe.astype(np.float64)

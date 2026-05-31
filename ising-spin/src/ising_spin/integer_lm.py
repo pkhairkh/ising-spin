@@ -7,22 +7,22 @@ Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 Architecture:
   1. BigramModel: P(word | prev) from integer counts (the base)
   2. FeatureHashEnergy: POS rules + lexical facts + skip-gram patterns
-  3. Metropolis gate: hard-reject grammatically invalid tokens
-  4. Repetition penalty: prevent loops
-  5. Boltzmann sampler: stochastic generation from energy distribution
+  3. LEGD: P(c) ∝ P_base(c) × exp(-α × E_norm(c))
+  4. Metropolis gate: hard-reject grammatically invalid tokens
+  5. Repetition penalty: prevent loops
 
 Generation loop (per step):
-  1. Bigram model proposes top-K candidates with log-probabilities
-  2. Feature hash energy computes delta_E for each candidate
-  3. Metropolis gate hard-rejects candidates above energy threshold
-  4. Repetition penalty added for recently-used words
-  5. Combined energy = base_energy + alpha * hash_energy + rep_penalty
-  6. Boltzmann sample from adjusted distribution
+  1. Bigram model proposes top-K candidates with probabilities
+  2. Feature hash energy computes E for each candidate
+  3. LEGD combines: P(c) ∝ P_base(c) × exp(-α × E_norm(c))
+  4. Metropolis gate zeros out candidates above threshold
+  5. Repetition penalty reduces probability of recent words
+  6. Sample from resulting distribution
 
 Training:
   1. Count bigrams (integer)
-  2. NCE train energy tables (integer)
-  3. Calibrate alpha/beta/weights (grid search)
+  2. NCE train energy tables (integer, with balanced POS negatives)
+  3. Calibrate alpha + feature weights (grid search on LEGD probs)
 
 Memory footprint: ~20 MB for V=2000. Runs anywhere.
 """
@@ -32,7 +32,6 @@ from typing import List, Dict, Optional, Tuple
 
 from .bigram_model import BigramModel
 from .feature_hash_energy import FeatureHashEnergyTable
-from .boltzmann import IntegerBoltzmannSampler
 from .vocabulary import Vocabulary, IDX2POS
 
 
@@ -41,14 +40,14 @@ class IntegerLM:
     Pure Integer Language Model.
 
     No neural nets. No torch. No float32 matrix multiplies in the hot path.
-    Just integer counting, hash table lookups, and Boltzmann sampling.
+    Just integer counting, hash table lookups, and LEGD probability adjustment.
 
-    Combines:
-      - BigramModel: base probability P(word | prev) from counts
-      - FeatureHashEnergy: POS + lexical + skip-gram energy correction
-      - Metropolis gate: hard rejection for bad grammar
-      - Repetition penalty: prevent loops
-      - Boltzmann sampler: stochastic selection
+    The LEGD formula:
+        P(c | ctx) ∝ P_base(c | prev) × exp(-α × E_norm(c, ctx))
+
+    Lower energy = more likely = higher probability.
+    α controls how much the energy correction overrides the base model.
+    α=0: pure bigram model. α→∞: pure energy model.
     """
 
     def __init__(
@@ -80,9 +79,9 @@ class IntegerLM:
         # Generation
         top_k: int = 50,
         alpha: float = 1.0,
-        beta: float = 0.01,
+        temperature: float = 1.0,
         metropolis_threshold: int = 0,
-        rep_penalty: float = 50.0,
+        rep_penalty: float = 3.0,
         rep_window: int = 5,
         # Seed
         seed: int = 42,
@@ -90,6 +89,7 @@ class IntegerLM:
         self.vocab = vocab
         self.V = vocab.V
         self.seed = seed
+        self.rng = np.random.RandomState(seed)
 
         # Bigram base model
         self.bigram = BigramModel(
@@ -128,20 +128,15 @@ class IntegerLM:
         # Generation parameters
         self.top_k = top_k
         self.alpha = alpha
+        self.temperature = temperature
         self.log_prob_scale = log_prob_scale
         self.metropolis_threshold = metropolis_threshold
         self.rep_penalty = rep_penalty
         self.rep_window = rep_window
 
-        # Boltzmann sampler
-        self.beta = beta
-        self.sampler = IntegerBoltzmannSampler(beta=beta, max_delta=50000)
-
         # Normalization stats (calibrated after training)
         self._e_mean = 0.0
         self._e_std = 1.0
-        self._b_mean = 0.0
-        self._b_std = 1.0
         self._calibrated = False
 
     # -------------------------------------------------------------------
@@ -167,12 +162,12 @@ class IntegerLM:
 
     def calibrate(self, sequences: List[List[int]]) -> Dict:
         """
-        Calibrate alpha, beta, metropolis_threshold, and feature weights.
+        Calibrate alpha, metropolis_threshold, and feature weights.
         """
         print("  Calibrating...", flush=True)
 
-        # Collect energy samples
-        e_samples, b_samples = [], []
+        # Collect energy samples for normalization
+        e_samples = []
         for seq in sequences[:300]:
             if len(seq) < 3:
                 continue
@@ -181,17 +176,12 @@ class IntegerLM:
                 target = seq[pos]
                 if 0 <= target < self.V:
                     e_samples.append(self.energy.compute_local_energy(ctx, target))
-                candidates, log_probs = self.bigram.get_top_k(ctx, k=self.top_k)
-                b_samples.extend((-(log_probs * self.log_prob_scale)).astype(np.int64).tolist())
 
         if e_samples:
             self._e_mean = float(np.mean(e_samples))
             self._e_std = max(1.0, float(np.std(e_samples)))
-            self._b_mean = float(np.mean(b_samples))
-            self._b_std = max(1.0, float(np.std(b_samples)))
 
         print(f"    Energy: mean={self._e_mean:.1f}, std={self._e_std:.1f}", flush=True)
-        print(f"    Base:   mean={self._b_mean:.1f}, std={self._b_std:.1f}", flush=True)
 
         # Build test data
         rerank_data = []
@@ -208,22 +198,23 @@ class IntegerLM:
 
         if not rerank_data:
             self._calibrated = True
-            return {'alpha': self.alpha, 'beta': self.beta}
+            return {'alpha': self.alpha}
 
         print(f"    Grid search on {len(rerank_data)} pairs...", flush=True)
 
-        best_alpha, best_beta, best_acc = self.alpha, self.beta, 0.0
-        best_pw, best_lw, best_sw = self.energy.pos_weight, self.energy.lex_weight, self.energy.skip_weight
+        best_alpha, best_acc = self.alpha, 0.0
+        best_pw = self.energy.pos_weight
+        best_lw = self.energy.lex_weight
+        best_sw = self.energy.skip_weight
 
-        # Phase 1: search alpha/beta
-        for alpha in [0.0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0]:
-            for beta in [0.001, 0.005, 0.01, 0.05, 0.1]:
-                acc = self._eval_rerank(rerank_data, alpha, beta)
-                if acc > best_acc:
-                    best_acc, best_alpha, best_beta = acc, alpha, beta
+        # Phase 1: search alpha
+        for alpha in [0.0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]:
+            acc = self._eval_rerank(rerank_data, alpha)
+            if acc > best_acc:
+                best_acc, best_alpha = acc, alpha
 
         # Phase 2: search feature weights
-        print(f"    Best alpha/beta: {best_alpha}, {best_beta} (acc={best_acc:.3f})", flush=True)
+        print(f"    Best alpha: {best_alpha} (acc={best_acc:.3f})", flush=True)
         print(f"    Searching feature weights...", flush=True)
         for pw in [0.5, 1.0, 2.0, 3.0, 5.0]:
             for lw in [0.5, 1.0, 2.0, 3.0]:
@@ -231,7 +222,7 @@ class IntegerLM:
                     self.energy.pos_weight = pw
                     self.energy.lex_weight = lw
                     self.energy.skip_weight = sw
-                    acc = self._eval_rerank(rerank_data, best_alpha, best_beta)
+                    acc = self._eval_rerank(rerank_data, best_alpha)
                     if acc > best_acc:
                         best_acc, best_pw, best_lw, best_sw = acc, pw, lw, sw
 
@@ -239,9 +230,8 @@ class IntegerLM:
         self.energy.lex_weight = best_lw
         self.energy.skip_weight = best_sw
         self.alpha = best_alpha
-        self.beta = best_beta
 
-        # Metropolis threshold
+        # Metropolis threshold: reject candidates in the top 30% of energy
         best_threshold = 0
         if best_alpha > 0:
             all_e = []
@@ -252,33 +242,95 @@ class IntegerLM:
                 best_threshold = int(np.percentile(all_e, 70))
 
         self.metropolis_threshold = best_threshold
-        self.sampler = IntegerBoltzmannSampler(beta=best_beta, max_delta=50000)
         self._calibrated = True
 
         result = {
-            'alpha': best_alpha, 'beta': best_beta,
+            'alpha': best_alpha,
             'metropolis_threshold': best_threshold,
             'rerank_acc': best_acc,
             'pos_weight': best_pw, 'lex_weight': best_lw, 'skip_weight': best_sw,
         }
-        print(f"    Result: alpha={best_alpha}, beta={best_beta}, "
+        print(f"    Result: alpha={best_alpha}, "
               f"pos_w={best_pw}, lex_w={best_lw}, skip_w={best_sw}, "
               f"threshold={best_threshold}, acc={best_acc:.3f}", flush=True)
         return result
 
-    def _eval_rerank(self, data, alpha, beta):
-        """Evaluate re-ranking accuracy with given alpha/beta."""
+    def _eval_rerank(self, data, alpha):
+        """Evaluate re-ranking accuracy with given alpha. Uses argmax of LEGD probs."""
         correct = total = 0
-        sampler = IntegerBoltzmannSampler(beta=beta, max_delta=50000)
         for ctx, cands, lps, tidx in data:
-            combined = self._combined_energy(ctx, cands, lps, alpha)
-            if len(combined) == 0:
+            probs = self._compute_legd_probs(ctx, cands, lps, alpha)
+            if len(probs) == 0:
                 continue
-            idx = sampler.sample(combined)
-            if idx == tidx:
+            if np.argmax(probs) == tidx:
                 correct += 1
             total += 1
         return correct / max(1, total)
+
+    # -------------------------------------------------------------------
+    # LEGD probability computation — the core formula
+    # -------------------------------------------------------------------
+
+    def _compute_legd_probs(
+        self,
+        context: List[int],
+        candidates: np.ndarray,
+        log_probs: np.ndarray,
+        alpha: float,
+        recent_words: Optional[List[int]] = None,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Compute LEGD-adjusted probabilities.
+
+        P(c) ∝ P_base(c)^(1/T) × exp(-α × E_norm(c) / T)
+
+        This is the proper LEGD (Local Energy-Guided Decoding) formula:
+          - Base probability is adjusted by energy in probability space
+          - α controls energy influence (0 = pure bigram, ∞ = pure energy)
+          - T controls sampling diversity (1.0 = normal, >1 = more random)
+
+        The key insight: we work in PROBABILITY space, not energy space.
+        The old formula combined base_e + α×h_scaled and applied Boltzmann,
+        which produced P_base^{β×scale} = P_base^{10} — absurdly peaked.
+        """
+        K = len(candidates)
+        if K == 0:
+            return np.array([])
+
+        # Base probabilities (numerically stable)
+        lps_scaled = log_probs / temperature
+        base_probs = np.exp(lps_scaled - np.max(lps_scaled))
+
+        # Hash energy (z-score normalized)
+        hash_e = self.energy.compute_local_energy_batch(context, candidates)
+        h_norm = (hash_e.astype(np.float64) - self._e_mean) / max(1.0, self._e_std)
+
+        # LEGD: P(c) ∝ P_base(c) × exp(-alpha × h_norm(c) / T)
+        legd_weights = base_probs * np.exp(-alpha * h_norm / temperature)
+
+        # Metropolis gate: zero out candidates above threshold
+        if self.metropolis_threshold > 0 and alpha > 0:
+            gate = hash_e > self.metropolis_threshold
+            legd_weights[gate] = 0.0
+
+        # Repetition penalty (in probability space)
+        # rep_penalty is in natural-log units: weight *= exp(-penalty × recency / T)
+        # Default 3.0 means the most recent word gets exp(-3) ≈ 0.05 weight
+        if recent_words and self.rep_penalty > 0:
+            recent = recent_words[-self.rep_window:]
+            for i, cid in enumerate(candidates):
+                for j, pw in enumerate(recent):
+                    if cid == pw:
+                        recency = (len(recent) - j) / len(recent)
+                        legd_weights[i] *= np.exp(-self.rep_penalty * recency / temperature)
+
+        # Normalize
+        total = legd_weights.sum()
+        if total > 0:
+            return legd_weights / total
+        else:
+            return np.ones(K) / K
 
     # -------------------------------------------------------------------
     # Generation
@@ -286,14 +338,12 @@ class IntegerLM:
 
     def generate(self, prompt_ids: List[int], length: int = 100) -> List[int]:
         """
-        Generate text using integer-only energy-guided decoding.
+        Generate text using LEGD-adjusted probability sampling.
 
         Per step:
           1. Bigram model proposes top-K candidates
-          2. Feature hash energy computes delta_E
-          3. Metropolis gate rejects bad candidates
-          4. Repetition penalty added
-          5. Boltzmann sample from combined distribution
+          2. LEGD computes adjusted probabilities
+          3. Sample from distribution
         """
         generated = list(prompt_ids)
         for _ in range(length):
@@ -308,12 +358,13 @@ class IntegerLM:
             candidates = candidates[valid]
             log_probs = log_probs[valid]
 
-            combined = self._combined_energy(
+            probs = self._compute_legd_probs(
                 generated, candidates, log_probs, self.alpha,
-                recent_words=generated[-self.rep_window:]
+                recent_words=generated[-self.rep_window:],
+                temperature=self.temperature,
             )
 
-            idx = self.sampler.sample(combined) if len(combined) > 1 else 0
+            idx = self.rng.choice(len(candidates), p=probs)
             generated.append(int(candidates[idx]))
 
         return generated
@@ -328,51 +379,18 @@ class IntegerLM:
         generated = self.generate(ids, length=length)
         return self.vocab.decode(generated)
 
-    def _combined_energy(
-        self,
-        context: List[int],
-        candidates: np.ndarray,
-        log_probs: np.ndarray,
-        alpha: float,
-        recent_words: Optional[List[int]] = None,
-    ) -> np.ndarray:
-        """Compute combined energy: base + alpha*hash + rep_penalty."""
-        K = len(candidates)
-        if K == 0:
-            return np.array([], dtype=np.int64)
-
-        # Base energy (negative log-prob scaled to integer)
-        base_e = -(log_probs * self.log_prob_scale).astype(np.int64)
-
-        # Hash energy (z-score normalized, rescaled to base std)
-        hash_e = self.energy.compute_local_energy_batch(context, candidates)
-        if self._e_std > 0:
-            h_norm = (hash_e.astype(np.float64) - self._e_mean) / self._e_std
-            h_scaled = (h_norm * self._b_std).astype(np.int64)
-        else:
-            h_scaled = np.zeros(K, dtype=np.int64)
-
-        # Metropolis gate
-        if self.metropolis_threshold > 0 and alpha > 0:
-            h_scaled[hash_e > self.metropolis_threshold] = 100000
-
-        # Repetition penalty
-        rep_pen = np.zeros(K, dtype=np.int64)
-        if recent_words and self.rep_penalty > 0:
-            recent = recent_words[-self.rep_window:]
-            for i, cid in enumerate(candidates):
-                for j, pw in enumerate(recent):
-                    if cid == pw:
-                        rep_pen[i] += int(self.rep_penalty * (len(recent) - j) / len(recent))
-
-        return base_e + (h_scaled * alpha).astype(np.int64) + rep_pen
-
     # -------------------------------------------------------------------
     # Evaluation
     # -------------------------------------------------------------------
 
     def perplexity(self, sequences: List[List[int]], n_samples: int = 100) -> Dict:
-        """Compute base PPL and energy-guided PPL."""
+        """
+        Compute base PPL and LEGD-adjusted PPL.
+
+        LEGD PPL uses the proper formula:
+          P_legd(target) = P_base(target) × exp(-α × E_norm(target)) / Z
+        where Z = Σ_c P_base(c) × exp(-α × E_norm(c))
+        """
         base_lps, legd_lps, n_tok = [], [], 0
 
         for seq in sequences[:n_samples]:
@@ -387,17 +405,14 @@ class IntegerLM:
                 cands, lps = self.bigram.get_top_k(ctx, k=self.top_k)
                 if target in cands:
                     tidx = int(np.where(cands == target)[0][0])
-                    combined = self._combined_energy(ctx, cands, lps, self.alpha)
-                    e_min = np.min(combined)
-                    deltas = np.clip((combined - e_min).astype(np.float64), 0, 700)
-                    weights = np.exp(-deltas * self.beta)
-                    total_w = np.sum(weights)
-                    if total_w > 0:
-                        tp = weights[tidx] / total_w
-                        legd_lps.append(float(np.log(max(tp, 1e-300))))
+                    probs = self._compute_legd_probs(ctx, cands, lps, self.alpha)
+                    tp = probs[tidx]
+                    if tp > 0:
+                        legd_lps.append(float(np.log(tp)))
                     else:
                         legd_lps.append(base_lp)
                 else:
+                    # Target not in top-K: use base prob (energy can't help)
                     legd_lps.append(base_lp)
                 n_tok += 1
 
@@ -446,7 +461,7 @@ class IntegerLM:
         b_stats = self.bigram.statistics()
         return {
             'alpha': self.alpha,
-            'beta': self.beta,
+            'temperature': self.temperature,
             'metropolis_threshold': self.metropolis_threshold,
             'rep_penalty': self.rep_penalty,
             'rep_window': self.rep_window,
@@ -455,8 +470,6 @@ class IntegerLM:
             'skip_weight': e_stats['skip_weight'],
             'energy_mean': self._e_mean,
             'energy_std': self._e_std,
-            'base_mean': self._b_mean,
-            'base_std': self._b_std,
             'calibrated': self._calibrated,
             'energy_memory_mb': e_stats['memory_mb'],
             'bigram_memory_mb': b_stats.get('memory_mb', 0),

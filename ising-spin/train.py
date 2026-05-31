@@ -6,7 +6,7 @@ Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
 Usage:
-  python -u train.py                           # Full run (50K texts, GPT-2 optional)
+  python -u train.py                           # Full run (50K texts)
   python -u train.py --samples 5000 --vocab 1000  # Quick test
 """
 
@@ -117,8 +117,8 @@ def main():
     # Generation
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.01)
-    parser.add_argument("--rep-penalty", type=float, default=50.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--rep-penalty", type=float, default=3.0)
     parser.add_argument("--rep-window", type=int, default=5)
     parser.add_argument("--gen-length", type=int, default=100)
 
@@ -139,6 +139,7 @@ def main():
     print(f"  Skip:  {'ON' if use_skip else 'OFF'}, {args.n_skip_hashes} hashes, size={args.skip_table_size}", flush=True)
     print(f"  Tri:   {'ON' if use_trigram else 'OFF'}", flush=True)
     print(f"  Weights: pos={args.pos_weight}, lex={args.lex_weight}, skip={args.skip_weight}", flush=True)
+    print(f"  Gen:   alpha={args.alpha}, T={args.temperature}, rep={args.rep_penalty}", flush=True)
     rss = get_rss_mb()
     if rss:
         print(f"Memory (RSS): {rss} MB", flush=True)
@@ -187,7 +188,7 @@ def main():
         skip_weight=args.skip_weight,
         top_k=args.top_k,
         alpha=args.alpha,
-        beta=args.beta,
+        temperature=args.temperature,
         rep_penalty=args.rep_penalty,
         rep_window=args.rep_window,
         seed=42,
@@ -244,8 +245,8 @@ def main():
     diag = model.diagnostics()
     t_total = time.time() - t0
     results = {
-        "version": "1.0.0",
-        "architecture": "Integer Language Model (no neural nets)",
+        "version": "1.1.0",
+        "architecture": "Integer Language Model — LEGD + balanced POS negatives",
         "timestamp": timestamp,
         "config": vars(args),
         "results": {
@@ -256,7 +257,7 @@ def main():
             "legd_ppl": ppl['legd_ppl'],
             "vocab_size": vocab.V,
             "alpha": diag['alpha'],
-            "beta": diag['beta'],
+            "temperature": diag['temperature'],
             "metropolis_threshold": diag['metropolis_threshold'],
             "pos_weight": diag['pos_weight'],
             "lex_weight": diag['lex_weight'],
@@ -279,7 +280,7 @@ def main():
     print(f"DONE — Integer Language Model")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
-    print(f"  Alpha: {diag['alpha']:.1f} | Beta: {diag['beta']} | "
+    print(f"  Alpha: {diag['alpha']:.1f} | T: {diag['temperature']} | "
           f"POS: {diag['pos_weight']} | LEX: {diag['lex_weight']} | SKIP: {diag['skip_weight']}")
     print(f"  Results: {output_dir}")
     print(f"{'='*70}", flush=True)
