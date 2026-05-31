@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v83 — Multi-Class + Fixes)
+Integer Language Model — Training Script (v84 — Anti-Saturation + Per-Feature Negatives)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v83 FIXES over v82 (PPL regression 13.89 → 15.43):
-  1. Fixed adaptive_clip() — was a no-op, now clips to 2*clip max
-  2. Fixed dist clustering — sorted partition guarantees all K clusters non-empty
-  3. Disc-aware weight pruning — features with disc < 0.60 get weight=0
-  4. Wider weight grid — [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+v84 FIXES over v83 (PPL 13.77):
+  1. Per-feature adaptive clip scaling: class features get higher limits
+     based on sqrt(n_classes) to prevent saturation at clip boundaries
+  2. Added cls_tri_freq to default features (9 total, was 8)
+  3. Per-feature class-balanced negatives: dist features get dist-balanced
+     negatives instead of sharing freq-balanced negatives
+  4. Softer bigram repetition penalty: exponential decay instead of hard kill
+  5. Class feature clips raised from 50 → 200 to prevent saturation
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
   python -u train.py --samples 5000 --vocab 1000  # Quick test
-  python -u train.py --features default            # Default 8 features (3 lex + 2 freq + 3 dist)
+  python -u train.py --features default            # Default 9 features (3 lex + 3 freq + 3 dist)
   python -u train.py --features all                # All feature variants
   python -u train.py --n-clusters 40               # More distributional clusters
   python -u train.py --no-dist                     # Disable distributional clusters
@@ -182,7 +185,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v83 — Multi-Class + Fixes)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v84 — Anti-Saturation + Per-Feature Negatives)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -207,7 +210,8 @@ def main():
     parser.add_argument("--cls-n-hashes", type=int, default=2)
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
-    parser.add_argument("--cls-clip", type=int, default=50)
+    parser.add_argument("--cls-clip", type=int, default=200,
+                        help="Clip for class features (v84: raised from 50 to prevent saturation)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -244,6 +248,7 @@ def main():
             "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
             "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
+            "cls_tri_freq",  # v84 NEW
             "lex_tri",
         ]
         if not use_dist:
@@ -261,7 +266,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v83 — Multi-Class + Fixes", flush=True)
+    print("INTEGER LANGUAGE MODEL v84 — Anti-Saturation + Per-Feature Negatives", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -421,7 +426,7 @@ def main():
     t_total = time.time() - t0
     results = {
         "version": "2.2.0",
-        "architecture": "Integer Language Model v83 — Multi-Class + Fixes",
+        "architecture": "Integer Language Model v84 — Anti-Saturation + Per-Feature Negatives",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -456,7 +461,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v83")
+    print(f"DONE — Integer Language Model v84")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

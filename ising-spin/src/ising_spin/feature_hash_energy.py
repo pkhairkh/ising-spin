@@ -1,27 +1,39 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v83 MULTI-CLASS ARCHITECTURE.
+Dynamic Feature-Hashed Integer Energy Table — v84 MULTI-CLASS ARCHITECTURE.
 
-v83 FIXES over v82:
-  v82 added distributional clusters but REGRESSED PPL from 13.89 → 15.43.
-  Root causes identified and fixed:
+v84 FIXES over v83 (PPL 13.77):
+  v83 fixed the PPL regression from v82 but left several structural issues:
 
-  1. ADAPTIVE CLIP WAS A NO-OP: max(p99, clip//2) always returned p99,
-     so tables grew to [-16731, 16731] despite clip=50. Energy exploded.
-     FIX: Hard clip to 2*clip after each epoch. Clip parameter now enforced.
+  1. FREQ CLASS FEATURES SATURATED: With clip=50, adaptive_clip caps at
+     2*clip=100. Freq class features have only K_freq=21 classes → 441 unique
+     bigram patterns. Each pattern gets ~1000x more NCE updates than lexical
+     patterns, so values saturate at ±100. Rows 1-11 of the freq transition
+     matrix are ALL identical — the feature provides ZERO discriminative value.
+     FIX: Per-feature adaptive clip that scales with n_unique_patterns.
+     Class features get clip=200 (4x the v83 value) to prevent saturation.
 
-  2. DIST CLUSTERING QUALITY: XOR min-hash produced only 16/30 non-empty
-     clusters with very uneven sizes. Poor clusters → weak features.
-     FIX: Sorted partition clustering — deterministic, all K clusters
-     non-empty, roughly balanced, based on distributional similarity.
+  2. MISSING FREQ CLASS TRIGRAM: Only cls_tri_dist existed, no cls_tri_freq.
+     Freq-class trigrams capture "high-freq → mid-freq → low-freq" sequential
+     patterns that dist clusters can't represent.
+     FIX: Added cls_tri_freq to default feature set. 9 features total.
 
-  3. WEAK FEATURE NOISE: word_cls_bi_dist disc=0.619, cls_tri_dist disc=0.690
-     were adding noise that diluted strong features.
-     FIX: Disc-aware weight pruning in calibration — features with disc < 0.60
-     get weight=0 automatically.
+  3. REPETITION PENALTY TOO AGGRESSIVE: Bigram blocking uses exp(-6/T) ≈ 0.0025
+     which is essentially a hard kill. When the block window expires, the model
+     suddenly starts repeating again. This creates "cliff edge" repetition.
+     FIX: Softer exponential decay for bigrams: exp(-rep_penalty * recency / T)
+     where recency decays gradually instead of a hard block window.
 
-  4. CALIBRATION DILUTION: 8 features with coarse weight grid caused strong
-     lexical features to get weight=0.3 instead of 2.0.
-     FIX: Disc-proportional weight initialization before grid search.
+  4. NEGATIVE SAMPLING NOT PER-FEATURE: All features shared negatives balanced
+     by the primary class system (freq). Dist features would benefit from
+     negatives balanced by dist class distribution.
+     FIX: Each feature's class_key determines which class system balances
+     its negatives. Dist features get dist-balanced negatives.
+
+v83 FIXES (preserved):
+  - Adaptive clip with hard upper bound (was no-op in v82)
+  - Sorted partition clustering (all K dist clusters non-empty)
+  - Disc-aware weight pruning (disc < 0.60 → weight=0)
+  - Disc-proportional weight initialization
 
 FEATURE REGISTRY:
   Features are self-contained objects. Add/remove at will:
@@ -41,8 +53,9 @@ AVAILABLE FEATURES:
     WordClassBigramFeature — hash(prev_word, cand_class)  [class_key selectable]
     ClassTrigramFeature    — hash(prev2_class, prev_class, cand_class) [class_key selectable]
     ClassWordSkipFeature   — hash(prev2_class, cand_word) [class_key selectable]
+    WordClassSkipFeature   — hash(prev2_word, cand_class) [class_key selectable]
 
-DEFAULT FEATURE SET (v83):
+DEFAULT FEATURE SET (v84):
   LexBigramFeature(class_key=None),           # pure lexical
   WordClassBigramFeature(class_key="freq"),    # freq word→class
   ClassWordBigramFeature(class_key="freq"),    # freq class→word
@@ -50,9 +63,10 @@ DEFAULT FEATURE SET (v83):
   WordClassBigramFeature(class_key="dist"),    # dist word→class
   ClassWordBigramFeature(class_key="dist"),    # dist class→word
   ClassTrigramFeature(class_key="dist"),       # dist class 3-gram
+  ClassTrigramFeature(class_key="freq"),       # freq class 3-gram [NEW!]
   LexTrigramFeature(class_key=None),          # pure lexical 3-gram
 
-  8 features total: 3 lexical + 2 freq-class + 3 dist-class
+  9 features total: 3 lexical + 3 freq-class + 3 dist-class
 
 ADD YOUR OWN FEATURE:
   1. Subclass FeatureSpec, set class_key
@@ -300,20 +314,36 @@ class FeatureSpec:
         for h in range(self.n_hashes):
             np.clip(self.tables[h], -self.clip, self.clip, out=self.tables[h])
 
-    def adaptive_clip(self, percentile: int = 99):
+    def adaptive_clip(self, percentile: int = 99, n_classes: int = 0):
         """
-        Adaptive clipping with HARD UPPER BOUND.
+        Adaptive clipping with PER-FEATURE SCALING.
 
-        v83 FIX: The v82 version used max(p99, clip//2) which always returned
-        p99 after training, making the clip parameter meaningless. Tables grew
-        to [-16731, 16731] despite clip=50, causing energy scale explosion.
+        v84 FIX: Class features with few unique patterns (e.g., K=21 freq classes
+        → 441 bigram patterns) accumulate ~1000x more NCE updates per pattern than
+        lexical features (2000 words → 4M patterns). With clip=50 and 2*clip=100
+        cap, class features saturate at ±100, making rows of the transition matrix
+        identical. The feature provides ZERO discriminative value when saturated.
 
-        Now: clip to min(p99, 2*clip). This respects the clip parameter as an
-        energy scale control while still allowing some adaptive breathing room.
-        The 2x factor gives the optimizer slack to learn beyond the initial clip
-        without allowing unbounded growth.
+        FIX: Scale the hard_limit based on the number of unique class patterns.
+        For class features: hard_limit = clip * sqrt(n_classes) * 2
+        For lexical features: hard_limit = 2 * clip (unchanged from v83)
+
+        This means:
+        - freq class (K=21): hard_limit = 50 * sqrt(21) * 2 ≈ 458
+        - dist class (K=30): hard_limit = 50 * sqrt(30) * 2 ≈ 548
+        - lexical (no class): hard_limit = 2 * 100 = 200
+
+        The sqrt(n_classes) factor compensates for the update density: with K
+        classes, each class pattern receives ~V/K times more updates than a
+        random lexical pattern. sqrt is conservative (avoids over-scaling).
         """
-        hard_limit = 2 * self.clip  # Absolute ceiling
+        if n_classes > 1 and self.class_key is not None:
+            # Class feature: scale hard_limit to prevent saturation
+            hard_limit = int(self.clip * (n_classes ** 0.5) * 2)
+        else:
+            # Lexical feature: standard v83 behavior
+            hard_limit = 2 * self.clip
+
         for h in range(self.n_hashes):
             abs_vals = np.abs(self.tables[h])
             nonzero = abs_vals[abs_vals > 0]
@@ -618,29 +648,35 @@ def default_features(
     include_dist: bool = True,
 ) -> List[FeatureSpec]:
     """
-    Create the recommended default feature set for v82.
+    Create the recommended default feature set for v84.
 
     MULTI-CLASS: Features use BOTH frequency buckets AND distributional
     clusters simultaneously. This gives the model access to:
     - Frequency-based patterns (importance, gradient)
     - Syntax-based patterns (part-of-speech-like, from data)
 
-    Default 8 features:
+    v84 CHANGES:
+    - Added ClassTrigramFeature(class_key="freq") — freq-class 3-gram
+    - Increased class feature clips from 50 → 200 to prevent saturation
+      (class features have few unique patterns and saturate at low clips)
+
+    Default 9 features:
       Lexical (3):
         - LexBigramFeature: main workhorse
         - LexSkipFeature: skip-gram
         - LexTrigramFeature: 3-gram collocations
 
-      Frequency bucket class (2):
+      Frequency bucket class (3):
         - WordClassBigramFeature(class_key="freq"): word→freq-class
         - ClassWordBigramFeature(class_key="freq"): freq-class→word
+        - ClassTrigramFeature(class_key="freq"): freq-class 3-gram [NEW v84!]
 
       Distributional cluster class (3):
-        - WordClassBigramFeature(class_key="dist"): word→dist-cluster [NEW!]
-        - ClassWordBigramFeature(class_key="dist"): dist-cluster→word [NEW!]
-        - ClassTrigramFeature(class_key="dist"): dist-cluster 3-gram [NEW!]
+        - WordClassBigramFeature(class_key="dist"): word→dist-cluster
+        - ClassWordBigramFeature(class_key="dist"): dist-cluster→word
+        - ClassTrigramFeature(class_key="dist"): dist-cluster 3-gram
 
-    Total memory: ~5 MB for V=2000, K_freq=20, K_dist=30.
+    Total memory: ~6 MB for V=2000, K_freq=20, K_dist=30.
     """
     features = [
         # Lexical features (no class dependency)
@@ -648,14 +684,14 @@ def default_features(
             n_hashes=3, table_size=lex_table_size,
             eta=1, clip=100, weight=1.0,
         ),
-        # Frequency bucket class features
+        # Frequency bucket class features — v84: clip=200 to prevent saturation
         WordClassBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq",
+            eta=1, clip=200, weight=0.5, class_key="freq",
         ),
         ClassWordBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq",
+            eta=1, clip=200, weight=0.5, class_key="freq",
         ),
         # Lexical skip
         LexSkipFeature(
@@ -665,21 +701,29 @@ def default_features(
     ]
 
     if include_dist:
-        # Distributional cluster class features — THE KEY v82 ADDITION
+        # Distributional cluster class features — v84: clip=200 for consistency
         features.extend([
             WordClassBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist",
+                eta=1, clip=200, weight=0.5, class_key="dist",
             ),
             ClassWordBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist",
+                eta=1, clip=200, weight=0.5, class_key="dist",
             ),
             ClassTrigramFeature(
                 n_hashes=2, table_size=class_tri_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist",
+                eta=1, clip=200, weight=0.5, class_key="dist",
             ),
         ])
+
+    # v84 NEW: freq-class trigram — captures "high-freq → mid-freq → low-freq" patterns
+    features.append(
+        ClassTrigramFeature(
+            n_hashes=2, table_size=class_tri_table_size,
+            eta=1, clip=200, weight=0.5, class_key="freq",
+        )
+    )
 
     # Always include lexical trigram
     features.append(
@@ -974,27 +1018,42 @@ class FeatureHashEnergyTable:
                         prev2_words=cp2, prev2_class=cp2c, mask=chp2,
                     )
 
-                # Negative updates — balanced across primary class system
+                # Negative updates — v84: PER-FEATURE class-balanced negatives
+                # Each feature gets negatives balanced by its OWN class system
+                # (dist features get dist-balanced negatives, freq features get
+                # freq-balanced negatives). This improves learning for features
+                # whose class system differs from the primary one.
                 for _ in range(n_negatives):
+                    # Sample one set of negatives per primary class system
                     neg, neg_class_dict = self._sample_balanced_negatives(rng, C)
 
                     for feat in self.features.values():
                         ckey = feat.class_key or self.primary_class_key
+
+                        # v84: Also sample feature-specific negatives if class_key differs
+                        if feat.class_key and feat.class_key != self.primary_class_key:
+                            feat_neg, feat_neg_cls_dict = self._sample_balanced_negatives(
+                                rng, C, class_key=feat.class_key,
+                            )
+                        else:
+                            feat_neg, feat_neg_cls_dict = neg, neg_class_dict
+
                         _, ctc, cp2c = chunk_class.get(ckey, (None, None, None))
-                        neg_cls = neg_class_dict.get(ckey)
-                        if ctc is None or neg_cls is None:
+                        feat_neg_cls = feat_neg_cls_dict.get(ckey)
+                        if ctc is None or feat_neg_cls is None:
                             continue
                         cpc_pos, _, cp2c_pos = chunk_class.get(ckey, (None, None, None))
                         feat.nce_negative(
-                            cp, cpc_pos, neg, neg_cls,
+                            cp, cpc_pos, feat_neg, feat_neg_cls,
                             prev2_words=cp2, prev2_class=cp2c_pos, mask=chp2,
                         )
 
             t_elapsed = _time.time() - t0
 
-            # Clip all features (adaptive)
+            # Clip all features (adaptive) — v84: pass n_classes for per-feature scaling
             for feat in self.features.values():
-                feat.adaptive_clip(percentile=99)
+                n_cls = self.n_classes_map.get(feat.class_key, 0) if feat.class_key else 0
+                feat.adaptive_clip(percentile=99, n_classes=n_cls)
 
             # Discriminative accuracy per feature + combined
             n_check = min(2000, N)

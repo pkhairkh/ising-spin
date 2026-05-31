@@ -1,5 +1,5 @@
 """
-Integer Language Model v83 — pure integer, no neural nets, runs on a Pi 5.
+Integer Language Model v84 — pure integer, no neural nets, runs on a Pi 5.
 
 A 100% interpretable, integer-only language model that produces
 grammatically coherent text for simple domains using:
@@ -7,18 +7,22 @@ grammatically coherent text for simple domains using:
   - DYNAMIC feature registry: add/remove features at runtime
   - MULTI-CLASS word system: frequency buckets + distributional clusters
   - Features declare which class system they use via class_key
-  - Class-balanced NCE training
+  - Per-feature class-balanced NCE training
+  - Per-feature adaptive clip scaling (anti-saturation)
   - Metropolis gate for grammaticality enforcement
-  - N-gram blocking to prevent repetition loops
+  - Soft exponential decay repetition penalty
   - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
 
-v83 FIXES over v82 (PPL regression 13.89 → 15.43):
-  - Fixed adaptive_clip() — was a no-op, now clips to 2*clip max
-  - Fixed dist clustering — sorted partition guarantees all K clusters non-empty
-  - Disc-aware weight pruning — features with disc < 0.60 get weight=0
-  - Wider weight search grid — [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+v84 FIXES over v83 (PPL 13.77):
+  - Per-feature adaptive clip scaling: class features get higher limits
+    based on sqrt(n_classes) to prevent saturation at clip boundaries
+  - Added cls_tri_freq to default features (9 total, was 8)
+  - Per-feature class-balanced negatives: dist features get dist-balanced
+    negatives instead of sharing freq-balanced negatives
+  - Softer bigram repetition penalty: exponential decay instead of hard kill
+  - Class feature clips raised from 50 → 200 to prevent saturation
 
-No torch. No neural nets. No float32 in the hot path. ~25 MB memory.
+No torch. No neural nets. No float32 in the hot path. ~28 MB memory.
 """
 
 from .vocabulary import Vocabulary, COARSE_POS, POS2IDX, IDX2POS, N_POS

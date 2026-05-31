@@ -4,7 +4,7 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v83 — Multi-Class + Fixes):
+Architecture (v84 — Anti-Saturation + Per-Feature Negatives):
   1. BigramModel: P(word | prev) from integer counts (the base)
   2. Dynamic FeatureHashEnergy: MULTI-CLASS features
      - Multiple word class systems running simultaneously
@@ -13,9 +13,19 @@ Architecture (v83 — Multi-Class + Fixes):
      - add_feature() / remove_feature() for full flexibility
   3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
   4. Metropolis gate: hard-reject high-energy candidates
-  5. Repetition penalty: unigram + bigram n-gram blocking
+  5. Repetition penalty: unigram + bigram SOFT exponential decay
 
-v83 FIXES over v82:
+v84 FIXES over v83 (PPL 13.77):
+  - Per-feature adaptive clip scaling: class features get higher limits
+    to prevent saturation at clip boundaries (freq rows were all ±100)
+  - Added cls_tri_freq to default features (9 total, was 8)
+  - Per-feature class-balanced negatives: dist features get dist-balanced
+    negatives instead of sharing freq-balanced negatives
+  - Softer bigram repetition penalty: exponential decay instead of
+    hard kill, prevents "cliff edge" repetition after block window expires
+  - Class feature clips raised from 50 → 200 to prevent saturation
+
+v83 FIXES (preserved):
   - Disc-aware weight pruning: features with disc < 0.60 get weight=0
   - Disc-proportional weight initialization before grid search
   - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
@@ -31,10 +41,10 @@ Generation loop (per step):
 
 Training:
   1. Count bigrams (integer)
-  2. NCE train all features (integer, with class-balanced negatives)
+  2. NCE train all features (integer, with per-feature balanced negatives)
   3. Calibrate alpha + feature weights (grid search with disc-aware priors)
 
-Memory footprint: ~25 MB for V=2000 with 8 features. Runs anywhere.
+Memory footprint: ~28 MB for V=2000 with 9 features. Runs anywhere.
 """
 
 import numpy as np
@@ -368,22 +378,31 @@ class IntegerLM:
                         recency = (len(recent) - j) / len(recent)
                         legd_weights[i] *= np.exp(-self.rep_penalty * recency / temperature)
 
-            # v82: Bigram blocking — prevent repeating recent bigrams
-            # If context[-1] → candidate appeared recently, penalize heavily
+            # v84: Bigram repetition penalty — SOFT exponential decay
+            # Instead of hard kill (exp(-6/T) ≈ 0.0025), use gradual decay
+            # based on how recently the bigram appeared. This prevents the
+            # "cliff edge" where the model suddenly repeats after the block
+            # window expires.
             if len(recent_words) >= 2 and self.bigram_block_window > 0:
                 prev_word = recent_words[-1] if recent_words else None
                 if prev_word is not None:
-                    # Check recent bigrams
-                    for j in range(max(0, len(recent_words) - self.bigram_block_window),
+                    # Check ALL recent positions for this prev_word
+                    for j in range(max(0, len(recent_words) - self.bigram_block_window * 2),
                                    len(recent_words) - 1):
-                        if recent_words[j] == prev_word:
-                            # This bigram (prev_word → next) appeared before
+                        if recent_words[j] == prev_word and j + 1 < len(recent_words):
                             next_word = recent_words[j + 1]
+                            # Recency: how recently this bigram occurred
+                            # 1.0 = most recent, decays toward 0
+                            recency = 1.0 - (len(recent_words) - 1 - j) / max(1, self.bigram_block_window * 2)
+                            recency = max(0.0, recency)
                             for i, cid in enumerate(candidates):
                                 if cid == next_word:
-                                    # Heavy penalty for repeating a bigram
+                                    # Soft penalty: scales with recency
+                                    # At recency=1: exp(-3/T) ≈ 0.05 (strong but not killed)
+                                    # At recency=0.5: exp(-1.5/T) ≈ 0.22
+                                    # At recency=0: no penalty
                                     legd_weights[i] *= np.exp(
-                                        -self.rep_penalty * 2.0 / temperature
+                                        -self.rep_penalty * recency / temperature
                                     )
 
         # Normalize
