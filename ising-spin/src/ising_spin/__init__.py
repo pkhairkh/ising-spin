@@ -1,5 +1,5 @@
 """
-Integer Language Model v84 — pure integer, no neural nets, runs on a Pi 5.
+Integer Language Model v85 — pure integer, no neural nets, runs on a Pi 5.
 
 A 100% interpretable, integer-only language model that produces
 grammatically coherent text for simple domains using:
@@ -8,19 +8,17 @@ grammatically coherent text for simple domains using:
   - MULTI-CLASS word system: frequency buckets + distributional clusters
   - Features declare which class system they use via class_key
   - Per-feature class-balanced NCE training
-  - Per-feature adaptive clip scaling (anti-saturation)
+  - Per-feature NCE subsampling (nce_rate) to prevent class feature saturation
   - Metropolis gate for grammaticality enforcement
   - Soft exponential decay repetition penalty
   - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
 
-v84 FIXES over v83 (PPL 13.77):
-  - Per-feature adaptive clip scaling: class features get higher limits
-    based on sqrt(n_classes) to prevent saturation at clip boundaries
-  - Added cls_tri_freq to default features (9 total, was 8)
-  - Per-feature class-balanced negatives: dist features get dist-balanced
-    negatives instead of sharing freq-balanced negatives
-  - Softer bigram repetition penalty: exponential decay instead of hard kill
-  - Class feature clips raised from 50 → 200 to prevent saturation
+v85 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
+  - v84 raised class clip 50→200 + sqrt(n_classes) scaling → energy explosion
+  - v85: Reverted class clip to 50, reverted adaptive_clip to v83 formula
+  - v85: Added per-feature NCE subsampling (nce_rate=0.02 for class features)
+    This reduces update density from ~2950 to ~59 updates/pattern/epoch,
+    preventing saturation without needing higher clips
 
 No torch. No neural nets. No float32 in the hot path. ~28 MB memory.
 """

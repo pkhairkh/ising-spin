@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v84 — Anti-Saturation + Per-Feature Negatives)
+Integer Language Model — Training Script (v85 — NCE Subsampling)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v84 FIXES over v83 (PPL 13.77):
-  1. Per-feature adaptive clip scaling: class features get higher limits
-     based on sqrt(n_classes) to prevent saturation at clip boundaries
-  2. Added cls_tri_freq to default features (9 total, was 8)
-  3. Per-feature class-balanced negatives: dist features get dist-balanced
-     negatives instead of sharing freq-balanced negatives
-  4. Softer bigram repetition penalty: exponential decay instead of hard kill
-  5. Class feature clips raised from 50 → 200 to prevent saturation
+v85 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
+  v84 raised class feature clips from 50→200 and added sqrt(n_classes) scaling.
+  This caused massive energy explosion (mean=-7951, std=5787). PPL regressed.
+
+  ROOT CAUSE: Raising the clip ceiling doesn't fix saturation — it makes it worse.
+  Class features have only ~441 unique patterns but get ~2950 updates/pattern/epoch.
+  Any clip level will saturate under this pressure.
+
+  FIX: Per-feature NCE subsampling (nce_rate parameter).
+  Class features update on only 2% of training pairs (nce_rate=0.02),
+  giving ~59 updates/pattern/epoch instead of 2950.
+  This keeps values within clip=50 bounds.
+
+  Also reverted: class clip back to 50, adaptive_clip back to v83 formula.
+
+  Preserved from v84: cls_tri_freq, per-feature negatives, softer bigram rep penalty.
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
@@ -69,77 +77,88 @@ ALL_FEATURE_NAMES = [
 def build_features(feature_names, args, has_dist=True):
     """Build feature list from names and CLI args."""
     features = []
+    cls_nce_rate = args.cls_nce_rate
 
     for name in feature_names:
         if name == "lex_bi":
             features.append(LexBigramFeature(
                 n_hashes=args.lex_n_hashes, table_size=args.lex_table_size,
-                eta=args.lex_eta, clip=args.lex_clip, weight=1.0,
+                eta=args.lex_eta, clip=args.lex_clip, weight=1.0, nce_rate=1.0,
             ))
         elif name == "lex_skip":
             features.append(LexSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
-                eta=args.skip_eta, clip=args.skip_clip, weight=0.3,
+                eta=args.skip_eta, clip=args.skip_clip, weight=0.3, nce_rate=1.0,
             ))
         elif name == "lex_tri":
             features.append(LexTrigramFeature(
                 n_hashes=args.lex_n_hashes, table_size=args.lex_table_size,
-                eta=args.lex_eta, clip=args.lex_clip, weight=0.3,
+                eta=args.lex_eta, clip=args.lex_clip, weight=0.3, nce_rate=1.0,
             ))
         elif name == "word_cls_bi_freq":
             features.append(WordClassBigramFeature(
                 n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                 eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
+                nce_rate=cls_nce_rate,
             ))
         elif name == "cls_word_bi_freq":
             features.append(ClassWordBigramFeature(
                 n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                 eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
+                nce_rate=cls_nce_rate,
             ))
         elif name == "word_cls_bi_dist":
             if has_dist:
                 features.append(WordClassBigramFeature(
                     n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                     eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
+                    nce_rate=cls_nce_rate,
                 ))
         elif name == "cls_word_bi_dist":
             if has_dist:
                 features.append(ClassWordBigramFeature(
                     n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                     eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
+                    nce_rate=cls_nce_rate,
                 ))
         elif name == "cls_tri_dist":
             if has_dist:
                 features.append(ClassTrigramFeature(
                     n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                     eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="dist",
+                    nce_rate=cls_nce_rate,
                 ))
         elif name == "cls_word_skip_freq":
             features.append(ClassWordSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="freq",
+                nce_rate=cls_nce_rate,
             ))
         elif name == "word_cls_skip_freq":
             features.append(WordClassSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="freq",
+                nce_rate=cls_nce_rate,
             ))
         elif name == "cls_word_skip_dist":
             if has_dist:
                 features.append(ClassWordSkipFeature(
                     n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                     eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="dist",
+                    nce_rate=cls_nce_rate,
                 ))
         elif name == "word_cls_skip_dist":
             if has_dist:
                 features.append(WordClassSkipFeature(
                     n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                     eta=args.skip_eta, clip=args.skip_clip, weight=0.3, class_key="dist",
+                    nce_rate=cls_nce_rate,
                 ))
         elif name == "cls_tri_freq":
             features.append(ClassTrigramFeature(
                 n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
                 eta=args.cls_eta, clip=args.cls_clip, weight=0.5, class_key="freq",
+                nce_rate=cls_nce_rate,
             ))
         else:
             print(f"    WARNING: Unknown feature '{name}' — skipping", flush=True)
@@ -185,7 +204,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v84 — Anti-Saturation + Per-Feature Negatives)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v85 — NCE Subsampling)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -210,8 +229,10 @@ def main():
     parser.add_argument("--cls-n-hashes", type=int, default=2)
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
-    parser.add_argument("--cls-clip", type=int, default=200,
-                        help="Clip for class features (v84: raised from 50 to prevent saturation)")
+    parser.add_argument("--cls-clip", type=int, default=50,
+                        help="Clip for class features (v85: reverted to 50, nce_rate handles saturation)")
+    parser.add_argument("--cls-nce-rate", type=float, default=0.02,
+                        help="NCE subsampling rate for class features (v85: 0.02 = update on 2%% of pairs)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -248,7 +269,7 @@ def main():
             "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
             "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-            "cls_tri_freq",  # v84 NEW
+            "cls_tri_freq",  # v84+, kept in v85
             "lex_tri",
         ]
         if not use_dist:
@@ -266,7 +287,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v84 — Anti-Saturation + Per-Feature Negatives", flush=True)
+    print("INTEGER LANGUAGE MODEL v85 — NCE Subsampling", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -275,7 +296,7 @@ def main():
         class_str += f" + dist(K={args.n_clusters})"
     print(f"  Word classes: {class_str}", flush=True)
     print(f"  Class table: size={args.cls_table_size}, hashes={args.cls_n_hashes}, "
-          f"eta={args.cls_eta}, clip={args.cls_clip}", flush=True)
+          f"eta={args.cls_eta}, clip={args.cls_clip}, nce_rate={args.cls_nce_rate}", flush=True)
     print(f"  Lex table:   size={args.lex_table_size}, hashes={args.lex_n_hashes}, "
           f"eta={args.lex_eta}, clip={args.lex_clip}", flush=True)
     print(f"  Skip table:  size={args.skip_table_size}, hashes={args.skip_n_hashes}, "
@@ -416,17 +437,18 @@ def main():
     for feat in model.energy.features.values():
         fs = feat.statistics()
         ck = fs.get('class_key', None)
+        nr = fs.get('nce_rate', 1.0)
         print(f"  {feat.name}: weight={fs['weight']:.1f}, class={ck}, "
               f"range=[{fs['range'][0]},{fs['range'][1]}], "
               f"mean={fs['mean']:.1f}, std={fs['std']:.1f}, "
-              f"nnz={fs['nnz']}, mem={fs['memory_kb']:.0f}KB", flush=True)
+              f"nnz={fs['nnz']}, nce_rate={nr}, mem={fs['memory_kb']:.0f}KB", flush=True)
 
     # Save results
     diag = model.diagnostics()
     t_total = time.time() - t0
     results = {
-        "version": "2.2.0",
-        "architecture": "Integer Language Model v84 — Anti-Saturation + Per-Feature Negatives",
+        "version": "2.3.0",
+        "architecture": "Integer Language Model v85 — NCE Subsampling",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -437,6 +459,7 @@ def main():
             "use_dist": use_dist,
             "nce_epochs": args.nce_epochs,
             "nce_negatives": args.nce_negatives,
+            "cls_nce_rate": args.cls_nce_rate,
         },
         "results": {
             "training_time_s": t_train,
@@ -461,7 +484,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v84")
+    print(f"DONE — Integer Language Model v85")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "
