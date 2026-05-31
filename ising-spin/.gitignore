@@ -1,2 +1,12 @@
-.json
-cached_tinystories_50k.json
+# Data caches
+cached_*.json
+*.json
+
+# Python bytecode
+*.pyc
+__pycache__/
+*.pyo
+
+# Training outputs
+output/
+training_results.json

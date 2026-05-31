@@ -387,7 +387,7 @@ class IntegerLM:
                 cands, lps = self.bigram.get_top_k(ctx, k=self.top_k)
                 if target in cands:
                     tidx = int(np.where(cands == target)[0][0])
-                    combined = self._combined_energy(ctx, cands, lps)
+                    combined = self._combined_energy(ctx, cands, lps, self.alpha)
                     e_min = np.min(combined)
                     deltas = np.clip((combined - e_min).astype(np.float64), 0, 700)
                     weights = np.exp(-deltas * self.beta)

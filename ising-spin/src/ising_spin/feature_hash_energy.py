@@ -396,6 +396,7 @@ class FeatureHashEnergyTable:
                     if self.use_skip and self._skip_bi is not None and np.any(has_p2 if C > 0 else False):
                         for h in range(self.n_skip_hashes):
                             np.add.at(self._skip_bi[h], _hash2_vec(cp2v, neg[has_p2] if C == len(neg) else rng.randint(4, self.V, size=len(cp2v)), h, self.skip_table_size), self.skip_eta)
+                            np.add.at(self._skip_pos_bi[h], _hash2_vec(cp2pv, neg_pos[has_p2], h, self.pos_table_size), self.skip_eta)
 
                 # Trigram updates
                 if self.use_trigram:

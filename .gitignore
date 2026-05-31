@@ -1,5 +1,5 @@
 # Data caches (too large for git)
-cached_fineweb_*.json
+cached_*.json
 *.npy
 data/
 

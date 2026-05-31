@@ -1,14 +1,12 @@
-"""Pytest configuration — add src/ to Python path and define shared fixtures."""
+"""Pytest configuration for Integer Language Model tests."""
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "ising-spin" / "src"))
 
-
-# ── Shared synthetic texts ──────────────────────────────────────────────────
 
 _SYNTHETIC_TEXTS = [
     "the cat sat on the mat and the dog ran in the park",
@@ -21,15 +19,8 @@ _SYNTHETIC_TEXTS = [
     "the weather was warm and sunny during the summer months",
     "he walked along the beach and watched the waves roll in",
     "the city was busy with people going to work each day",
-    "the old man told stories about his adventures at sea",
-    "a young girl found a beautiful shell on the sandy shore",
-    "the team worked together to finish the project on time",
-    "music played softly in the background as they danced slowly",
-    "the scientist discovered a new species in the deep ocean",
 ] * 3
 
-
-# ── Basic fixtures ──────────────────────────────────────────────────────────
 
 @pytest.fixture
 def sample_texts():
@@ -47,22 +38,21 @@ def small_vocab():
 
 
 @pytest.fixture
-def small_attractor_model():
-    """Build a small AttractorLanguageModel for integration tests."""
-    from ising_spin.attractor import AttractorLanguageModel
-
-    model = AttractorLanguageModel(
-        vocab_min_freq=1,
-        vocab_max_size=200,
-        sdr_dim=64,
-        sdr_sparsity=0.08,
-        dam_scale=400,
-        grammar_penalty_scale=30,
-        same_word_penalty=200,
-        max_episodes=100,
-        episodic_scale=200,
-        max_seq_len=15,
+def small_model(small_vocab):
+    """Build a small IntegerLM for integration tests."""
+    from ising_spin import IntegerLM
+    model = IntegerLM(
+        vocab=small_vocab,
+        n_pos_hashes=1,
+        pos_table_size=101,
+        n_lex_hashes=1,
+        lex_table_size=1009,
+        use_skip=False,
+        use_trigram=False,
+        top_k=20,
         seed=42,
     )
-    model.train(n_samples=len(_SYNTHETIC_TEXTS), texts=_SYNTHETIC_TEXTS)
+    sequences = small_vocab.tokenize(_SYNTHETIC_TEXTS)
+    model.train(sequences, n_epochs=1, n_negatives=2)
+    model.calibrate(sequences[:10])
     return model
