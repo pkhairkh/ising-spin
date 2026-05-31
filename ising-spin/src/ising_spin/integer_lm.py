@@ -179,7 +179,14 @@ class IntegerLM:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
 
-        v83 IMPROVEMENTS over v82:
+        v86 IMPROVEMENT: Per-feature z-score normalization.
+        Before grid search, compute each feature's mean and std from
+        training data. During inference, each feature is normalized to
+        unit variance before combining. This ensures the weight grid
+        search can find the optimal balance between features regardless
+        of their absolute scale.
+
+        v83 IMPROVEMENTS (preserved):
         - Disc-aware weight pruning: features with disc < 0.60 get weight=0
         - Disc-proportional weight initialization before grid search
         - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
@@ -187,7 +194,11 @@ class IntegerLM:
         """
         print("  Calibrating...", flush=True)
 
-        # Collect energy samples for normalization
+        # v86: Compute per-feature z-score stats BEFORE anything else
+        self._compute_feature_stats(sequences)
+
+        # Collect energy samples for GLOBAL normalization
+        # (after per-feature normalization, global stats will be different)
         e_samples = []
         for seq in sequences[:300]:
             if len(seq) < 3:
@@ -203,6 +214,13 @@ class IntegerLM:
             self._e_std = max(1.0, float(np.std(e_samples)))
 
         print(f"    Energy: mean={self._e_mean:.1f}, std={self._e_std:.1f}", flush=True)
+
+        # Print per-feature stats for diagnostics
+        if self.energy.feature_stats:
+            print(f"    Per-feature normalization:", flush=True)
+            for fname, stats in self.energy.feature_stats.items():
+                print(f"      {fname}: mean={stats['mean']:.1f}, std={stats['std']:.1f}",
+                      flush=True)
 
         # Build test data for re-ranking accuracy
         rerank_data = []
@@ -327,6 +345,48 @@ class IntegerLM:
             total += 1
         return correct / max(1, total)
 
+    def _compute_feature_stats(self, sequences: List[List[int]]):
+        """
+        v86: Compute per-feature mean and std for z-score normalization.
+
+        For each feature, sample (context, target) pairs from training data,
+        compute the feature's raw energy contribution, and store mean/std.
+        These stats are used by compute_local_energy_batch to normalize
+        each feature to unit variance before combining.
+
+        This ensures that features with different scales (lexical std~78,
+        class std~10) contribute proportionally based on their weight,
+        not their absolute magnitude.
+        """
+        feature_energies = {feat.name: [] for feat in self.energy.features.values()}
+
+        n_samples = 0
+        for seq in sequences[:500]:
+            if len(seq) < 3:
+                continue
+            for pos in range(1, min(len(seq), 8)):
+                ctx = seq[:pos]
+                target = seq[pos]
+                if not (0 <= target < self.V):
+                    continue
+                candidates = np.array([target], dtype=np.int64)
+                for feat in self.energy.features.values():
+                    wc = self.energy._get_class_array(feat)
+                    e = feat.energy_batch(ctx, candidates, wc)
+                    feature_energies[feat.name].append(float(e[0]))
+                n_samples += 1
+
+        self.energy.feature_stats = {}
+        for feat in self.energy.features.values():
+            vals = feature_energies[feat.name]
+            if len(vals) > 10:
+                mean = float(np.mean(vals))
+                std = max(1.0, float(np.std(vals)))
+                self.energy.feature_stats[feat.name] = {
+                    'mean': mean,
+                    'std': std,
+                }
+
     # -------------------------------------------------------------------
     # LEGD probability computation — the core formula
     # -------------------------------------------------------------------
@@ -355,9 +415,9 @@ class IntegerLM:
         lps_scaled = log_probs / temperature
         base_probs = np.exp(lps_scaled - np.max(lps_scaled))
 
-        # Hash energy (z-score normalized)
+        # Hash energy (already per-feature normalized in v86)
         hash_e = self.energy.compute_local_energy_batch(context, candidates)
-        h_norm = (hash_e.astype(np.float64) - self._e_mean) / max(1.0, self._e_std)
+        h_norm = (hash_e - self._e_mean) / max(1.0, self._e_std)
 
         # LEGD: P(c) proportional to P_base(c) * exp(-alpha * h_norm(c) / T)
         legd_weights = base_probs * np.exp(-alpha * h_norm / temperature)

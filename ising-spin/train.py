@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v85 — NCE Subsampling)
+Integer Language Model — Training Script (v86 — Per-Feature Normalization)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-v85 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
+v86 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
   v84 raised class feature clips from 50→200 and added sqrt(n_classes) scaling.
   This caused massive energy explosion (mean=-7951, std=5787). PPL regressed.
 
@@ -204,7 +204,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v85 — NCE Subsampling)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v86 — Per-Feature Normalization)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -230,9 +230,9 @@ def main():
     parser.add_argument("--cls-table-size", type=int, default=65537)
     parser.add_argument("--cls-eta", type=int, default=1)
     parser.add_argument("--cls-clip", type=int, default=50,
-                        help="Clip for class features (v85: reverted to 50, nce_rate handles saturation)")
-    parser.add_argument("--cls-nce-rate", type=float, default=0.02,
-                        help="NCE subsampling rate for class features (v85: 0.02 = update on 2%% of pairs)")
+                        help="Clip for class features (v86: reverted to 50, nce_rate handles saturation)")
+    parser.add_argument("--cls-nce-rate", type=float, default=0.10,
+                        help="NCE subsampling rate for class features (v86: 0.10 = update on 10%% of pairs)")
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -269,7 +269,7 @@ def main():
             "word_cls_bi_freq", "cls_word_bi_freq",
             "lex_skip",
             "word_cls_bi_dist", "cls_word_bi_dist", "cls_tri_dist",
-            "cls_tri_freq",  # v84+, kept in v85
+            "cls_tri_freq",  # v84+, kept in v86
             "lex_tri",
         ]
         if not use_dist:
@@ -287,7 +287,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v85 — NCE Subsampling", flush=True)
+    print("INTEGER LANGUAGE MODEL v86 — Per-Feature Normalization", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -447,8 +447,8 @@ def main():
     diag = model.diagnostics()
     t_total = time.time() - t0
     results = {
-        "version": "2.3.0",
-        "architecture": "Integer Language Model v85 — NCE Subsampling",
+        "version": "2.4.0",
+        "architecture": "Integer Language Model v86 — Per-Feature Normalization",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -484,7 +484,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v85")
+    print(f"DONE — Integer Language Model v86")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

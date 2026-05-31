@@ -1,14 +1,27 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v85 NCE SUBSAMPLING.
+Dynamic Feature-Hashed Integer Energy Table — v86 PER-FEATURE NORMALIZATION.
 
-v85 FIXES over v84 (PPL 15.07 — REGRESSION from v83's 13.77):
-  v84 raised class feature clips from 50→200 and added sqrt(n_classes) scaling
-  to the adaptive_clip hard_limit. This caused MASSIVE energy explosion:
-  mean=-7951, std=5787 (v83 had ~200 range). Freq class matrix went from
-  all ±100 (v83) to all ±1833 (v84). BOTH class systems saturated WORSE.
+v86 FIXES over v85 (PPL 14.27 — still worse than v83's 13.77):
+  v85's NCE subsampling (nce_rate=0.02) fixed saturation but made class features
+  too weak: std=10 vs lexical std=78. After global z-score normalization, class
+  features contributed only ~1.7% of energy variance — effectively noise.
 
-  ROOT CAUSE: Raising the clip ceiling doesn't fix saturation — it makes it
-  worse. The real problem is UPDATE DENSITY: class features have only ~441
+  ROOT CAUSE: Feature scale mismatch. Lexical features (4M unique patterns,
+  sparse updates) and class features (441 patterns, dense updates) operate on
+  completely different scales. Summing them directly lets lexical features
+  dominate, making class features irrelevant regardless of their weight.
+
+  FIX: Per-feature z-score normalization BEFORE combining energies.
+  E = Σ weight_f × (E_f − mean_f) / std_f
+
+  This normalizes each feature to unit variance, so the weight grid search
+  can find the optimal balance. A weight of 1.0 now means "contribute 1 std"
+  regardless of whether the feature has raw values in [-200,200] or [-20,20].
+
+  Also: increased nce_rate from 0.02 → 0.10 for class features (stronger signal
+  while still preventing saturation).
+
+v85 FIXES (preserved):
   unique patterns (21×21 freq bigrams) but receive ~1.3M NCE updates per
   epoch. That's ~2950 updates per pattern, vs ~0.3 for lexical features
   (2000×2000=4M patterns). Any clip level will saturate under this pressure.
@@ -60,18 +73,18 @@ AVAILABLE FEATURES:
     ClassWordSkipFeature   — hash(prev2_class, cand_word) [class_key selectable]
     WordClassSkipFeature   — hash(prev2_word, cand_class) [class_key selectable]
 
-DEFAULT FEATURE SET (v85):
+DEFAULT FEATURE SET (v86):
   LexBigramFeature(class_key=None, nce_rate=1.0),              # pure lexical
-  WordClassBigramFeature(class_key="freq", nce_rate=0.02),     # freq word→class
-  ClassWordBigramFeature(class_key="freq", nce_rate=0.02),     # freq class→word
+  WordClassBigramFeature(class_key="freq", nce_rate=0.10),     # freq word→class
+  ClassWordBigramFeature(class_key="freq", nce_rate=0.10),     # freq class→word
   LexSkipFeature(class_key=None, nce_rate=1.0),               # pure lexical skip
-  WordClassBigramFeature(class_key="dist", nce_rate=0.02),     # dist word→class
-  ClassWordBigramFeature(class_key="dist", nce_rate=0.02),     # dist class→word
-  ClassTrigramFeature(class_key="dist", nce_rate=0.02),        # dist class 3-gram
-  ClassTrigramFeature(class_key="freq", nce_rate=0.02),        # freq class 3-gram
+  WordClassBigramFeature(class_key="dist", nce_rate=0.10),     # dist word→class
+  ClassWordBigramFeature(class_key="dist", nce_rate=0.10),     # dist class→word
+  ClassTrigramFeature(class_key="dist", nce_rate=0.10),        # dist class 3-gram
+  ClassTrigramFeature(class_key="freq", nce_rate=0.10),        # freq class 3-gram
   LexTrigramFeature(class_key=None, nce_rate=1.0),             # pure lexical 3-gram
 
-  9 features total: 3 lexical (nce_rate=1.0) + 6 class (nce_rate=0.02)
+  9 features total: 3 lexical (nce_rate=1.0) + 6 class (nce_rate=0.10)
 
 ADD YOUR OWN FEATURE:
   1. Subclass FeatureSpec, set class_key
@@ -492,7 +505,7 @@ class ClassWordBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.02):
+                 weight=0.5, class_key="freq", nce_rate=0.10):
         name = f"cls_word_bi_{class_key}" if class_key else "cls_word_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -520,7 +533,7 @@ class WordClassBigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.02):
+                 weight=0.5, class_key="freq", nce_rate=0.10):
         name = f"word_cls_bi_{class_key}" if class_key else "word_cls_bi"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -547,7 +560,7 @@ class ClassTrigramFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.5, class_key="freq", nce_rate=0.02):
+                 weight=0.5, class_key="freq", nce_rate=0.10):
         name = f"cls_tri_{class_key}" if class_key else "cls_tri"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -577,7 +590,7 @@ class ClassWordSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.02):
+                 weight=0.3, class_key="freq", nce_rate=0.10):
         name = f"cls_word_skip_{class_key}" if class_key else "cls_word_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -605,7 +618,7 @@ class WordClassSkipFeature(FeatureSpec):
     """
 
     def __init__(self, n_hashes=2, table_size=65537, eta=1, clip=50,
-                 weight=0.3, class_key="freq", nce_rate=0.02):
+                 weight=0.3, class_key="freq", nce_rate=0.10):
         name = f"word_cls_skip_{class_key}" if class_key else "word_cls_skip"
         super().__init__(name, n_hashes, table_size, eta, clip, weight, class_key, nce_rate=nce_rate)
 
@@ -650,13 +663,9 @@ def default_features(
     - Frequency-based patterns (importance, gradient)
     - Syntax-based patterns (part-of-speech-like, from data)
 
-    v85 CHANGES over v84:
-    - Reverted class feature clips from 200 → 50 (v83 value)
-      v84's clip=200 caused energy explosion (mean=-7951)
-    - Added nce_rate parameter: class features use nce_rate=0.02
-      This means they only update on 2% of training pairs, preventing
-      saturation from update density mismatch
-    - Lexical features keep nce_rate=1.0 (update on all pairs)
+    v86 CHANGES over v85:
+    - Increased class feature nce_rate from 0.02 → 0.10 (stronger signal)
+    - Per-feature z-score normalization now balances feature contributions
 
     Default 9 features:
       Lexical (3) — nce_rate=1.0:
@@ -682,15 +691,15 @@ def default_features(
             n_hashes=3, table_size=lex_table_size,
             eta=1, clip=100, weight=1.0, nce_rate=1.0,
         ),
-        # Frequency bucket class features — v85: clip=50, nce_rate=0.02
-        # (nce_rate=0.02 prevents saturation from update density mismatch)
+        # Frequency bucket class features — v86: clip=50, nce_rate=0.10
+        # (nce_rate=0.10 + per-feature normalization = balanced contribution)
         WordClassBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.02,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
         ),
         ClassWordBigramFeature(
             n_hashes=2, table_size=class_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.02,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
         ),
         # Lexical skip
         LexSkipFeature(
@@ -700,19 +709,19 @@ def default_features(
     ]
 
     if include_dist:
-        # Distributional cluster class features — v85: clip=50, nce_rate=0.02
+        # Distributional cluster class features — v86: clip=50, nce_rate=0.10
         features.extend([
             WordClassBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.02,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
             ),
             ClassWordBigramFeature(
                 n_hashes=2, table_size=class_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.02,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
             ),
             ClassTrigramFeature(
                 n_hashes=2, table_size=class_tri_table_size,
-                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.02,
+                eta=1, clip=50, weight=0.5, class_key="dist", nce_rate=0.10,
             ),
         ])
 
@@ -720,7 +729,7 @@ def default_features(
     features.append(
         ClassTrigramFeature(
             n_hashes=2, table_size=class_tri_table_size,
-            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.02,
+            eta=1, clip=50, weight=0.5, class_key="freq", nce_rate=0.10,
         )
     )
 
@@ -777,6 +786,10 @@ class FeatureHashEnergyTable:
         self.word_classes = {k: v.astype(np.int32) for k, v in word_classes.items()}
         self.seed = seed
         self.features: OrderedDict[str, FeatureSpec] = OrderedDict()
+
+        # v86: Per-feature z-score normalization stats
+        # Computed during calibration, used during inference
+        self.feature_stats: Dict[str, Dict[str, float]] = {}
 
         # Primary class system for balanced negative sampling
         # Use the first available class system (usually "freq")
@@ -837,39 +850,54 @@ class FeatureHashEnergyTable:
         """
         Compute total local energy for all candidates given context.
 
-        E = sum_features(weight_f * E_f)
+        v86: Per-feature z-score normalization BEFORE combining.
+        E = sum_features(weight_f * (E_f - mean_f) / std_f)
+
+        This ensures each feature contributes proportionally regardless of
+        its absolute scale. Without normalization, lexical features (std~78)
+        dominate class features (std~10), making class features irrelevant.
+
+        Stats are computed during calibration. If not yet calibrated,
+        falls back to raw (unnormalized) combination.
 
         Each feature uses its own class array (determined by class_key).
-        Returns integer energy array. Lower = more likely = better.
+        Returns float64 energy array. Lower = more likely = better.
         """
         K = len(candidates)
         if not context_word_ids:
-            return np.zeros(K, dtype=np.int64)
+            return np.zeros(K, dtype=np.float64)
 
         total = np.zeros(K, dtype=np.float64)
         for feat in self.features.values():
             wc = self._get_class_array(feat)
-            e = feat.energy_batch(context_word_ids, candidates, wc)
-            total += feat.weight * e.astype(np.float64)
+            e = feat.energy_batch(context_word_ids, candidates, wc).astype(np.float64)
+            # v86: per-feature z-score normalization
+            if feat.name in self.feature_stats:
+                stats = self.feature_stats[feat.name]
+                e = (e - stats['mean']) / max(stats['std'], 1.0)
+            total += feat.weight * e
 
-        return total.astype(np.int64)
+        return total
 
     def compute_local_energy(
         self,
         context_word_ids: List[int],
         candidate: int,
-    ) -> int:
-        """Scalar version for single candidate."""
+    ) -> float:
+        """Scalar version for single candidate. v86: returns float with per-feature norm."""
         if not context_word_ids:
-            return 0
+            return 0.0
 
         total = 0.0
         for feat in self.features.values():
             wc = self._get_class_array(feat)
-            total += feat.weight * feat.energy_scalar(
-                context_word_ids, candidate, wc
-            )
-        return int(total)
+            e = float(feat.energy_scalar(context_word_ids, candidate, wc))
+            # v86: per-feature z-score normalization
+            if feat.name in self.feature_stats:
+                stats = self.feature_stats[feat.name]
+                e = (e - stats['mean']) / max(stats['std'], 1.0)
+            total += feat.weight * e
+        return total
 
     # -------------------------------------------------------------------
     # NCE Training — vectorized batch integer updates
