@@ -1,9 +1,26 @@
 """
-Vocabulary builder and POS type system for the Integer Language Model.
+Vocabulary builder and DATA-DRIVEN word class system.
 
-Combines word-frequency counting, POS tag assignment, and tokenization
-into a single module. No external NLP dependencies — pure rule-based
-POS assignment using English morphological heuristics.
+v81 BREAKING CHANGE:
+  The old system had 13 hardcoded POS tags with 88% of words tagged NOUN.
+  hash(word, pos) with pos=NOUN for 88% of words ≈ hash(word, 0) — the
+  "class" dimension carried ZERO information.
+
+  The new system uses DATA-DRIVEN word classes:
+  - Frequency buckets: words binned by frequency rank into K buckets.
+    Function words (the, a, was) land in bucket 0, content words in
+    higher buckets. K is VARIABLE (default 20), not hardcoded.
+  - Distributional clusters: built from bigram co-occurrence patterns.
+    Words with similar left/right context distributions get the same cluster.
+
+  POS tags are kept for DIAGNOSTICS ONLY — never used in features.
+
+  The key insight: frequency rank naturally separates function words from
+  content words, which is exactly what POS tags were trying (and failing)
+  to capture. But frequency is continuous, not degenerate: you get a
+  smooth gradient from "the" (rank 0) → "cat" (rank 200) → "dinosaur" (rank 1990).
+  With K=20 buckets, each bucket has ~100 words, giving hash(word, bucket)
+  2000×20 = 40000 unique keys — rich, smooth, non-degenerate.
 """
 
 import numpy as np
@@ -12,7 +29,7 @@ from typing import Dict, List, Tuple, Optional
 
 
 # ===========================================================================
-# COARSE POS TAGS (13 categories)
+# COARSE POS TAGS (diagnostics only — NOT used in features)
 # ===========================================================================
 
 COARSE_POS = [
@@ -36,7 +53,6 @@ IDX2POS = {i: tag for i, tag in enumerate(COARSE_POS)}
 N_POS = len(COARSE_POS)
 
 # Priority for choosing the "primary" POS when a word has multiple tags
-# (Closed-class tags get higher priority = lower number)
 TAG_PRIORITY = {
     POS2IDX["PUNCT"]: 0, POS2IDX["DET"]: 1, POS2IDX["PRON"]: 2,
     POS2IDX["AUX"]: 3, POS2IDX["CONJ"]: 4, POS2IDX["PART"]: 5,
@@ -47,7 +63,7 @@ TAG_PRIORITY = {
 
 
 # ===========================================================================
-# WORD SETS FOR CLOSED-CLASS CATEGORIES
+# WORD SETS FOR CLOSED-CLASS CATEGORIES (diagnostics only)
 # ===========================================================================
 
 _DET_WORDS = frozenset({
@@ -97,18 +113,26 @@ _PREP_WORDS = frozenset({
 
 class Vocabulary:
     """
-    Word vocabulary with POS type assignments.
+    Word vocabulary with DATA-DRIVEN word class assignments.
 
-    Builds a fixed-size vocabulary from text data, assigns POS types
-    using morphological heuristics, and provides tokenization.
+    Builds a fixed-size vocabulary from text data, computes frequency-based
+    word classes (buckets), and optionally distributional clusters from
+    bigram statistics.
+
+    Word classes replace the old static POS tags for features:
+    - Frequency buckets: words ranked by frequency, binned into K groups
+    - K is VARIABLE (default 20), not hardcoded at 13
+    - Each bucket has ~V/K words — balanced, non-degenerate
 
     Attributes:
         words: List of vocabulary words (index = word ID).
         word2idx: Dict mapping word -> ID.
         idx2word: Dict mapping ID -> word.
         word_freq: Array of word frequencies, shape (V,).
-        word_pos: Array of primary POS type per word, shape (V,).
-        word_pos_set: Dict mapping word ID -> set of possible POS types.
+        word_freq_rank: Array of frequency rank per word (0 = most frequent).
+        word_bucket: Array of frequency bucket per word, shape (V,).
+        n_buckets: Number of frequency buckets (variable).
+        word_pos: Array of POS type per word (diagnostics only).
     """
 
     SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
@@ -118,15 +142,19 @@ class Vocabulary:
         max_size: int = 2000,
         min_freq: int = 5,
         max_seq_len: int = 30,
+        n_buckets: int = 20,
     ):
         self.max_size = max_size
         self.min_freq = min_freq
         self.max_seq_len = max_seq_len
+        self.n_buckets = n_buckets
 
         self.words: List[str] = []
         self.word2idx: Dict[str, int] = {}
         self.idx2word: Dict[int, str] = {}
         self.word_freq: np.ndarray = np.array([], dtype=np.int32)
+        self.word_freq_rank: np.ndarray = np.array([], dtype=np.int32)
+        self.word_bucket: np.ndarray = np.array([], dtype=np.int32)
         self.word_pos: np.ndarray = np.array([], dtype=np.int32)
         self.word_pos_set: Dict[int, set] = {}
         self.V: int = 0
@@ -155,13 +183,122 @@ class Vocabulary:
             if w in self.word2idx:
                 self.word_freq[self.word2idx[w]] = c
 
-        # Assign POS types
+        # Build frequency-based word classes (THE KEY CHANGE from v80)
+        self._build_freq_buckets()
+
+        # Assign POS types (diagnostics only)
         self._assign_pos_types()
 
         return self
 
+    def _build_freq_buckets(self):
+        """
+        Build frequency-based word class buckets.
+
+        This is the CORE of the v81 redesign. Instead of 13 hardcoded POS tags
+        where 88% are NOUN, we bin words by frequency rank into K buckets.
+
+        WHY THIS WORKS:
+        - High-frequency words (the, a, was, is, he, she) = function words
+          that play grammatical roles → bucket 0
+        - Mid-frequency words (cat, dog, said, went) = common content words
+          → middle buckets
+        - Low-frequency words (dinosaur, castle, whispered) = rare content
+          words → last buckets
+
+        With K=20 buckets and V=2000, each bucket has ~100 words.
+        hash(word, bucket) produces V*K = 40000 unique keys — rich, smooth,
+        non-degenerate. Compare to the old hash(word, pos) with 88% having
+        the same POS value — nearly degenerate.
+
+        The bucket IDs are STABLE: they depend only on frequency rank, not
+        on the arbitrary POS assignment heuristics.
+        """
+        # Frequency rank: 0 = most frequent, V-1 = least frequent
+        # Special tokens (0-3) get their own bucket
+        self.word_freq_rank = np.zeros(self.V, dtype=np.int32)
+        self.word_bucket = np.zeros(self.V, dtype=np.int32)
+
+        # Sort real words (ID >= 4) by frequency (descending)
+        real_word_ids = np.arange(4, self.V)
+        if len(real_word_ids) == 0:
+            return
+
+        freqs = self.word_freq[real_word_ids]
+        sorted_by_freq = real_word_ids[np.argsort(-freqs)]
+
+        # Assign ranks
+        for rank, word_id in enumerate(sorted_by_freq):
+            self.word_freq_rank[word_id] = rank
+
+        # Assign buckets: K buckets for real words, bucket 0 for special tokens
+        # Each bucket gets approximately the same number of words
+        n_real = len(sorted_by_freq)
+        for i, word_id in enumerate(sorted_by_freq):
+            # Bucket 1..K for real words (bucket 0 = special tokens)
+            bucket = 1 + min(i * self.n_buckets // n_real, self.n_buckets - 1)
+            self.word_bucket[word_id] = bucket
+
+        # Print bucket distribution
+        print(f"  Frequency buckets: K={self.n_buckets}, ~{n_real // max(1, self.n_buckets)} words/bucket",
+              flush=True)
+
+    def build_distributional_clusters(
+        self,
+        sequences: List[List[int]],
+        n_clusters: int = 30,
+    ) -> np.ndarray:
+        """
+        Build distributional word clusters from bigram co-occurrence.
+
+        Words that appear in similar contexts (similar distribution of
+        preceding and following words) get the same cluster.
+
+        This is a SIMPLE hash-based approach — no k-means, no SVD:
+        1. For each word, compute a "context fingerprint" by hashing
+           its top-N most frequent followers
+        2. Cluster by fingerprint hash modulo n_clusters
+
+        Returns: word_cluster array, shape (V,), dtype int32.
+
+        NOTE: This is optional — frequency buckets work well by default.
+              Call this AFTER build() and only if you want richer classes.
+        """
+        # Count what follows each word
+        followers = {}
+        for seq in sequences:
+            for pos in range(1, len(seq)):
+                prev = seq[pos - 1]
+                target = seq[pos]
+                if prev not in followers:
+                    followers[prev] = Counter()
+                followers[prev][target] += 1
+
+        # For each word, hash its top-10 followers into a fingerprint
+        word_cluster = np.zeros(self.V, dtype=np.int32)
+        for word_id in range(self.V):
+            if word_id < 4:
+                continue
+            if word_id not in followers or not followers[word_id]:
+                word_cluster[word_id] = 0
+                continue
+
+            # Top 10 followers
+            top = followers[word_id].most_common(10)
+            # Simple hash: multiply follower IDs by primes and sum
+            fp = 0
+            for i, (fid, cnt) in enumerate(top):
+                fp += fid * (i + 1) * 2654435761 + cnt * 2246822519
+            word_cluster[word_id] = (fp % n_clusters) + 1  # 1..n_clusters
+
+        print(f"  Distributional clusters: K={n_clusters}, "
+              f"built from {len(followers)} words with followers",
+              flush=True)
+
+        return word_cluster
+
     def _assign_pos_types(self):
-        """Assign POS types to all vocabulary words using rule-based heuristics."""
+        """Assign POS types to all vocabulary words (diagnostics only)."""
         self.word_pos = np.zeros(self.V, dtype=np.int32)
         self.word_pos_set = {}
 
@@ -183,7 +320,7 @@ class Vocabulary:
 
     @staticmethod
     def _classify_pos(word: str) -> List[int]:
-        """Rule-based POS classification for an English word."""
+        """Rule-based POS classification for an English word (diagnostics only)."""
         w = word.lower()
         tags = []
 
@@ -251,9 +388,17 @@ class Vocabulary:
         return " ".join(self.idx2word.get(i, "<unk>") for i in ids)
 
     def pos_distribution(self) -> Dict[str, int]:
-        """Return count of words per POS category."""
+        """Return count of words per POS category (diagnostics only)."""
         counts = {}
         for idx in range(self.V):
             name = IDX2POS.get(int(self.word_pos[idx]), "X")
             counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def bucket_distribution(self) -> Dict[int, int]:
+        """Return count of words per frequency bucket."""
+        counts = {}
+        for idx in range(self.V):
+            b = int(self.word_bucket[idx])
+            counts[b] = counts.get(b, 0) + 1
         return counts

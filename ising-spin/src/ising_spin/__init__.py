@@ -1,14 +1,20 @@
 """
-Integer Language Model v80 — pure integer, no neural nets, runs on a Pi 5.
+Integer Language Model v81 — pure integer, no neural nets, runs on a Pi 5.
 
 A 100% interpretable, integer-only language model that produces
 grammatically coherent text for simple domains using:
   - Bigram counting for base probabilities
   - DYNAMIC feature registry: add/remove features at runtime
-  - Mixed word-POS features (hash(word, pos)) — no more static 13x13 matrix
-  - Balanced NCE training across POS types
+  - DATA-DRIVEN word classes (frequency buckets), NOT static POS tags
+  - Class-balanced NCE training
   - Metropolis gate for grammaticality enforcement
   - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+
+v81 BREAKING CHANGE:
+  - ALL POS dependency removed from features
+  - Word classes are frequency buckets (K=20, balanced, data-driven)
+  - NOT static POS tags (K=13, 88% NOUN, degenerate)
+  - hash(word, class) has V*K=40000 keys vs hash(word, pos) ≈ V*1=2000
 
 No torch. No neural nets. No float32 in the hot path. ~20 MB memory.
 """
@@ -19,17 +25,16 @@ from .feature_hash_energy import (
     FeatureHashEnergyTable,
     FeatureSpec,
     default_features,
-    # Concrete feature classes — for custom feature sets
+    # Lexical features (pure word ID, no class dependency)
     LexBigramFeature,
-    WordPosBigramFeature,
-    PosWordBigramFeature,
-    PosBigramFeature,
     LexSkipFeature,
-    WordPosSkipFeature,
-    PosWordSkipFeature,
-    PosSkipFeature,
-    PosTrigramFeature,
     LexTrigramFeature,
+    # Class-word mixed features (DATA-DRIVEN, replaces all POS features)
+    ClassWordBigramFeature,
+    WordClassBigramFeature,
+    ClassWordSkipFeature,
+    WordClassSkipFeature,
+    ClassTrigramFeature,
 )
 from .boltzmann import IntegerBoltzmannSampler
 from .integer_lm import IntegerLM
@@ -42,15 +47,13 @@ __all__ = [
     "FeatureSpec",
     "default_features",
     "LexBigramFeature",
-    "WordPosBigramFeature",
-    "PosWordBigramFeature",
-    "PosBigramFeature",
     "LexSkipFeature",
-    "WordPosSkipFeature",
-    "PosWordSkipFeature",
-    "PosSkipFeature",
-    "PosTrigramFeature",
     "LexTrigramFeature",
+    "ClassWordBigramFeature",
+    "WordClassBigramFeature",
+    "ClassWordSkipFeature",
+    "WordClassSkipFeature",
+    "ClassTrigramFeature",
     "IntegerBoltzmannSampler",
     "IntegerLM",
 ]

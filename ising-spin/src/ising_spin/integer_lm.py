@@ -4,23 +4,22 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v80 — Dynamic Features):
+Architecture (v81 — Data-Driven Classes):
   1. BigramModel: P(word | prev) from integer counts (the base)
-  2. Dynamic FeatureHashEnergy: variable features registered at runtime
+  2. Dynamic FeatureHashEnergy: variable features with DATA-DRIVEN classes
      - Each feature is a self-contained FeatureSpec (own tables, eta, clip, weight)
      - add_feature() / remove_feature() for full flexibility
-     - Default: 6 features (lex_bi, word_pos_bi, pos_word_bi, lex_skip, pos_tri, lex_tri)
+     - Word classes from frequency buckets (NOT static POS tags!)
+     - Default: 6 features (lex_bi, word_cls_bi, cls_word_bi, lex_skip, cls_tri, lex_tri)
   3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
   4. Metropolis gate: hard-reject high-energy candidates
   5. Repetition penalty: prevent loops
 
-KEY CHANGES from v79:
-  - No more hardcoded 13x13 POS matrix (the "POS disaster")
-  - Mixed word-POS features (hash(word, pos)) with 26000+ keys
-    replace static POS pairs (hash(pos, pos)) with 169 keys
-  - Variable number of features via FeatureSpec registry
-  - Proper energy scaling: smaller clip values (50-100 vs 500-1000)
-  - Calibration searches smaller alpha range (0.001-0.5 vs 0-10)
+KEY CHANGES from v80:
+  - NO MORE POS DEPENDENCY IN FEATURES
+  - Word classes are DATA-DRIVEN (frequency buckets, K=20)
+  - Balanced classes instead of degenerate 88%-NOUN POS
+  - hash(word, class) has V*K=40000 keys vs hash(word, pos) with V*1≈2000
 
 Generation loop (per step):
   1. Bigram model proposes top-K candidates with probabilities
@@ -32,7 +31,7 @@ Generation loop (per step):
 
 Training:
   1. Count bigrams (integer)
-  2. NCE train all features (integer, with balanced POS negatives)
+  2. NCE train all features (integer, with class-balanced negatives)
   3. Calibrate alpha (grid search on LEGD probs)
 
 Memory footprint: ~20 MB for V=2000. Runs anywhere.
@@ -50,7 +49,7 @@ from .vocabulary import Vocabulary, IDX2POS
 
 class IntegerLM:
     """
-    Pure Integer Language Model with Dynamic Features.
+    Pure Integer Language Model with Data-Driven Word Classes.
 
     No neural nets. No torch. No float32 matrix multiplies in the hot path.
     Just integer counting, hash table lookups, and LEGD probability adjustment.
@@ -94,11 +93,11 @@ class IntegerLM:
             seed=seed,
         )
 
-        # Feature hash energy — dynamic feature registry
+        # Feature hash energy — dynamic feature registry with DATA-DRIVEN classes
         self.energy = FeatureHashEnergyTable(
             vocab_size=self.V,
-            word_pos=vocab.word_pos,
-            n_pos_types=13,
+            word_class=vocab.word_bucket,  # v81: frequency buckets, NOT word_pos
+            n_classes=vocab.n_buckets,
             seed=seed,
         )
 
@@ -165,12 +164,7 @@ class IntegerLM:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
 
-        v80 FIX: The old calibration searched alpha in [0, 10] which was
-        way too large. With z-score normalized energy and smaller clip
-        values, the right range is [0.001, 0.5].
-
-        Also: we now calibrate feature weights by searching a small grid
-        per feature, rather than the old monolithic 3D grid search.
+        Searches alpha in [0.001, 0.5] and feature weights independently.
         """
         print("  Calibrating...", flush=True)
 
@@ -210,9 +204,7 @@ class IntegerLM:
 
         print(f"    Grid search on {len(rerank_data)} pairs...", flush=True)
 
-        # Phase 1: Search alpha in reasonable range
-        # v80 FIX: old range was [0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]
-        # With z-score normalization, alpha should be small
+        # Phase 1: Search alpha
         best_alpha, best_acc = self.alpha, 0.0
         for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:
             acc = self._eval_rerank(rerank_data, alpha)
@@ -226,7 +218,6 @@ class IntegerLM:
         if len(self.energy.features) > 0 and best_alpha > 0:
             print(f"    Searching feature weights...", flush=True)
 
-            # Search each feature's weight independently (greedy)
             for feat in self.energy.features.values():
                 original_weight = feat.weight
                 best_w = original_weight
@@ -250,7 +241,7 @@ class IntegerLM:
 
         self.alpha = best_alpha
 
-        # Metropolis threshold: reject candidates in the top 30% of energy
+        # Metropolis threshold
         best_threshold = 0
         if best_alpha > 0:
             all_e = []
@@ -276,7 +267,7 @@ class IntegerLM:
         return result
 
     def _eval_rerank(self, data, alpha):
-        """Evaluate re-ranking accuracy with given alpha. Uses argmax of LEGD probs."""
+        """Evaluate re-ranking accuracy with given alpha."""
         correct = total = 0
         for ctx, cands, lps, tidx in data:
             probs = self._compute_legd_probs(ctx, cands, lps, alpha)
@@ -306,8 +297,6 @@ class IntegerLM:
         P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E_norm(c) / T)
 
         The energy is z-score normalized: E_norm = (E - mean) / std
-        With proper normalization and alpha in [0.001, 0.5], the energy
-        acts as a gentle correction to the base model, not a sledgehammer.
         """
         K = len(candidates)
         if K == 0:
@@ -329,7 +318,7 @@ class IntegerLM:
             gate = hash_e > self.metropolis_threshold
             legd_weights[gate] = 0.0
 
-        # Repetition penalty (in probability space)
+        # Repetition penalty
         if recent_words and self.rep_penalty > 0:
             recent = recent_words[-self.rep_window:]
             for i, cid in enumerate(candidates):
@@ -352,11 +341,6 @@ class IntegerLM:
     def generate(self, prompt_ids: List[int], length: int = 100) -> List[int]:
         """
         Generate text using LEGD-adjusted probability sampling.
-
-        Per step:
-          1. Bigram model proposes top-K candidates
-          2. LEGD computes adjusted probabilities
-          3. Sample from distribution
         """
         generated = list(prompt_ids)
         for _ in range(length):
@@ -383,7 +367,7 @@ class IntegerLM:
         return generated
 
     def generate_text(self, prompt: str, length: int = 100) -> str:
-        """Generate text from a string prompt. Convenience method."""
+        """Generate text from a string prompt."""
         words = prompt.lower().split()
         ids = [self.vocab.word2idx.get(w, 1) for w in words]
         ids = [i for i in ids if i >= 4]
@@ -399,10 +383,6 @@ class IntegerLM:
     def perplexity(self, sequences: List[List[int]], n_samples: int = 100) -> Dict:
         """
         Compute base PPL and LEGD-adjusted PPL.
-
-        LEGD PPL uses the proper formula:
-          P_legd(target) = P_base(target) * exp(-alpha * E_norm(target)) / Z
-        where Z = sum_c P_base(c) * exp(-alpha * E_norm(c))
         """
         base_lps, legd_lps, n_tok = [], [], 0
 
@@ -425,7 +405,6 @@ class IntegerLM:
                     else:
                         legd_lps.append(base_lp)
                 else:
-                    # Target not in top-K: use base prob (energy can't help)
                     legd_lps.append(base_lp)
                 n_tok += 1
 
@@ -446,7 +425,6 @@ class IntegerLM:
                 ctx, target = seq[:pos], seq[pos]
                 pos_e = self.energy.compute_local_energy(ctx, target)
 
-                # Compare against 3 random corruptions
                 for _ in range(3):
                     neg = rng.randint(4, self.V)
                     while neg == target:
@@ -464,9 +442,9 @@ class IntegerLM:
 
         return {'accuracy': correct / max(1, total), 'comparisons': total}
 
-    def pos_transition_matrix(self) -> np.ndarray:
-        """Return 13x13 POS transition energy matrix for visualization."""
-        return self.energy.get_pos_matrix()
+    def class_transition_matrix(self) -> np.ndarray:
+        """Return K×K class transition energy matrix for visualization."""
+        return self.energy.get_class_matrix()
 
     def diagnostics(self) -> Dict:
         """Full diagnostic report."""
@@ -482,6 +460,7 @@ class IntegerLM:
             'n_features': e_stats['n_features'],
             'feature_names': e_stats['feature_names'],
             'feature_weights': feat_weights,
+            'n_classes': e_stats.get('n_classes', 0),
             'energy_mean': self._e_mean,
             'energy_std': self._e_std,
             'calibrated': self._calibrated,

@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Integer Language Model — Training Script (v80 — Dynamic Features)
+Integer Language Model — Training Script (v81 — Data-Driven Classes)
 
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text.
 
-KEY CHANGE: Dynamic feature system replaces hardcoded tables.
-  - 6 default features (lex_bi, word_pos_bi, pos_word_bi, lex_skip, pos_tri, lex_tri)
-  - Add/remove features at runtime via --features flag
-  - No more static 13x13 POS matrix (the "POS disaster")
+KEY CHANGE v81: ALL POS dependency removed from features.
+  - Word classes are DATA-DRIVEN (frequency buckets, K=20)
+  - NOT static POS tags (K=13, 88% NOUN = degenerate)
+  - Balanced classes: ~100 words/bucket instead of 1762 in one tag
+  - hash(word, class) has 40000 keys vs hash(word, pos) ≈ 2000
 
 Usage:
   python -u train.py                           # Full run (50K texts, default features)
   python -u train.py --samples 5000 --vocab 1000  # Quick test
-  python -u train.py --features lex_bi,word_pos_bi,pos_word_bi  # Custom feature set
-  python -u train.py --features all             # All 10 features
+  python -u train.py --features lex_bi,word_cls_bi,cls_word_bi  # Custom feature set
+  python -u train.py --features all             # All 9 features
+  python -u train.py --n-buckets 30             # More buckets for larger vocab
 """
 
 import os, sys, argparse, json, time, traceback
@@ -38,9 +40,10 @@ for root, dirs, files in os.walk(Path(__file__).parent / "src"):
 from ising_spin import IntegerLM, Vocabulary, IDX2POS
 from ising_spin.feature_hash_energy import (
     FeatureSpec, default_features,
-    LexBigramFeature, WordPosBigramFeature, PosWordBigramFeature, PosBigramFeature,
-    LexSkipFeature, WordPosSkipFeature, PosWordSkipFeature, PosSkipFeature,
-    PosTrigramFeature, LexTrigramFeature,
+    LexBigramFeature, LexSkipFeature, LexTrigramFeature,
+    ClassWordBigramFeature, WordClassBigramFeature,
+    ClassWordSkipFeature, WordClassSkipFeature,
+    ClassTrigramFeature,
 )
 from ising_spin.utils import get_rss_mb
 
@@ -50,9 +53,9 @@ OUTPUT_DIR = CACHE_DIR / "output"
 
 # All available feature names
 ALL_FEATURE_NAMES = [
-    "lex_bi", "word_pos_bi", "pos_word_bi", "pos_bi",
-    "lex_skip", "word_pos_skip", "pos_word_skip", "pos_skip",
-    "pos_tri", "lex_tri",
+    "lex_bi", "word_cls_bi", "cls_word_bi",
+    "lex_skip", "word_cls_skip", "cls_word_skip",
+    "cls_tri", "lex_tri",
 ]
 
 
@@ -66,45 +69,35 @@ def build_features(feature_names, args):
                 n_hashes=args.lex_n_hashes, table_size=args.lex_table_size,
                 eta=args.lex_eta, clip=args.lex_clip, weight=1.0,
             ))
-        elif name == "word_pos_bi":
-            features.append(WordPosBigramFeature(
-                n_hashes=args.pos_n_hashes, table_size=args.pos_table_size,
-                eta=args.pos_eta, clip=args.pos_clip, weight=0.5,
+        elif name == "word_cls_bi":
+            features.append(WordClassBigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5,
             ))
-        elif name == "pos_word_bi":
-            features.append(PosWordBigramFeature(
-                n_hashes=args.pos_n_hashes, table_size=args.pos_table_size,
-                eta=args.pos_eta, clip=args.pos_clip, weight=0.5,
-            ))
-        elif name == "pos_bi":
-            features.append(PosBigramFeature(
-                n_hashes=args.pos_n_hashes, table_size=1009,
-                eta=1, clip=30, weight=0.3,
+        elif name == "cls_word_bi":
+            features.append(ClassWordBigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5,
             ))
         elif name == "lex_skip":
             features.append(LexSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3,
             ))
-        elif name == "word_pos_skip":
-            features.append(WordPosSkipFeature(
+        elif name == "word_cls_skip":
+            features.append(WordClassSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3,
             ))
-        elif name == "pos_word_skip":
-            features.append(PosWordSkipFeature(
+        elif name == "cls_word_skip":
+            features.append(ClassWordSkipFeature(
                 n_hashes=args.skip_n_hashes, table_size=args.skip_table_size,
                 eta=args.skip_eta, clip=args.skip_clip, weight=0.3,
             ))
-        elif name == "pos_skip":
-            features.append(PosSkipFeature(
-                n_hashes=args.skip_n_hashes, table_size=1009,
-                eta=1, clip=30, weight=0.2,
-            ))
-        elif name == "pos_tri":
-            features.append(PosTrigramFeature(
-                n_hashes=args.pos_n_hashes, table_size=args.pos_tri_table_size,
-                eta=args.pos_eta, clip=args.pos_clip, weight=0.5,
+        elif name == "cls_tri":
+            features.append(ClassTrigramFeature(
+                n_hashes=args.cls_n_hashes, table_size=args.cls_table_size,
+                eta=args.cls_eta, clip=args.cls_clip, weight=0.5,
             ))
         elif name == "lex_tri":
             features.append(LexTrigramFeature(
@@ -155,7 +148,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v80 — Dynamic Features)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v81 — Data-Driven Classes)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -163,17 +156,22 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=30)
     parser.add_argument("--vocab-min-freq", type=int, default=5)
 
+    # Word classes (v81: variable, data-driven)
+    parser.add_argument("--n-buckets", type=int, default=20,
+                        help="Number of frequency buckets for word classes. "
+                             "K=20 means ~100 words/bucket for V=2000. "
+                             "NOT the old static 13 POS tags.")
+
     # Feature selection
     parser.add_argument("--features", type=str, default="default",
                         help="Comma-separated feature names, 'default', or 'all'. "
                              f"Options: {', '.join(ALL_FEATURE_NAMES)}")
 
     # Shared feature parameters
-    parser.add_argument("--pos-n-hashes", type=int, default=2)
-    parser.add_argument("--pos-table-size", type=int, default=65537)
-    parser.add_argument("--pos-eta", type=int, default=1)
-    parser.add_argument("--pos-clip", type=int, default=50)
-    parser.add_argument("--pos-tri-table-size", type=int, default=1301)
+    parser.add_argument("--cls-n-hashes", type=int, default=2)
+    parser.add_argument("--cls-table-size", type=int, default=65537)
+    parser.add_argument("--cls-eta", type=int, default=1)
+    parser.add_argument("--cls-clip", type=int, default=50)
 
     parser.add_argument("--lex-n-hashes", type=int, default=3)
     parser.add_argument("--lex-table-size", type=int, default=65537)
@@ -201,7 +199,7 @@ def main():
 
     # Resolve feature names
     if args.features == "default":
-        feature_names = ["lex_bi", "word_pos_bi", "pos_word_bi", "lex_skip", "pos_tri", "lex_tri"]
+        feature_names = ["lex_bi", "word_cls_bi", "cls_word_bi", "lex_skip", "cls_tri", "lex_tri"]
     elif args.features == "all":
         feature_names = ALL_FEATURE_NAMES
     else:
@@ -212,15 +210,16 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v80 — Dynamic Features", flush=True)
+    print("INTEGER LANGUAGE MODEL v81 — Data-Driven Classes", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
-    print(f"  POS table:  size={args.pos_table_size}, hashes={args.pos_n_hashes}, "
-          f"eta={args.pos_eta}, clip={args.pos_clip}", flush=True)
-    print(f"  Lex table:  size={args.lex_table_size}, hashes={args.lex_n_hashes}, "
+    print(f"  Word classes: K={args.n_buckets} (frequency buckets, NOT POS)", flush=True)
+    print(f"  Class table: size={args.cls_table_size}, hashes={args.cls_n_hashes}, "
+          f"eta={args.cls_eta}, clip={args.cls_clip}", flush=True)
+    print(f"  Lex table:   size={args.lex_table_size}, hashes={args.lex_n_hashes}, "
           f"eta={args.lex_eta}, clip={args.lex_clip}", flush=True)
-    print(f"  Skip table: size={args.skip_table_size}, hashes={args.skip_n_hashes}, "
+    print(f"  Skip table:  size={args.skip_table_size}, hashes={args.skip_n_hashes}, "
           f"eta={args.skip_eta}, clip={args.skip_clip}", flush=True)
     print(f"  Gen: alpha={args.alpha}, T={args.temperature}, rep={args.rep_penalty}", flush=True)
     rss = get_rss_mb()
@@ -233,11 +232,28 @@ def main():
     texts = load_data(args.samples)
     print(f"  {len(texts):,} texts", flush=True)
 
-    # [2] Build vocabulary + POS
-    print("\n[2/6] Building vocabulary + POS types...", flush=True)
-    vocab = Vocabulary(max_size=args.vocab, min_freq=args.vocab_min_freq, max_seq_len=args.max_seq_len)
+    # [2] Build vocabulary + DATA-DRIVEN word classes
+    print("\n[2/6] Building vocabulary + frequency buckets...", flush=True)
+    vocab = Vocabulary(
+        max_size=args.vocab,
+        min_freq=args.vocab_min_freq,
+        max_seq_len=args.max_seq_len,
+        n_buckets=args.n_buckets,
+    )
     vocab.build(texts)
-    print(f"  {vocab.V} words", flush=True)
+    print(f"  {vocab.V} words, K={vocab.n_buckets} frequency buckets", flush=True)
+
+    # Show frequency bucket distribution (the NEW class system)
+    print(f"\n  === Frequency Bucket Distribution (DATA-DRIVEN, replaces POS) ===", flush=True)
+    bucket_dist = vocab.bucket_distribution()
+    for b in sorted(bucket_dist.keys()):
+        count = bucket_dist[b]
+        # Show example words for each bucket
+        examples = [vocab.words[w] for w in range(4, vocab.V) if vocab.word_bucket[w] == b][:5]
+        print(f"    Bucket {b:2d}: {count:4d} words  (e.g. {', '.join(examples)})", flush=True)
+
+    # Show POS distribution (diagnostics only — NOT used in features)
+    print(f"\n  === POS Distribution (diagnostics only, NOT used in features) ===", flush=True)
     for name, count in sorted(vocab.pos_distribution().items(), key=lambda x: -x[1]):
         print(f"    {name}: {count}", flush=True)
 
@@ -276,15 +292,18 @@ def main():
     cal_stats = model.calibrate(train_seqs)
     t_train = time.time() - t0
 
-    # Show POS transition matrix (estimated from features)
-    print("\n  === POS Transition Matrix (estimated from word_pos_bi) ===", flush=True)
-    pos_matrix = model.pos_transition_matrix()
-    header = "        " + " ".join(f"{IDX2POS.get(j, 'X'):>6s}" for j in range(13))
+    # Show class transition matrix (v81: replaces POS matrix)
+    print("\n  === Class Transition Matrix (from frequency buckets) ===", flush=True)
+    cls_matrix = model.class_transition_matrix()
+    K = cls_matrix.shape[0]
+    # Show abbreviated matrix (max 10×10 for readability)
+    show_K = min(K, 10)
+    header = "        " + " ".join(f"B{j:>2d}" for j in range(show_K))
     print(header, flush=True)
-    for i in range(13):
-        row = f"  {IDX2POS.get(i, 'X'):>6s} "
-        for j in range(13):
-            row += f"{pos_matrix[i,j]:>6.0f}"
+    for i in range(show_K):
+        row = f"  B{i:>2d}  "
+        for j in range(show_K):
+            row += f"{cls_matrix[i,j]:>5.0f}"
         print(row, flush=True)
 
     # [6] Evaluate
@@ -327,13 +346,14 @@ def main():
     diag = model.diagnostics()
     t_total = time.time() - t0
     results = {
-        "version": "2.0.0",
-        "architecture": "Integer Language Model v80 — Dynamic Features",
+        "version": "2.1.0",
+        "architecture": "Integer Language Model v81 — Data-Driven Classes",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
             "samples": args.samples,
             "vocab_size": args.vocab,
+            "n_buckets": args.n_buckets,
             "nce_epochs": args.nce_epochs,
             "nce_negatives": args.nce_negatives,
         },
@@ -344,6 +364,7 @@ def main():
             "base_ppl": ppl['base_ppl'],
             "legd_ppl": ppl['legd_ppl'],
             "vocab_size": vocab.V,
+            "n_buckets": vocab.n_buckets,
             "alpha": diag['alpha'],
             "temperature": diag['temperature'],
             "metropolis_threshold": diag['metropolis_threshold'],
@@ -356,20 +377,12 @@ def main():
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
 
-    # Save POS matrix
-    pos_data = {}
-    for i in range(13):
-        for j in range(13):
-            pos_data[f"{IDX2POS.get(i,'X')}->{IDX2POS.get(j,'X')}"] = float(pos_matrix[i,j])
-    with open(output_dir / "pos_matrix.json", "w") as f:
-        json.dump(pos_data, f, indent=2)
-
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v80")
+    print(f"DONE — Integer Language Model v81")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "
-          f"Features: {diag['n_features']}")
+          f"Features: {diag['n_features']} | Buckets: {diag['n_classes']}")
     print(f"  Energy: mean={diag['energy_mean']:.1f}, std={diag['energy_std']:.1f}")
     print(f"  Results: {output_dir}")
     print(f"{'='*70}", flush=True)
