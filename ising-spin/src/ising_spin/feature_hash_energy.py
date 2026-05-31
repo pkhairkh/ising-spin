@@ -1,28 +1,35 @@
 """
-Dynamic Feature-Hashed Integer Energy Table — v88 COORDINATED ENERGY.
+Dynamic Feature-Hashed Integer Energy Table — v89 NORMALIZED ENERGY.
 
-v88 DIAGNOSIS over v84–v87 (PPL 14.16–15.07, all worse than v83's 13.77):
-  Since v84, we kept two changes that v83 didn't have:
-  1. Per-feature class-balanced negatives — each feature gets negatives
-     balanced by its own class system. This fragments the energy landscape:
-     features trained on different negatives learn different baselines,
-     making them less coordinated at inference.
-  2. nce_rate subsampling (0.02–0.50) — weakens or distorts class features
-     relative to lexical features.
+v89 DIAGNOSIS: v88 PPL=27.35 — barely better than base bigram 27.74!
+  The fundamental issue was TWO-FOLD:
 
-  v83 worked because ALL features shared the same negatives (balanced by
-  the primary class system) and all had nce_rate=1.0. Class features
-  saturated at ±100, but the saturated binary signal was still useful,
-  and the alpha/weight calibration worked with it.
+  1. NO per-feature normalization: With 9 features contributing raw
+     energies at wildly different scales (lex_bi mean=-454, cls_tri_freq
+     mean=-103), the total energy was dominated by the largest feature.
+     Global z-score normalization can't fix this — it rescales the total
+     but doesn't fix the relative feature contributions.
 
-  FIX: Return to v83's COORDINATED training dynamics:
-  - All features at nce_rate=1.0 (no subsampling)
-  - All features share the same negatives (balanced by primary class only)
-  - Class features will saturate at ±100 — this is EXPECTED and FINE
-  - The global z-score normalization + alpha/weight grid search handles it
+  2. Argmax-based calibration: Searching for alpha that maximizes
+     re-ranking ACCURACY selects overly aggressive alpha (2.0), which
+     makes exp(-alpha * E_norm) dominate P_base entirely. Good for argmax
+     but catastrophic for PPL (assigns near-zero prob to correct tokens
+     when the model is confident but wrong).
 
-  Also: expanded alpha grid in integer_lm.py (0.5 → 2.0 cap) to allow
-  stronger energy correction when the energy is well-scaled.
+  FIX — Two fundamental changes:
+  1. Per-feature z-score normalization: Each feature's energy is
+     standardized to (E_f - mu_f) / sigma_f BEFORE weighting. This
+     ensures features contribute equally by default, and the weight
+     grid search controls relative importance.
+
+  2. PPL-based calibration (in integer_lm.py): Search for alpha that
+     MINIMIZES perplexity instead of maximizing argmax accuracy.
+     This finds the sweet spot where energy gently corrects the base
+     model without overwhelming it.
+
+  Training dynamics remain coordinated (all nce_rate=1.0, shared negatives).
+  Class features still saturate at ±100 but per-feature normalization
+  rescales their contribution appropriately.
 
 v83 FIXES (preserved):
   - Adaptive clip with hard upper bound (was no-op in v82)
@@ -764,8 +771,8 @@ class FeatureHashEnergyTable:
         self.seed = seed
         self.features: OrderedDict[str, FeatureSpec] = OrderedDict()
 
-        # v88: Per-feature stats kept for diagnostics only
-        self.feature_stats: Dict[str, Dict[str, float]] = {}  # diagnostics only
+        # v89: Per-feature stats USED for normalization at inference
+        self.feature_stats: Dict[str, Dict[str, float]] = {}  # used for per-feature z-score
 
         # Primary class system for balanced negative sampling
         # Use the first available class system (usually "freq")
@@ -826,10 +833,14 @@ class FeatureHashEnergyTable:
         """
         Compute total local energy for all candidates given context.
 
-        v88: Raw weighted energy sum — no per-feature normalization.
-        The global z-score normalization in _compute_legd_probs handles scaling.
-        All features are trained with coordinated dynamics (shared negatives,
-        same nce_rate=1.0), so raw energy values are naturally balanced.
+        v89: Per-feature z-score normalization BEFORE weighting.
+        Each feature's raw energy is standardized: (E_f - mu_f) / sigma_f
+        then multiplied by its weight. This ensures features contribute
+        equally by default, with weights controlling relative importance.
+
+        Without this, lex_bi (mean=-454) drowns out cls_tri_freq (mean=-103),
+        and the total energy is dominated by the largest feature regardless
+        of its discriminative quality.
 
         Each feature uses its own class array (determined by class_key).
         Returns float64 energy array. Lower = more likely = better.
@@ -842,6 +853,13 @@ class FeatureHashEnergyTable:
         for feat in self.features.values():
             wc = self._get_class_array(feat)
             e = feat.energy_batch(context_word_ids, candidates, wc).astype(np.float64)
+
+            # v89: Per-feature z-score normalization
+            if feat.name in self.feature_stats:
+                mu = self.feature_stats[feat.name]['mean']
+                sigma = self.feature_stats[feat.name]['std']
+                e = (e - mu) / sigma
+
             total += feat.weight * e
 
         return total
@@ -851,7 +869,7 @@ class FeatureHashEnergyTable:
         context_word_ids: List[int],
         candidate: int,
     ) -> float:
-        """Scalar version for single candidate. v88: raw weighted energy."""
+        """Scalar version for single candidate. v89: per-feature z-score normalized."""
         if not context_word_ids:
             return 0.0
 
@@ -859,6 +877,13 @@ class FeatureHashEnergyTable:
         for feat in self.features.values():
             wc = self._get_class_array(feat)
             e = float(feat.energy_scalar(context_word_ids, candidate, wc))
+
+            # v89: Per-feature z-score normalization
+            if feat.name in self.feature_stats:
+                mu = self.feature_stats[feat.name]['mean']
+                sigma = self.feature_stats[feat.name]['std']
+                e = (e - mu) / sigma
+
             total += feat.weight * e
         return total
 

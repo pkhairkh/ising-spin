@@ -200,7 +200,7 @@ def load_data(n_samples):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integer Language Model (v88 — Coordinated Energy)")
+    parser = argparse.ArgumentParser(description="Integer Language Model (v89 — Normalized Energy)")
 
     # Data
     parser.add_argument("--samples", type=int, default=50000)
@@ -283,7 +283,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("INTEGER LANGUAGE MODEL v88 — Coordinated Energy", flush=True)
+    print("INTEGER LANGUAGE MODEL v89 — Normalized Energy", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"  Features: {', '.join(feature_names)}", flush=True)
@@ -444,7 +444,7 @@ def main():
     t_total = time.time() - t0
     results = {
         "version": "2.5.0",
-        "architecture": "Integer Language Model v88 — Coordinated Energy",
+        "architecture": "Integer Language Model v89 — Normalized Energy",
         "timestamp": timestamp,
         "config": {
             "features": feature_names,
@@ -480,7 +480,7 @@ def main():
         json.dump(results, f, indent=2, default=str)
 
     print(f"\n{'='*70}", flush=True)
-    print(f"DONE — Integer Language Model v88")
+    print(f"DONE — Integer Language Model v89")
     print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
           f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
     print(f"  Alpha: {diag['alpha']:.3f} | T: {diag['temperature']} | "

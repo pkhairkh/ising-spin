@@ -1,5 +1,5 @@
 """
-Integer Language Model v87 — pure integer, no neural nets, runs on a Pi 5.
+Integer Language Model v89 — pure integer, no neural nets, runs on a Pi 5.
 
 A 100% interpretable, integer-only language model that produces
 grammatically coherent text for simple domains using:
@@ -8,18 +8,20 @@ grammatically coherent text for simple domains using:
   - MULTI-CLASS word system: frequency buckets + distributional clusters
   - Features declare which class system they use via class_key
   - Per-feature class-balanced NCE training
-  - Per-feature NCE subsampling (nce_rate) to prevent class feature saturation
-  - RAW energy combination (per-feature normalization removed in v87)
+  - PER-FEATURE Z-SCORE NORMALIZATION (v89 fix — rescales each feature
+    independently so lex_bi doesn't drown out cls_tri_freq)
+  - PPL-BASED CALIBRATION (v89 fix — minimizes perplexity instead of
+    maximizing argmax accuracy, preventing energy from dominating P_base)
   - Metropolis gate for grammaticality enforcement
   - Soft exponential decay repetition penalty
-  - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+  - LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c))
 
-v87 FIXES over v86 (PPL 14.16 — per-feature normalization was harmful):
-  - Removed per-feature z-score normalization: it destroyed the mean
-    discriminative signal and over-compressed energy (std=3.2)
-  - Raw energies + global z-score only (like v83, which had PPL 13.77)
-  - Increased class nce_rate from 0.10 → 0.50 (5x more updates)
-  - Class features now get enough signal to be useful
+v89 FUNDAMENTAL FIXES over v88 (PPL 27.35 — barely better than base 27.74):
+  - Per-feature z-score normalization: each feature's energy is standardized
+    to (E_f - mu_f) / sigma_f before weighting, so features contribute
+    equally by default (lex_bi no longer drowns out everything else)
+  - PPL-based calibration: search alpha minimizing PPL instead of maximizing
+    argmax accuracy (argmax selects alpha=2.0 which dominates P_base)
 
 No torch. No neural nets. No float32 in the hot path. ~28 MB memory.
 """

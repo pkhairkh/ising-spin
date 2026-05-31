@@ -4,43 +4,57 @@ Integer Language Model — the main class.
 Pure integer language model. No neural nets. No torch dependency.
 Runs on a Pi 5. Produces grammatically coherent text for simple domains.
 
-Architecture (v88 — Coordinated Energy):
+Architecture (v89 — Normalized Energy):
   1. BigramModel: P(word | prev) from integer counts (the base)
   2. Dynamic FeatureHashEnergy: MULTI-CLASS features
+     - Per-feature z-score normalization BEFORE weighting
      - Multiple word class systems running simultaneously
      - Frequency buckets ("freq") + distributional clusters ("dist")
      - Each feature declares which class system it uses via class_key
      - add_feature() / remove_feature() for full flexibility
-  3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+  3. LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
   4. Metropolis gate: hard-reject high-energy candidates
   5. Repetition penalty: unigram + bigram SOFT exponential decay
 
-v88 FIXES over v87 (PPL 14.46 — worse than v83's 13.77):
-  - Returned to v83's COORDINATED training dynamics:
-    - All features at nce_rate=1.0 (no subsampling)
-    - Shared negatives for all features (balanced by primary class only)
-  - Expanded alpha grid: added 1.0 and 2.0 (was capped at 0.5)
-  - Class features will saturate at ±100 — this is expected and FINE (v83 worked)
-  - Root cause since v84: per-feature negatives fragmented the energy landscape
+v89 FUNDAMENTAL FIXES over v88 (PPL 27.35 — barely better than base 27.74):
+  The problem was not training dynamics — it was inference dynamics:
 
-v83 FIXES (preserved):
-  - Disc-aware weight pruning: features with disc < 0.60 get weight=0
-  - Disc-proportional weight initialization before grid search
-  - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
-  - Better Metropolis threshold using energy percentiles
+  1. Per-feature z-score normalization (in feature_hash_energy.py):
+     Each feature's raw energy is standardized to (E_f - mu_f) / sigma_f
+     BEFORE the weight is applied. This prevents lex_bi (mean=-454)
+     from drowning out cls_tri_freq (mean=-103). Without this, the
+     global z-score just rescales the total — it can't fix relative
+     feature contributions.
+
+  2. PPL-based calibration instead of argmax-based:
+     v88 searched for alpha maximizing re-ranking ACCURACY (argmax).
+     This selects alpha=2.0, making exp(-2*E_norm) range from 0.002 to
+     403 — a 200,000:1 ratio that completely dominates P_base. Good for
+     argmax (0.898 accuracy) but catastrophic for PPL (27.35). v89
+     searches for alpha minimizing PPL directly.
+
+  3. Removed global z-score normalization in _compute_legd_probs:
+     Per-feature normalization already standardizes each feature. The
+     global z-score was redundant and could double-normalize.
+
+Training dynamics preserved from v88:
+  - All features at nce_rate=1.0 (coordinated)
+  - Shared negatives for all features
+  - Disc-aware weight pruning
 
 Generation loop (per step):
   1. Bigram model proposes top-K candidates with probabilities
-  2. Each feature computes its energy contribution (using its class array)
-  3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E_norm(c))
+  2. Each feature computes its NORMALIZED energy contribution
+  3. LEGD combines: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
   4. Metropolis gate zeros out candidates above threshold
   5. Repetition penalty reduces probability of recent words AND bigrams
   6. Sample from resulting distribution
 
 Training:
   1. Count bigrams (integer)
-  2. NCE train all features (integer, with per-feature balanced negatives)
-  3. Calibrate alpha + feature weights (grid search with disc-aware priors)
+  2. NCE train all features (integer, with balanced negatives)
+  3. Compute per-feature energy statistics (mean, std)
+  4. Calibrate alpha + feature weights (PPL-based grid search)
 
 Memory footprint: ~28 MB for V=2000 with 9 features. Runs anywhere.
 """
@@ -177,21 +191,34 @@ class IntegerLM:
         """
         Calibrate alpha, metropolis_threshold, and feature weights.
 
-        v88: Expanded alpha grid (up to 2.0) to allow stronger energy correction.
-        Raw energies + global z-score normalization (like v83).
+        v89 FUNDAMENTAL CHANGES over v88:
+        1. Per-feature z-score normalization is now used (computed in
+           _compute_feature_stats, applied in compute_local_energy_batch).
+           This means the energy is already properly scaled — no global
+           z-score needed.
+        2. Alpha search uses PPL MINIMIZATION instead of argmax accuracy.
+           Argmax-based search selects alpha=2.0 which makes energy
+           dominate P_base (good for argmax, catastrophic for PPL).
+           PPL-based search finds the sweet spot where energy gently
+           corrects the base model.
 
         v83 IMPROVEMENTS (preserved):
         - Disc-aware weight pruning: features with disc < 0.60 get weight=0
         - Disc-proportional weight initialization before grid search
-        - Wider weight search grid: [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
-        - Better Metropolis threshold using energy percentiles
         """
         print("  Calibrating...", flush=True)
 
-        # v88: Compute per-feature stats for diagnostics only (NOT for normalization)
+        # v89: Compute per-feature stats — NOW USED for normalization
         self._compute_feature_stats(sequences)
 
-        # Collect energy samples for GLOBAL normalization
+        # Print per-feature stats (now actually used for normalization)
+        if self.energy.feature_stats:
+            print(f"    Per-feature stats (USED for z-score normalization):", flush=True)
+            for fname, stats in self.energy.feature_stats.items():
+                print(f"      {fname}: mean={stats['mean']:.1f}, std={stats['std']:.1f}",
+                      flush=True)
+
+        # Compute overall energy stats for diagnostics
         e_samples = []
         for seq in sequences[:300]:
             if len(seq) < 3:
@@ -206,16 +233,10 @@ class IntegerLM:
             self._e_mean = float(np.mean(e_samples))
             self._e_std = max(1.0, float(np.std(e_samples)))
 
-        print(f"    Energy: mean={self._e_mean:.1f}, std={self._e_std:.1f}", flush=True)
+        print(f"    Energy (normalized): mean={self._e_mean:.2f}, std={self._e_std:.2f}",
+              flush=True)
 
-        # v88: Print per-feature energy stats for diagnostics
-        if self.energy.feature_stats:
-            print(f"    Per-feature stats (diagnostics only, NOT used for normalization):", flush=True)
-            for fname, stats in self.energy.feature_stats.items():
-                print(f"      {fname}: mean={stats['mean']:.1f}, std={stats['std']:.1f}",
-                      flush=True)
-
-        # Build test data for re-ranking accuracy
+        # Build test data for PPL-based calibration
         rerank_data = []
         for seq in sequences[:200]:
             if len(seq) < 3:
@@ -235,7 +256,6 @@ class IntegerLM:
         print(f"    Grid search on {len(rerank_data)} pairs...", flush=True)
 
         # Phase 0: Disc-aware weight pruning
-        # Get last epoch's per-feature discriminative accuracy from training
         last_train_stats = getattr(self.energy, '_last_train_stats', None)
         if last_train_stats and 'epochs' in last_train_stats and last_train_stats['epochs']:
             last_epoch = last_train_stats['epochs'][-1]
@@ -244,54 +264,58 @@ class IntegerLM:
             for feat in self.energy.features.values():
                 disc = feat_disc.get(feat.name, 0.5)
                 if disc < 0.60:
-                    # Feature is barely above random — kill it
                     print(f"    PRUNE: {feat.name} disc={disc:.3f} < 0.60 → weight=0",
                           flush=True)
                     feat.weight = 0.0
                     n_pruned += 1
                 elif disc > 0.85:
-                    # Strong feature — boost initial weight
                     feat.weight = max(feat.weight, 1.0)
                     print(f"    BOOST: {feat.name} disc={disc:.3f} → weight={feat.weight:.1f}",
                           flush=True)
             if n_pruned > 0:
                 print(f"    Pruned {n_pruned} weak features (disc < 0.60)", flush=True)
 
-        # Phase 1: Search alpha — v88: expanded grid up to 2.0
-        best_alpha, best_acc = self.alpha, 0.0
-        for alpha in [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]:
-            acc = self._eval_rerank(rerank_data, alpha)
-            if acc > best_acc:
-                best_acc, best_alpha = acc, alpha
+        # Phase 1: Search alpha — v89: PPL MINIMIZATION instead of argmax accuracy
+        # With per-feature normalization, energy is well-scaled so alpha
+        # should be small (0.05-0.5 range). Capping at 1.0.
+        best_alpha, best_ppl = self.alpha, float('inf')
+        for alpha in [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0]:
+            ppl = self._eval_ppl(rerank_data, alpha)
+            if ppl < best_ppl:
+                best_ppl, best_alpha = ppl, alpha
 
-        print(f"    Best alpha: {best_alpha} (acc={best_acc:.3f})", flush=True)
+        # Also report argmax accuracy for comparison
+        best_acc = self._eval_rerank(rerank_data, best_alpha)
+        print(f"    Best alpha: {best_alpha} (PPL={best_ppl:.2f}, acc={best_acc:.3f})",
+              flush=True)
 
-        # Phase 2: Search feature weights (wider grid, only active features)
+        # Phase 2: Search feature weights (PPL-based, only active features)
         best_weights = {feat.name: feat.weight for feat in self.energy.features.values()}
         active_features = [f for f in self.energy.features.values() if f.weight > 0]
 
         if len(active_features) > 0 and best_alpha > 0:
-            print(f"    Searching feature weights ({len(active_features)} active)...",
+            print(f"    Searching feature weights ({len(active_features)} active, PPL-based)...",
                   flush=True)
 
-            # Wider weight grid than v82
-            weight_grid = [0.0, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0]
+            # v89: More conservative weight grid — with per-feature normalization,
+            # weights should be moderate (no need for 3.0)
+            weight_grid = [0.0, 0.3, 0.5, 1.0, 1.5, 2.0]
 
             for feat in active_features:
                 original_weight = feat.weight
                 best_w = original_weight
-                best_feat_acc = best_acc
+                best_feat_ppl = best_ppl
 
                 for w in weight_grid:
                     feat.weight = w
-                    acc = self._eval_rerank(rerank_data, best_alpha)
-                    if acc > best_feat_acc:
-                        best_feat_acc = acc
+                    ppl = self._eval_ppl(rerank_data, best_alpha)
+                    if ppl < best_feat_ppl:
+                        best_feat_ppl = ppl
                         best_w = w
 
                 feat.weight = best_w
-                if best_feat_acc > best_acc:
-                    best_acc = best_feat_acc
+                if best_feat_ppl < best_ppl:
+                    best_ppl = best_feat_ppl
                     best_weights[feat.name] = best_w
 
             # Restore best weights
@@ -308,7 +332,6 @@ class IntegerLM:
                 he = self.energy.compute_local_energy_batch(ctx, cands)
                 all_e.extend(he.tolist())
             if all_e:
-                # Use 75th percentile (higher threshold = fewer rejections)
                 best_threshold = int(np.percentile(all_e, 75))
 
         self.metropolis_threshold = best_threshold
@@ -317,12 +340,13 @@ class IntegerLM:
         result = {
             'alpha': best_alpha,
             'metropolis_threshold': best_threshold,
+            'cal_ppl': best_ppl,
             'rerank_acc': best_acc,
             'feature_weights': best_weights,
         }
         w_str = ", ".join(f"{k}={v:.1f}" for k, v in best_weights.items())
         print(f"    Result: alpha={best_alpha}, threshold={best_threshold}, "
-              f"acc={best_acc:.3f}", flush=True)
+              f"PPL={best_ppl:.2f}, acc={best_acc:.3f}", flush=True)
         print(f"    Weights: {w_str}", flush=True)
         return result
 
@@ -338,14 +362,30 @@ class IntegerLM:
             total += 1
         return correct / max(1, total)
 
+    def _eval_ppl(self, data, alpha):
+        """v89: Evaluate PPL with given alpha. Lower is better."""
+        log_probs = []
+        for ctx, cands, lps, tidx in data:
+            probs = self._compute_legd_probs(ctx, cands, lps, alpha)
+            if len(probs) == 0:
+                continue
+            tp = probs[tidx]
+            if tp > 0:
+                log_probs.append(float(np.log(tp)))
+            else:
+                log_probs.append(-20.0)  # Very bad but not -inf
+        if not log_probs:
+            return float('inf')
+        return float(np.exp(-np.mean(log_probs)))
+
     def _compute_feature_stats(self, sequences: List[List[int]]):
         """
-        v88: Compute per-feature mean and std for DIAGNOSTICS ONLY.
+        v89: Compute per-feature mean and std — NOW USED for normalization.
 
-        These stats are printed during calibration for debugging but are
-        NOT used for normalization. The raw energies are combined directly,
-        and the global z-score normalization in _compute_legd_probs handles
-        the overall scale.
+        These stats are stored in self.energy.feature_stats and used by
+        compute_local_energy_batch() for per-feature z-score normalization.
+        This is the key fix: without per-feature normalization, lex_bi
+        (mean=-454) drowns out cls_tri_freq (mean=-103).
         """
         feature_energies = {feat.name: [] for feat in self.energy.features.values()}
 
@@ -353,7 +393,7 @@ class IntegerLM:
         for seq in sequences[:500]:
             if len(seq) < 3:
                 continue
-            for pos in range(1, min(len(seq), 8)):
+            for pos in range(1, min(len(seq), 10)):  # v89: more positions (was 8)
                 ctx = seq[:pos]
                 target = seq[pos]
                 if not (0 <= target < self.V):
@@ -365,7 +405,7 @@ class IntegerLM:
                     feature_energies[feat.name].append(float(e[0]))
                 n_samples += 1
 
-        # v88: Store for diagnostics only — NOT used for normalization
+        # v89: Store for per-feature z-score normalization at inference
         self.energy.feature_stats = {}
         for feat in self.energy.features.values():
             vals = feature_energies[feat.name]
@@ -393,9 +433,12 @@ class IntegerLM:
         """
         Compute LEGD-adjusted probabilities.
 
-        P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E_norm(c) / T)
+        v89: P(c) proportional to P_base(c)^(1/T) * exp(-alpha * E(c) / T)
 
-        The energy is z-score normalized: E_norm = (E - mean) / std
+        The energy E(c) is already per-feature z-score normalized (in
+        compute_local_energy_batch), so no global z-score is needed here.
+        Each feature contributes (E_f - mu_f)/sigma_f * weight_f, giving
+        the total energy a well-behaved scale (mean≈0, std≈sqrt(sum(w^2))).
         """
         K = len(candidates)
         if K == 0:
@@ -405,12 +448,12 @@ class IntegerLM:
         lps_scaled = log_probs / temperature
         base_probs = np.exp(lps_scaled - np.max(lps_scaled))
 
-        # Hash energy (v88: raw weighted sum, no per-feature normalization)
+        # Hash energy (v89: already per-feature z-score normalized)
         hash_e = self.energy.compute_local_energy_batch(context, candidates)
-        h_norm = (hash_e - self._e_mean) / max(1.0, self._e_std)
 
-        # LEGD: P(c) proportional to P_base(c) * exp(-alpha * h_norm(c) / T)
-        legd_weights = base_probs * np.exp(-alpha * h_norm / temperature)
+        # LEGD: P(c) proportional to P_base(c) * exp(-alpha * E(c) / T)
+        # No global z-score needed — per-feature normalization handles scaling
+        legd_weights = base_probs * np.exp(-alpha * hash_e / temperature)
 
         # Metropolis gate: zero out candidates above threshold
         if self.metropolis_threshold > 0 and alpha > 0:
