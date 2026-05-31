@@ -1,39 +1,22 @@
 #!/usr/bin/env python3
 """
-Integer EBM Re-ranker v76h — Training Script
+Integer Language Model — Training Script
 
-v76h ARCHITECTURAL FIXES:
-  1. Proper BPE-to-word alignment: GPT-2 candidates are now word-level
-     (eliminates <unk> tokens, gives GPT-2 proper context)
-  2. Bigram energy scale fix: Bigram is z-score normalized independently
-     (was dominating DAM energy 7700 vs 84 std)
-  3. Repetition penalty: Prevents loops ("they in they in...")
-  4. J_max increased: 32000 → 64000 (was saturating)
-  5. SDR sparsity increased: 0.02 → 0.04 (k=10 → k=20, better position encoding)
-
-Pipeline:
-  1. Load base model (GPT-2 or DummyBaseLM)
-  2. Load corpus, build vocabulary, tokenize
-  3. Build SDR encoder (k=20 for v76h)
-  4. Build BPE-to-word alignment cache (v76h new step)
-  5. Build DAM discriminator (NCE-trained, 3 corruption types only)
-  6. Build bigram log-prob table
-  7. NCE training: Hebbian with contrastive signal
-  8. Calibrate re-ranking (z-score normalization + alpha/gamma/beta search)
-  9. Evaluate: discriminative accuracy, PPL, generation
+Pure integer language model. No neural nets. No torch dependency.
+Runs on a Pi 5. Produces grammatically coherent text.
 
 Usage:
-  python -u train.py --samples 5000 --vocab 1000 --no-base-model --nce-epochs 1
-  python -u train.py  # Default: 50K samples, GPT-2 base model
+  python -u train.py                           # Full run (50K texts, GPT-2 optional)
+  python -u train.py --samples 5000 --vocab 1000  # Quick test
 """
 
-# --- UNBUFFERED OUTPUT ---
-import os
-import sys
+import os, sys, argparse, json, time, traceback
 os.environ["PYTHONUNBUFFERED"] = "1"
 
-# Ensure src/ is on the Python path
 from pathlib import Path
+import numpy as np
+
+# Ensure src/ is on path
 _src = str(Path(__file__).parent / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
@@ -45,536 +28,261 @@ for root, dirs, files in os.walk(Path(__file__).parent / "src"):
         shutil.rmtree(os.path.join(root, "__pycache__"), ignore_errors=True)
         dirs.remove("__pycache__")
 
-import argparse
-import json
-import time
-import traceback
-import numpy as np
-from pathlib import Path
+from ising_spin import IntegerLM, Vocabulary, IDX2POS
+from ising_spin.utils import get_rss_mb
 
-# --- Configuration ---
-DEFAULT_SAMPLES = 50000
-DEFAULT_VOCAB = 2000
-DEFAULT_DATASET = "tinystories"
-DEFAULT_SDR_DIM = 512
-DEFAULT_SDR_SPARSITY = 0.04  # v76h: increased from 0.02 (k=10→20)
-
-# Cache directory
 CACHE_DIR = Path(__file__).parent
 OUTPUT_DIR = CACHE_DIR / "output"
 
 
-def get_rss_mb() -> int:
-    """Get current process RSS in MB."""
-    try:
-        import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
-    except Exception:
-        return 0
-
-
-def find_cache_file(n_samples: int, dataset_name: str = "tinystories") -> str:
-    """Find the best cache file for the requested number of samples."""
+def load_data(n_samples):
+    """Load TinyStories dataset."""
     cache_files = {}
-    glob_pattern = f"cached_{dataset_name}_*.json"
-    for f in CACHE_DIR.glob(glob_pattern):
-        name = f.stem
-        parts = name.split("_")
+    for f in CACHE_DIR.glob("cached_tiny_stories_*.json"):
+        parts = f.stem.split("_")
         size_str = parts[-1]
         try:
-            if size_str.endswith("k"):
-                size = int(size_str[:-1]) * 1000
-            elif size_str.endswith("m"):
-                size = int(size_str[:-1]) * 1000000
-            else:
-                size = int(size_str)
+            size = int(size_str[:-1]) * (1000 if size_str.endswith("k") else 1000000)
             cache_files[size] = str(f)
         except (ValueError, IndexError):
             continue
 
-    if n_samples in cache_files:
-        return cache_files[n_samples]
-
-    sufficient = {s: p for s, p in cache_files.items() if s >= n_samples}
-    if sufficient:
-        best_size = min(sufficient.keys())
-        return sufficient[best_size]
-
-    return None
-
-
-def load_data(n_samples: int, dataset_name: str = DEFAULT_DATASET) -> list:
-    """Load or download data with proper cache handling."""
-    cache_dataset = dataset_name.replace("-", "_")
-    cache_path = find_cache_file(n_samples, cache_dataset)
+    cache_path = cache_files.get(n_samples) or min(
+        (s for s in cache_files if s >= n_samples), default=None, key=lambda s: s
+    )
+    if cache_path is None:
+        sufficient = {s: p for s, p in cache_files.items() if s >= n_samples}
+        if sufficient:
+            cache_path = sufficient[min(sufficient.keys())]
 
     if cache_path:
         print(f"Loading cache: {cache_path}")
-        t0 = time.time()
-        with open(cache_path, "r") as f:
+        with open(cache_path) as f:
             texts = json.load(f)
-        t_load = time.time() - t0
-        print(f"  {len(texts):,} texts loaded in {t_load:.1f}s")
         if len(texts) >= n_samples:
             return texts[:n_samples]
 
-    print(f"Downloading {dataset_name} from HuggingFace...")
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("roneneldan/TinyStories", split=f"train[:{n_samples}]")
-        texts = [s["text"] for s in ds]
-        cache_name = f"cached_{cache_dataset}_{n_samples // 1000}k.json"
-        with open(CACHE_DIR / cache_name, "w") as f:
-            json.dump(texts, f)
-        print(f"  Downloaded and cached {len(texts):,} texts")
-        return texts
-    except Exception as e:
-        print(f"  Error downloading: {e}")
-        return []
-
-
-def build_vocabulary(texts: list, max_vocab: int = 2000, min_freq: int = 5):
-    """Build vocabulary from texts."""
-    from collections import Counter
-    word_counts = Counter()
-    for text in texts:
-        words = text.lower().split()
-        word_counts.update(words)
-
-    filtered = {w: c for w, c in word_counts.items() if c >= min_freq}
-    sorted_words = sorted(filtered.items(), key=lambda x: -x[1])
-    vocab_words = ["<pad>", "<unk>", "<bos>", "<eos>"] + [w for w, _ in sorted_words[:max_vocab-4]]
-
-    word2idx = {w: i for i, w in enumerate(vocab_words)}
-    idx2word = {i: w for i, w in enumerate(vocab_words)}
-    word_freq = np.zeros(len(vocab_words), dtype=np.int32)
-    for w, c in sorted_words[:max_vocab-4]:
-        if w in word2idx:
-            word_freq[word2idx[w]] = c
-
-    return vocab_words, word2idx, idx2word, word_freq
-
-
-def tokenize_texts(texts: list, word2idx: dict, max_seq_len: int = 30):
-    """Tokenize texts into word ID sequences."""
-    sequences = []
-    for text in texts:
-        words = text.lower().split()
-        ids = [word2idx.get(w, 1) for w in words]
-        ids = [id for id in ids if id >= 4]
-        if len(ids) >= 2:
-            sequences.append(ids[:max_seq_len])
-    return sequences
-
-
-def build_pos_types(vocab_words, word_freq):
-    """Build simple POS type system based on word suffixes."""
-    n_types = 13
-    pos_types = np.zeros(len(vocab_words), dtype=np.int32)
-
-    for i, word in enumerate(vocab_words):
-        if i < 4:
-            pos_types[i] = 0
-        elif word.endswith(("ed",)):
-            pos_types[i] = 1
-        elif word.endswith(("ing",)):
-            pos_types[i] = 2
-        elif word.endswith(("ly",)):
-            pos_types[i] = 3
-        elif word.endswith(("tion", "ment", "ness", "ity")):
-            pos_types[i] = 4
-        elif word.endswith(("ous", "ful", "less", "ive", "able")):
-            pos_types[i] = 5
-        elif word in ("the", "a", "an"):
-            pos_types[i] = 6
-        elif word in ("is", "was", "were", "are", "am", "be", "been", "being"):
-            pos_types[i] = 7
-        elif word in ("he", "she", "it", "they", "we", "i", "you"):
-            pos_types[i] = 8
-        elif word in ("and", "but", "or", "so", "because", "when", "if"):
-            pos_types[i] = 9
-        elif word in ("to", "from", "in", "on", "at", "with", "by", "for"):
-            pos_types[i] = 10
-        elif word in (".", ",", "!", "?", ";", ":"):
-            pos_types[i] = 11
-        else:
-            pos_types[i] = 12
-
-    return pos_types
+    print("Downloading TinyStories from HuggingFace...")
+    from datasets import load_dataset
+    ds = load_dataset("roneneldan/TinyStories", split=f"train[:{n_samples}]")
+    texts = [s["text"] for s in ds]
+    cache_name = f"cached_tiny_stories_{n_samples // 1000}k.json"
+    with open(CACHE_DIR / cache_name, "w") as f:
+        json.dump(texts, f)
+    return texts
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Integer EBM Re-ranker v76h — BPE Alignment + Bigram Fix + Rep Penalty"
-    )
+    parser = argparse.ArgumentParser(description="Integer Language Model")
 
-    # Core parameters
-    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
-    parser.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
-    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
-
-    # Base model
-    parser.add_argument("--base-model", type=str, default="gpt2")
-    parser.add_argument("--no-base-model", action="store_true", default=False,
-                        help="Use DummyBaseLM (no torch required)")
-
-    # Re-ranking
-    parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--sdr-dim", type=int, default=DEFAULT_SDR_DIM)
-    parser.add_argument("--sdr-sparsity", type=float, default=DEFAULT_SDR_SPARSITY,
-                        help="v76h: 0.04 default (k=20), was 0.02 (k=10)")
-    parser.add_argument("--dam-scale", type=int, default=1600)
-    parser.add_argument("--j-clip", type=int, default=64000,
-                        help="v76h: increased from 32000 (was saturating)")
-    parser.add_argument("--log-prob-scale", type=int, default=100)
-    parser.add_argument("--dam-alpha", type=float, default=1.0,
-                        help="v76g: Mixing weight for z-score normalized DAM energy. "
-                             "0=pure base model, 1=equal DAM+base, >1=DAM dominates")
-    parser.add_argument("--gamma", type=float, default=0.5,
-                        help="v76h: Mixing weight for z-score normalized bigram energy. "
-                             "0=no bigram, 1=equal bigram+base, >1=bigram dominates")
-
-    # NCE
-    parser.add_argument("--nce-eta", type=int, default=10,
-                        help="NCE learning rate")
-    parser.add_argument("--nce-epochs", type=int, default=3,
-                        help="NCE training epochs")
-    parser.add_argument("--nce-negatives", type=int, default=3,
-                        help="v76g: Number of NCE negatives (3 types: random_sub, pos_violate, topic_violate)")
-
-    # Spin and episodic
-    parser.add_argument("--spin-weight", type=int, default=5)
-    parser.add_argument("--episodic-weight", type=int, default=2)
-    parser.add_argument("--bind-weight", type=int, default=5)
-    parser.add_argument("--max-episodes", type=int, default=10000)
-
-    # v76h: Repetition penalty
-    parser.add_argument("--rep-penalty", type=float, default=50.0,
-                        help="v76h: Energy penalty for repeated words (0=disabled)")
-    parser.add_argument("--rep-window", type=int, default=5,
-                        help="v76h: How many recent words to check for repetition")
-
-    # Generation
-    parser.add_argument("--rerank-beta", type=float, default=0.01)
-    parser.add_argument("--gen-length", type=int, default=100)
+    # Data
+    parser.add_argument("--samples", type=int, default=50000)
+    parser.add_argument("--vocab", type=int, default=2000)
     parser.add_argument("--max-seq-len", type=int, default=30)
-    parser.add_argument("--context-window", type=int, default=10)
     parser.add_argument("--vocab-min-freq", type=int, default=5)
 
-    # Advanced
-    parser.add_argument("--exp-temperature", type=int, default=100)
+    # POS energy tables
+    parser.add_argument("--n-pos-hashes", type=int, default=2)
+    parser.add_argument("--pos-table-size", type=int, default=1009)
+    parser.add_argument("--pos-eta", type=int, default=3)
+    parser.add_argument("--pos-clip", type=int, default=500)
+
+    # Lexical energy tables
+    parser.add_argument("--n-lex-hashes", type=int, default=3)
+    parser.add_argument("--lex-table-size", type=int, default=65537)
+    parser.add_argument("--lex-eta", type=int, default=1)
+    parser.add_argument("--lex-clip", type=int, default=1000)
+
+    # Skip-gram
+    parser.add_argument("--use-skip", action="store_true", default=True)
+    parser.add_argument("--no-skip", action="store_true", default=False)
+    parser.add_argument("--n-skip-hashes", type=int, default=2)
+    parser.add_argument("--skip-table-size", type=int, default=65537)
+    parser.add_argument("--skip-eta", type=int, default=1)
+    parser.add_argument("--skip-clip", type=int, default=800)
+
+    # Trigram
+    parser.add_argument("--use-trigram", action="store_true", default=True)
+    parser.add_argument("--no-trigram", action="store_true", default=False)
+
+    # Weights
+    parser.add_argument("--pos-weight", type=float, default=1.0)
+    parser.add_argument("--lex-weight", type=float, default=1.0)
+    parser.add_argument("--skip-weight", type=float, default=0.5)
+
+    # NCE
+    parser.add_argument("--nce-epochs", type=int, default=3)
+    parser.add_argument("--nce-negatives", type=int, default=3)
+
+    # Generation
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.01)
+    parser.add_argument("--rep-penalty", type=float, default=50.0)
+    parser.add_argument("--rep-window", type=int, default=5)
+    parser.add_argument("--gen-length", type=int, default=100)
 
     args = parser.parse_args()
+    use_skip = args.use_skip and not args.no_skip
+    use_trigram = args.use_trigram and not args.no_trigram
 
-    # --- Header ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = OUTPUT_DIR / f"reranker_{timestamp}"
+    output_dir = OUTPUT_DIR / f"ilm_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    use_dummy = args.no_base_model or args.base_model == "dummy"
-
     print("=" * 70, flush=True)
-    print("INTEGER EBM RE-RANKER v76h — BPE Alignment + Bigram Fix + Rep Penalty", flush=True)
+    print("INTEGER LANGUAGE MODEL — Pure Integer, No Neural Nets", flush=True)
     print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
     print(f"Output: {output_dir}", flush=True)
-    print(f"Key changes from v76g:", flush=True)
-    print(f"  1. Proper BPE-to-word alignment (eliminates <unk>, fixes GPT-2 context)", flush=True)
-    print(f"  2. Bigram energy z-score normalized independently (fixes scale mismatch)", flush=True)
-    print(f"  3. Repetition penalty (prevents 'they in they in...' loops)", flush=True)
-    print(f"  4. J-clip increased: 32000 → {args.j_clip}", flush=True)
-    print(f"  5. SDR sparsity: 0.02 → {args.sdr_sparsity} (k={int(args.sdr_dim * args.sdr_sparsity)})", flush=True)
+    print(f"  POS:   {args.n_pos_hashes} hashes, size={args.pos_table_size}", flush=True)
+    print(f"  Lex:   {args.n_lex_hashes} hashes, size={args.lex_table_size}", flush=True)
+    print(f"  Skip:  {'ON' if use_skip else 'OFF'}, {args.n_skip_hashes} hashes, size={args.skip_table_size}", flush=True)
+    print(f"  Tri:   {'ON' if use_trigram else 'OFF'}", flush=True)
+    print(f"  Weights: pos={args.pos_weight}, lex={args.lex_weight}, skip={args.skip_weight}", flush=True)
     rss = get_rss_mb()
-    if rss > 0:
-        print(f"Memory (RSS): {rss:,} MB", flush=True)
+    if rss:
+        print(f"Memory (RSS): {rss} MB", flush=True)
     print("=" * 70, flush=True)
 
-    # --- [1] Load Data ---
-    print("\n[1/8] Loading data...", flush=True)
-    texts = load_data(args.samples, dataset_name=args.dataset)
-    n_texts = len(texts)
-    print(f"  Using {n_texts:,} texts for training", flush=True)
+    # [1] Load data
+    print("\n[1/6] Loading data...", flush=True)
+    texts = load_data(args.samples)
+    print(f"  {len(texts):,} texts", flush=True)
 
-    # --- [2] Build Vocabulary ---
-    print("\n[2/8] Building vocabulary...", flush=True)
-    vocab_words, word2idx, idx2word, word_freq = build_vocabulary(
-        texts, max_vocab=args.vocab, min_freq=args.vocab_min_freq
-    )
-    V = len(vocab_words)
-    print(f"  Vocabulary: {V} words", flush=True)
+    # [2] Build vocabulary + POS
+    print("\n[2/6] Building vocabulary + POS types...", flush=True)
+    vocab = Vocabulary(max_size=args.vocab, min_freq=args.vocab_min_freq, max_seq_len=args.max_seq_len)
+    vocab.build(texts)
+    print(f"  {vocab.V} words", flush=True)
+    for name, count in sorted(vocab.pos_distribution().items(), key=lambda x: -x[1]):
+        print(f"    {name}: {count}", flush=True)
 
-    # --- [3] Tokenize ---
-    print("\n[3/8] Tokenizing...", flush=True)
-    sequences = tokenize_texts(texts, word2idx, max_seq_len=args.max_seq_len)
-    # Split train/test
+    # [3] Tokenize
+    print("\n[3/6] Tokenizing...", flush=True)
+    sequences = vocab.tokenize(texts)
     n_train = int(0.9 * len(sequences))
-    train_seqs = sequences[:n_train]
-    test_seqs = sequences[n_train:]
+    train_seqs, test_seqs = sequences[:n_train], sequences[n_train:]
     print(f"  Train: {len(train_seqs):,}, Test: {len(test_seqs):,}", flush=True)
 
-    # --- [4] Build POS types ---
-    print("\n[4/8] Building POS type system...", flush=True)
-    pos_types = build_pos_types(vocab_words, word_freq)
-    print(f"  POS system: {len(set(pos_types))} types, {V} words typed", flush=True)
-
-    # --- [5] Build SDR Encoder ---
-    print("\n[5/8] Building SDR encoder...", flush=True)
-    from ising_spin.attractor.sdr import SDREncoder
-    sdr_encoder = SDREncoder(
-        vocab_size=V,
-        D=args.sdr_dim,
-        sparsity=args.sdr_sparsity,
-    )
-    sdr_encoder.build(word_freq=word_freq)
-    k = sdr_encoder.k
-    print(f"  SDR: D={args.sdr_dim}, k={k} ({args.sdr_sparsity*100:.1f}% sparse)", flush=True)
-
-    # --- [6] Build Base Model ---
-    print("\n[6/8] Building base model...", flush=True)
-    base_model = None
-    if use_dummy:
-        from ising_spin.attractor.base_model import DummyBaseLM
-        base_model = DummyBaseLM(
-            vocab_words=vocab_words,
-            word_freq=word_freq,
-            seed=42,
-        )
-        base_model.build_bigrams(train_seqs)
-        base_model.build_word_alignment(idx2word, word2idx)
-        print(f"  DummyBaseLM: {V} words, bigrams built", flush=True)
-    else:
-        try:
-            from ising_spin.attractor.base_model import BaseLMInterface
-            base_model = BaseLMInterface(model_name=args.base_model)
-            # v76h: Build BPE-to-word alignment cache
-            base_model.build_word_alignment(idx2word, word2idx)
-            print(f"  Base model: {args.base_model} loaded (word-level candidates enabled)", flush=True)
-        except (ImportError, Exception) as e:
-            print(f"  Cannot load GPT-2: {e}", flush=True)
-            print(f"  Falling back to DummyBaseLM", flush=True)
-            from ising_spin.attractor.base_model import DummyBaseLM
-            base_model = DummyBaseLM(
-                vocab_words=vocab_words,
-                word_freq=word_freq,
-                seed=42,
-            )
-            base_model.build_bigrams(train_seqs)
-            base_model.build_word_alignment(idx2word, word2idx)
-            use_dummy = True
-
-    # --- [7] Build ReRankerEngine and Train ---
-    print("\n[7/8] Building ReRankerEngine and training...", flush=True)
-    from ising_spin.attractor.reranker_engine import ReRankerEngine
-
-    engine = ReRankerEngine(
-        base_model=base_model,
-        sdr_encoder=sdr_encoder,
-        vocab_words=vocab_words,
-        word2idx=word2idx,
-        idx2word=idx2word,
-        pos_types=pos_types,
-        word_freq=word_freq,
-        dam_scale=args.dam_scale,
-        j_clip=args.j_clip,
-        f_type=2,  # F_EXP_APPROX
-        exp_temperature=args.exp_temperature,
-        nce_eta=args.nce_eta,
-        nce_negatives=args.nce_negatives,
-        nce_epochs=args.nce_epochs,
-        context_window=args.context_window,
-        dam_alpha=args.dam_alpha,
-        gamma=args.gamma,
+    # [4] Build model
+    print("\n[4/6] Building Integer Language Model...", flush=True)
+    model = IntegerLM(
+        vocab=vocab,
+        n_pos_hashes=args.n_pos_hashes,
+        pos_table_size=args.pos_table_size,
+        pos_eta=args.pos_eta,
+        pos_clip=args.pos_clip,
+        n_lex_hashes=args.n_lex_hashes,
+        lex_table_size=args.lex_table_size,
+        lex_eta=args.lex_eta,
+        lex_clip=args.lex_clip,
+        use_skip=use_skip,
+        n_skip_hashes=args.n_skip_hashes,
+        skip_table_size=args.skip_table_size,
+        skip_eta=args.skip_eta,
+        skip_clip=args.skip_clip,
+        use_trigram=use_trigram,
+        pos_weight=args.pos_weight,
+        lex_weight=args.lex_weight,
+        skip_weight=args.skip_weight,
         top_k=args.top_k,
-        log_prob_scale=args.log_prob_scale,
-        spin_weight=args.spin_weight,
-        episodic_weight=args.episodic_weight,
-        bind_weight=args.bind_weight,
+        alpha=args.alpha,
+        beta=args.beta,
         rep_penalty=args.rep_penalty,
         rep_window=args.rep_window,
-        max_episodes=args.max_episodes,
         seed=42,
     )
+    print(f"  Energy memory: {model.energy.memory_mb():.2f} MB", flush=True)
+    print(f"  Bigram memory: {model.bigram.statistics().get('memory_mb', 0):.1f} MB", flush=True)
 
-    # Train
-    t_start = time.time()
-    train_stats = engine.train(train_seqs)
-    t_train = time.time() - t_start
-    print(f"\n  Training complete: {t_train:.1f}s", flush=True)
+    # [5] Train + Calibrate
+    print("\n[5/6] Training + calibrating...", flush=True)
+    t0 = time.time()
 
-    # --- Discriminative Accuracy ---
-    print(f"\n{'=' * 70}", flush=True)
-    print("DISCRIMINATIVE ACCURACY (KEY METRIC)", flush=True)
-    print(f"{'=' * 70}", flush=True)
+    train_stats = model.train(train_seqs, n_epochs=args.nce_epochs, n_negatives=args.nce_negatives)
+    cal_stats = model.calibrate(train_seqs)
+    t_train = time.time() - t0
 
-    try:
-        disc_acc = engine.compute_discriminative_accuracy(
-            test_seqs, n_samples=500
-        )
-        print(f"  Overall: {disc_acc['overall_accuracy']:.3f}", flush=True)
-        for key in sorted(disc_acc.keys()):
-            if key.endswith("_accuracy"):
-                print(f"    {key}: {disc_acc[key]:.3f}", flush=True)
-    except Exception as e:
-        print(f"  Error: {e}", flush=True)
-        traceback.print_exc()
-        disc_acc = {"overall_accuracy": 0.0}
+    # Show POS transition matrix
+    print("\n  === POS Transition Matrix ===", flush=True)
+    pos_matrix = model.pos_transition_matrix()
+    header = "        " + " ".join(f"{IDX2POS.get(j, 'X'):>6s}" for j in range(13))
+    print(header, flush=True)
+    for i in range(13):
+        row = f"  {IDX2POS.get(i, 'X'):>6s} "
+        for j in range(13):
+            row += f"{pos_matrix[i,j]:>6.0f}"
+        print(row, flush=True)
 
-    # --- Perplexity ---
-    print(f"\n{'=' * 70}", flush=True)
+    # [6] Evaluate
+    print("\n[6/6] Evaluating...", flush=True)
+
+    # Discriminative accuracy
+    print(f"\n{'='*70}", flush=True)
+    print("DISCRIMINATIVE ACCURACY", flush=True)
+    disc = model.discriminative_accuracy(test_seqs, n_samples=500)
+    print(f"  {disc['accuracy']:.3f} ({disc['comparisons']} comparisons)", flush=True)
+
+    # Perplexity
+    print(f"\n{'='*70}", flush=True)
     print("PERPLEXITY", flush=True)
-    print(f"{'=' * 70}", flush=True)
+    ppl = model.perplexity(test_seqs, n_samples=min(100, len(test_seqs)))
+    print(f"  Base PPL: {ppl['base_ppl']:.2f}", flush=True)
+    print(f"  LEGD PPL: {ppl['legd_ppl']:.2f}", flush=True)
+    delta = ppl['base_ppl'] - ppl['legd_ppl']
+    print(f"  {'IMPROVEMENT' if delta > 0 else 'REGRESSION'}: {abs(delta):.2f} PPL", flush=True)
 
-    try:
-        ppl_stats = engine.compute_perplexity(test_seqs, n_samples=min(100, len(test_seqs)))
-        print(f"  Base PPL:      {ppl_stats['base_ppl']:.2f}", flush=True)
-        print(f"  Re-ranked PPL: {ppl_stats['reranked_ppl']:.2f}", flush=True)
-        print(f"  Evaluated on:  {ppl_stats['n_tokens']} tokens", flush=True)
-        improvement = ppl_stats['base_ppl'] - ppl_stats['reranked_ppl']
-        if improvement > 0:
-            print(f"  DAM IMPROVES the base model by {improvement:.2f} PPL", flush=True)
-        else:
-            print(f"  DAM HURTS the base model by {-improvement:.2f} PPL", flush=True)
-    except Exception as e:
-        print(f"  Error: {e}", flush=True)
-        traceback.print_exc()
-        ppl_stats = {"base_ppl": float("inf"), "reranked_ppl": float("inf"), "n_tokens": 0}
-
-    # --- Generation ---
-    print(f"\n{'=' * 70}", flush=True)
+    # Generation
+    print(f"\n{'='*70}", flush=True)
     print("GENERATION", flush=True)
-    print(f"{'=' * 70}", flush=True)
+    for prompt in ["once upon a time", "there was a little", "the little girl"]:
+        text = model.generate_text(prompt, length=args.gen_length)
+        print(f"\n  '{prompt}':", flush=True)
+        print(f"  {text[:300]}", flush=True)
 
-    prompts = ["once upon a time", "there was a little", "the little girl"]
-
-    for i, prompt in enumerate(prompts):
-        print(f"\n  --- '{prompt}' ({args.gen_length} words) ---", flush=True)
-        try:
-            prompt_words = prompt.lower().split()
-            prompt_ids = [word2idx.get(w, 1) for w in prompt_words]
-            prompt_ids = [pid for pid in prompt_ids if pid >= 4]
-
-            if len(prompt_ids) == 0:
-                print("  (prompt words not in vocab)", flush=True)
-                continue
-
-            generated_ids = engine.generate(
-                prompt_ids, length=args.gen_length
-            )
-
-            text = " ".join(idx2word.get(wid, "<unk>") for wid in generated_ids)
-            print(f"  {text[:300]}", flush=True)
-
-            gen_file = output_dir / f"generated_{i}.txt"
-            with open(gen_file, "w") as f:
-                f.write(text)
-
-            # Also generate WITHOUT re-ranking for comparison
-            base_ids = list(prompt_ids)
-            for step in range(args.gen_length):
-                # Use word-level candidates for fair comparison
-                if hasattr(base_model, 'get_top_k_words') and not isinstance(base_model, type(base_model)):
-                    try:
-                        candidates, log_probs = base_model.get_top_k_words(
-                            base_ids, k=min(args.top_k, V)
-                        )
-                    except Exception:
-                        candidates, log_probs = base_model.get_top_k(
-                            base_ids, k=min(args.top_k, V)
-                        )
-                else:
-                    candidates, log_probs = base_model.get_top_k(
-                        base_ids, k=min(args.top_k, V)
-                    )
-
-                # Filter to valid word IDs
-                valid = (candidates >= 4) & (candidates < V)
-                if not np.any(valid):
-                    break
-                candidates = candidates[valid]
-                log_probs = log_probs[valid]
-                best = int(np.argmax(log_probs))
-                base_ids.append(int(candidates[best]))
-
-            base_text = " ".join(idx2word.get(wid, "<unk>") for wid in base_ids)
-            print(f"\n  --- Base model only (no re-ranking) ---", flush=True)
-            print(f"  {base_text[:300]}", flush=True)
-
-        except Exception as e:
-            print(f"  Generation error: {e}", flush=True)
-            traceback.print_exc()
-
-    # --- Diagnostics ---
-    print(f"\n{'=' * 70}", flush=True)
-    print("DIAGNOSTICS", flush=True)
-    print(f"{'=' * 70}", flush=True)
-
-    print(f"  DAM: J_nnz={int(np.count_nonzero(engine.dam.J))}, "
-          f"J_max={int(np.max(np.abs(engine.dam.J)))}, "
-          f"h_nnz={int(np.count_nonzero(engine.dam.h))}", flush=True)
-    print(f"  Normalization: DAM_mean={engine._dam_energy_mean:.1f}, "
-          f"DAM_std={engine._dam_energy_std:.1f}", flush=True)
-    print(f"  Base: base_mean={engine._base_energy_mean:.1f}, "
-          f"base_std={engine._base_energy_std:.1f}", flush=True)
-    print(f"  Bigram: bigram_mean={engine._bigram_energy_mean:.3f}, "
-          f"bigram_std={engine._bigram_energy_std:.3f}", flush=True)
-    print(f"  Alpha={engine.dam_alpha:.1f}, Gamma={engine.gamma:.1f}, "
-          f"Beta={engine.rerank_beta}", flush=True)
-    print(f"  Bigram: {'built' if engine._bigram_logprob is not None else 'none'}", flush=True)
-    print(f"  Rep penalty: {engine.rep_penalty}, window={engine.rep_window}", flush=True)
-    print(f"  Spin: z_active={int(np.sum(engine.three_band.m_z > 0))}, "
-          f"x_active={int(np.sum(engine.three_band.m_x > 0))}, "
-          f"y_active={int(np.sum(engine.three_band.m_y > 0))}", flush=True)
-    print(f"  Episodic: {len(engine.episodic.episodes)} episodes", flush=True)
-    print(f"  Binding: {len(engine.binding._recent_words)} recent words", flush=True)
-    print(f"  Word-level candidates: {engine._use_word_candidates}", flush=True)
-
-    # --- Save Results ---
-    t_total = time.time() - t_start
+    # Save results
+    diag = model.diagnostics()
+    t_total = time.time() - t0
     results = {
-        "version": "76h.0.0",
-        "architecture": "Integer EBM Re-ranker v76h (BPE alignment + bigram fix + rep penalty)",
+        "version": "1.0.0",
+        "architecture": "Integer Language Model (no neural nets)",
         "timestamp": timestamp,
         "config": vars(args),
         "results": {
             "training_time_s": t_train,
             "total_time_s": t_total,
-            "discriminative_accuracy": disc_acc.get("overall_accuracy", 0.0),
-            "base_ppl": ppl_stats.get("base_ppl", float("inf")),
-            "reranked_ppl": ppl_stats.get("reranked_ppl", float("inf")),
-            "vocab_size": V,
-            "J_nnz": int(np.count_nonzero(engine.dam.J)),
-            "J_max": int(np.max(np.abs(engine.dam.J))),
-            "base_model": "dummy" if use_dummy else args.base_model,
-            "dam_alpha": engine.dam_alpha,
-            "gamma": engine.gamma,
-            "rerank_beta": engine.rerank_beta,
-            "dam_energy_mean": engine._dam_energy_mean,
-            "dam_energy_std": engine._dam_energy_std,
-            "base_energy_mean": engine._base_energy_mean,
-            "base_energy_std": engine._base_energy_std,
-            "bigram_energy_mean": engine._bigram_energy_mean,
-            "bigram_energy_std": engine._bigram_energy_std,
+            "disc_accuracy": disc['accuracy'],
+            "base_ppl": ppl['base_ppl'],
+            "legd_ppl": ppl['legd_ppl'],
+            "vocab_size": vocab.V,
+            "alpha": diag['alpha'],
+            "beta": diag['beta'],
+            "metropolis_threshold": diag['metropolis_threshold'],
+            "pos_weight": diag['pos_weight'],
+            "lex_weight": diag['lex_weight'],
+            "skip_weight": diag['skip_weight'],
         },
     }
-
     results_file = output_dir / "results.json"
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
-    print(f"\n  Saved: {results_file}")
 
-    root_results = CACHE_DIR / "training_results.json"
-    with open(root_results, "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"  Saved: {root_results}")
+    # Save POS matrix
+    pos_data = {}
+    for i in range(13):
+        for j in range(13):
+            pos_data[f"{IDX2POS.get(i,'X')}->{IDX2POS.get(j,'X')}"] = float(pos_matrix[i,j])
+    with open(output_dir / "pos_matrix.json", "w") as f:
+        json.dump(pos_data, f, indent=2)
 
-    print(f"\n{'=' * 70}", flush=True)
-    print(f"DONE — Integer EBM Re-ranker v76h")
-    print(f"Total time: {t_total:.1f}s ({t_total/60:.1f}min)")
-    print(f"Discriminative accuracy: {disc_acc.get('overall_accuracy', 0.0):.3f}")
-    print(f"Base PPL: {ppl_stats.get('base_ppl', float('inf')):.2f}")
-    print(f"Re-ranked PPL: {ppl_stats.get('reranked_ppl', float('inf')):.2f}")
-    print(f"Alpha: {engine.dam_alpha:.1f}, Gamma: {engine.gamma:.1f}, Beta: {engine.rerank_beta}")
-    print(f"Results: {output_dir}")
-    print(f"{'=' * 70}", flush=True)
+    print(f"\n{'='*70}", flush=True)
+    print(f"DONE — Integer Language Model")
+    print(f"  Time: {t_total:.1f}s | Disc: {disc['accuracy']:.3f} | "
+          f"Base PPL: {ppl['base_ppl']:.2f} | LEGD PPL: {ppl['legd_ppl']:.2f}")
+    print(f"  Alpha: {diag['alpha']:.1f} | Beta: {diag['beta']} | "
+          f"POS: {diag['pos_weight']} | LEX: {diag['lex_weight']} | SKIP: {diag['skip_weight']}")
+    print(f"  Results: {output_dir}")
+    print(f"{'='*70}", flush=True)
 
 
 if __name__ == "__main__":
